@@ -1,9 +1,13 @@
 const guiColors = {
     'color-scheme': 'light',
 
-    'ui-primary': 'hsla(215, 100%, 95%, 1)', /* #E5F0FF */
-    'ui-secondary': 'hsla(215, 75%, 95%, 1)', /* #E9F1FC */
-    'ui-tertiary': 'hsla(215, 50%, 90%, 1)', /* #D9E3F2 */
+    // 'ui-primary': 'hsla(215, 100%, 95%, 1)', /* #E5F0FF */
+    // 'ui-secondary': 'hsla(215, 75%, 95%, 1)', /* #E9F1FC */
+    // 'ui-tertiary': 'hsla(215, 50%, 90%, 1)', /* #D9E3F2 */
+
+    'ui-primary': '#f2f2f2', 
+    'ui-secondary': '#ededed',
+    'ui-tertiary': '#f2f2f2', 
 
     'ui-modal-overlay': 'var(--motion-primary-transparent)',
     'ui-modal-background': 'hsla(0, 100%, 100%, 1)', /* #FFFFFF */
