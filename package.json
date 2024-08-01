@@ -1,8 +1,8 @@
 {
-  "name": "scratch-gui",
-  "version": "3.2.37",
+  "name": "40code-gui",
+  "version": "3.4.1",
   "description": "Graphical User Interface for creating and running Scratch 3.0 projects",
-  "author": "Massachusetts Institute of Technology",
+  "author": "Massachusetts Institute of Technology & 40code",
   "license": "GPL-3.0",
   "homepage": "https://github.com/LLK/scratch-gui#readme",
   "repository": {
