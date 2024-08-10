@@ -983,7 +983,8 @@ class MenuBar extends React.Component {
                                                 className={styles.menuBarButton}
                                                 /* eslint-disable react/jsx-no-bind */
                                                 onClick={() => {
-                                                    this.handleClickSeeCommunity(waitForUpdate);
+                                                    // this.handleClickSeeCommunity(waitForUpdate);
+                                                    window.open('/#page=work&id='+id)
                                                 }}
                                                 /* eslint-enable react/jsx-no-bind */
                                             />
@@ -1002,7 +1003,17 @@ class MenuBar extends React.Component {
                             />
                         ) : []))}
                     </div>
-                    
+                    <Button id="publish"
+                    >
+                        发布
+                    </Button>
+                    <Button id="save"
+                    >
+                        保存
+                    </Button>
+                    <Button id="setCover">
+                        设置舞台为封面
+                    </Button>
                 </div>
 
                 <div className={styles.accountInfoGroup}>

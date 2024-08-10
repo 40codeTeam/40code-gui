@@ -50,7 +50,7 @@ import twIcon from './tw/tw.svg';
 import customExtensionIcon from './custom/custom.svg';
 import returnIcon from './custom/return.svg';
 import galleryIcon from './gallery/gallery.svg';
-import {APP_NAME} from '../../brand';
+// import {APP_NAME} from '../../brand';
 
 export default [
     {
@@ -360,12 +360,10 @@ export default [
     {
         name: (
             <FormattedMessage
-                defaultMessage="{APP_NAME} Blocks"
+                defaultMessage="TurboWarp Blocks"
                 description="Name of the strange 'TurboWarp Blocks' extension"
                 id="tw.twExtension.name"
-                values={{
-                    APP_NAME
-                }}
+                values="TurboWarp"
             />
         ),
         extensionId: 'tw',
@@ -407,12 +405,10 @@ export default [
 export const galleryLoading = {
     name: (
         <FormattedMessage
-            defaultMessage="{APP_NAME} Extension Gallery"
+            defaultMessage="TurboWarp Extension Gallery"
             description="Name of extensions.turbowarp.org in extension library"
             id="tw.extensionGallery.name"
-            values={{
-                APP_NAME
-            }}
+            values="TurboWarp"
         />
     ),
     href: 'https://extensions.turbowarp.org/',
@@ -433,12 +429,10 @@ export const galleryLoading = {
 export const galleryMore = {
     name: (
         <FormattedMessage
-            defaultMessage="{APP_NAME} Extension Gallery"
+            defaultMessage="TurboWarp Extension Gallery"
             description="Name of extensions.turbowarp.org in extension library"
             id="tw.extensionGallery.name"
-            values={{
-                APP_NAME
-            }}
+            values="TurboWarp"
         />
     ),
     href: 'https://extensions.turbowarp.org/',
@@ -459,12 +453,10 @@ export const galleryMore = {
 export const galleryError = {
     name: (
         <FormattedMessage
-            defaultMessage="{APP_NAME} Extension Gallery"
+            defaultMessage="TurboWarp Extension Gallery"
             description="Name of extensions.turbowarp.org in extension library"
             id="tw.extensionGallery.name"
-            values={{
-                APP_NAME
-            }}
+            values="TurboWarp"
         />
     ),
     href: 'https://extensions.turbowarp.org/',

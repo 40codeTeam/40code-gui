@@ -89,7 +89,121 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 storage.setAssetHost(this.props.assetHost);
             }
             if (this.props.isFetchingWithId && !prevProps.isFetchingWithId) {
-                this.fetchProject(this.props.reduxProjectId, this.props.loadingState);
+                var d;
+                let that = this;
+                function Decrypt(word) {
+                    const k0=["9609274736591562",'4312549111852919']
+                    const key = CryptoJS.enc.Utf8.parse(k0[0]);  //十六位十六进制数作为密钥
+                    const iv = CryptoJS.enc.Utf8.parse(k0[1]);   //十六位十六进制数作为密钥偏移量
+                    let encryptedHexStr = CryptoJS.enc.Hex.parse(word);
+                    let srcs = CryptoJS.enc.Base64.stringify(encryptedHexStr);
+                    let decrypt = CryptoJS.AES.decrypt(srcs, key, { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
+                    let decryptedStr = decrypt.toString(CryptoJS.enc.Utf8);
+                    return decryptedStr.toString();
+                }
+                (async () => {
+                    try {
+                        try {
+                            d=workinfo;
+                        } catch (error) {
+                            window.workinfo=d = await getworkinfosync(id);
+                            getuserinfo();
+                        }
+                        if(location.pathname.indexOf('editor.html')!=-1){
+                            if (d === undefined) {
+                                alert("未知错误")
+                                $(document).text("未知错误")
+                                throw('未知错误')
+                            }
+                            if (!d.issign) {
+                                alert("请登录后查看")
+                                $(document).text("请登录后查看")
+                                location.href = "/#page=sign"
+                                throw("请登录后查看")
+                            }
+                            if (!(d.isauthor || (d.opensource && d.publish))) {
+                                alert("你没有权限，当前作品未开源或未发布")
+                                $(document).text("你没有权限，当前作品未开源或未发布")
+                                throw("你没有权限，当前作品未开源或未发布")
+                            }
+                            $('#save').click(()=>{
+                                window.save()
+                            })
+                            $('#publish').click(()=>{
+                                window.save(1)
+                            })
+                            if(d.isauthor){
+                                $('#setCover').click(()=>{
+                                    savecover(function (id) {
+                                        post({
+                                            url: 'work/info/update',
+                                            data: { id: workinfo.id, image: id, coveronly: 1 },
+                                            p: 'updatework'
+                                        }, function (d) {
+                                            console.log(d)
+                                        })
+                                    })
+                                })
+                            }else{
+                                $('#publish').remove()
+                                $('#save').text('改编')
+                            
+                            }
+                            // location.href = "#id=" + d.id + (v ? '&v=' + v : '')
+                        }
+                        // let that=this;
+                        // fetch().then(blob => {
+                        //     const reader = new FileReader();
+                        //     reader.onload = () => {
+                        //         that.props.onFetchedProjectData(reader.result, that.props.loadingState);
+                        //     };
+                        //     reader.readAsArrayBuffer(blob);
+                        // });
+                        if (d.onlyFirefox && navigator.userAgent.indexOf("Firefox") == -1) {
+                            alert('当前作品仅支持Firefox（火狐）浏览器打开，请切换至火狐浏览器')
+                            throw new Error('仅支持Firefox')
+                        }
+                        var toLogin = () => {
+                            if (location.hash.startsWith('#page=sign&url='))
+                                location.href = '/' + location.hash
+                        }
+                        toLogin()
+                        window.onhashchange = toLogin
+                        fetch('https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/work/work?id=' + id + '&token=' + getCookie('token')
+                            + '&sha=' + getQueryString('sha')
+                            + '&etime=' + getQueryString('etime')
+                            + (v ? '&v=' + v : '')
+                        ).then(r => r.blob()).then(blob => {
+
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                if (d.raw || reader.result[0] == '{')
+                                    that.props.onFetchedProjectData(reader.result, that.props.loadingState);
+                                else
+                                    that.props.onFetchedProjectData(Decrypt(reader.result), that.props.loadingState);
+                                location.href = "#id=" + id + (v ? '&v=' + v : '')
+                            };
+                            if (d.raw)
+                                reader.readAsArrayBuffer(blob);
+                            else
+                                reader.readAsText(blob);
+                        }).catch(e => {
+                            console.log(e)
+                            fetch('https://abc.520gxx.com/p.sb3').then(r => r.blob()).then(blob => {
+                                const reader = new FileReader();
+                                reader.onload = () => {
+                                    that.props.onFetchedProjectData(reader.result, that.props.loadingState);
+                                };
+                                reader.readAsArrayBuffer(blob);
+                            })
+                        });
+                    } catch (error) {
+                        console.log(error)
+                        this.fetchProject(this.props.reduxProjectId, this.props.loadingState);
+                        alert('作品加载失败')
+
+                    }
+                })()
             }
             if (this.props.isShowingProject && !prevProps.isShowingProject) {
                 this.props.onProjectUnchanged();
@@ -194,7 +308,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
         vm: PropTypes.instanceOf(VM)
     };
     ProjectFetcherComponent.defaultProps = {
-        assetHost: 'https://assets.scratch.mit.edu',
+        assetHost: window.scratchhost+'/static',
         projectHost: 'https://projects.scratch.mit.edu'
     };
 
