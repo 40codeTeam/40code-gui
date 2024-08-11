@@ -52,6 +52,14 @@ import returnIcon from './custom/return.svg';
 import galleryIcon from './gallery/gallery.svg';
 // import {APP_NAME} from '../../brand';
 
+import _3dIconURL from './40code/3d.svg';
+import lazymusicIconURL from './40code/lazymusic.svg';
+import cloudIconURL from './40code/cloud.svg';
+import canvasIconURL from './40code/canvas.svg';
+import ysSmallIconURL from './40code/ys.svg';
+import jsIconURL from './40code/jsonfetch.svg';
+import _40code from './40code/40code.svg';
+
 export default [
     {
         name: (
@@ -399,7 +407,127 @@ export default [
         tags: ['tw'],
         featured: true
         // Not marked as incompatible with Scratch so that clicking on it doesn't show a prompt
-    }
+    }, 
+    {
+        name: '云',
+        extensionId: 'yun',
+        iconURL: cloudIconURL,
+        // insetIconURL: cloudIconURL,
+        description: '云数据',
+        tags: ['40code'],
+        featured: true
+    },
+    {
+        name: 'Scratch高级设置',
+        extensionId: 'set',
+        iconURL: twIcon,
+        description: '高级设置',
+        tags: ['40code'],
+        featured: true
+    },
+    {
+        name: '懒加载音乐',
+        extensionId: 'lazyAudio',
+        iconURL: lazymusicIconURL,
+        tags: ['40code'],
+        description: '懒加载音乐扩展指令，还有一些音乐高级功能',
+        featured: true
+    },
+    {
+        name: (
+            <FormattedMessage
+                defaultMessage="40code社区"
+                description="Name for the 'Community' extension"
+                id="gui.extension.community.name"
+            />
+        ),
+        extensionId: 'community2',
+        iconURL: _40code,//communityImage,
+        tags: ['40code'],
+        description: (
+            <FormattedMessage
+                defaultMessage="Community blocks."
+                description="Description for the 'community' extension"
+                id="gui.extension.community.description"
+            />
+        ),
+        featured: true
+    },
+    {
+        name: '运算',
+        extensionId: 'yx',
+        collaborator: '',
+        iconURL: ysSmallIconURL,//canvasIconURL,
+        tags: ['40code'],
+        description: '运算',
+        featured: true
+    },
+    {
+        name: 'Canvas',
+        extensionId: 'canvas',
+        collaborator: '',
+        iconURL: canvasIconURL,//canvasIconURL,
+        tags: ['40code'],
+        description: '高级画布扩展指令',
+        featured: true
+    },
+    {
+        name: 'JS扩展',
+        extensionId: 'jsonfetch',
+        iconURL: jsIconURL,//stringExtImage,
+        tags: ['40code'],
+        description: 'JS扩展，还有网络请求',
+        featured: true
+    },
+    {
+        name: '3D引擎',
+        extensionId: 'three',
+        iconURL: _3dIconURL,//stringExtImage,
+        tags: ['40code'],
+        description: '3D引擎',
+        featured: true
+    },
+    {
+        name: '3D物理引擎',
+        extensionId: 'p3d',
+        iconURL: _3dIconURL,//stringExtImage,
+        tags: ['40code'],
+        description: '3D物理引擎',
+        featured: true
+    },
+    // {
+    //     name: '2D物理引擎',
+    //     extensionId: 'box2d',
+    //     collaborator: 'griffpatch',
+    //     iconURL: twIcon,
+    //     description: '2D物理引擎(由griffpatch制作，感谢griffpatch)',
+    //     tags: ['40code'],
+    //     featured: true
+    // },
+    {
+        name: '图层',
+        extensionId: 'tc',
+        iconURL: twIcon,
+        description: '图层设置',
+        tags: ['40code'],
+        featured: true
+    },
+    {
+        name: '触碰',
+        extensionId: 'touch',
+        iconURL: twIcon,
+        description: '触碰',
+        tags: ['40code'],
+        featured: true
+    },
+    // {
+    //     name: '其他扩展合集',
+    //     extensionId: 'other',
+    //     iconURL: twIcon,
+    //     description: '其他扩展合集',
+    //     tags: ['40code'],
+    //     featured: true
+    // }
 ];
 
 export const galleryLoading = {
