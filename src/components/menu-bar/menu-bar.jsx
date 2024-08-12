@@ -879,7 +879,9 @@ class MenuBar extends React.Component {
                         {this.props.onClickAddonSettings && (
                             <div
                                 className={classNames(styles.menuBarItem, styles.hoverable)}
-                                onClick={this.props.onClickAddonSettings}
+                                onClick={
+                                    this.props.onClickAddonSettings
+                                }
                             >
                                 <img
                                     src={addonsIcon}

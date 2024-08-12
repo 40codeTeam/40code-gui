@@ -11,10 +11,10 @@ const autoprefixer = require('autoprefixer');
 const postcssVars = require('postcss-simple-vars');
 const postcssImport = require('postcss-import');
 
-const STATIC_PATH = process.env.STATIC_PATH || '/static';
+const STATIC_PATH = process.env.STATIC_PATH || (process.env.NODE_ENV === 'production' ?'https://abc.520gxx.com/scratch':'')+'/static';
 const {APP_NAME} = require('./src/lib/brand');
 
-const root = process.env.ROOT || '';
+const root = process.env.ROOT || (process.env.NODE_ENV === 'production' ?'https://abc.520gxx.com/scratch/':'/')
 if (root.length > 0 && !root.endsWith('/')) {
     throw new Error('If ROOT is defined, it must have a trailing slash.');
 }
@@ -24,6 +24,8 @@ const htmlWebpackPluginCommon = {
     meta: JSON.parse(process.env.EXTRA_META || '{}'),
     APP_NAME
 };
+
+// console.log(process.env.NODE_ENV)
 
 const base = {
     mode: process.env.NODE_ENV === 'production' ? 'production' : 'development',
@@ -49,7 +51,7 @@ const base = {
         library: 'GUI',
         filename: process.env.NODE_ENV === 'production' ? 'js/[name].[contenthash].js' : 'js/[name].js',
         chunkFilename: process.env.NODE_ENV === 'production' ? 'js/[name].[contenthash].js' : 'js/[name].js',
-        publicPath: root
+        publicPath:  root
     },
     resolve: {
         symlinks: false,

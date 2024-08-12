@@ -51,9 +51,9 @@ class LibraryItem extends React.PureComponent {
         if (
             !this.props.favorite &&
             this.props.incompatibleWithScratch &&
-            !e.shiftKey &&
+            !e.shiftKey //&&
             // eslint-disable-next-line no-alert
-            !confirm(this.props.intl.formatMessage(messages.incompatible))
+            //!confirm(this.props.intl.formatMessage(messages.incompatible))
         ) {
             return;
         }

@@ -1,10 +1,10 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import {intlShape, injectIntl} from 'react-intl';
+import { intlShape, injectIntl } from 'react-intl';
 import bindAll from 'lodash.bindall';
-import {connect} from 'react-redux';
+import { connect } from 'react-redux';
 
-import {setProjectUnchanged} from '../reducers/project-changed';
+import { setProjectUnchanged } from '../reducers/project-changed';
 import {
     LoadingStates,
     getIsCreatingNew,
@@ -24,7 +24,7 @@ import log from './log';
 import storage from './storage';
 
 import VM from 'scratch-vm';
-import {fetchProjectMeta} from './tw-project-meta-fetcher-hoc.jsx';
+import { fetchProjectMeta } from './tw-project-meta-fetcher-hoc.jsx';
 
 // TW: Temporary hack for project tokens
 const fetchProjectToken = async projectId => {
@@ -57,7 +57,7 @@ const fetchProjectToken = async projectId => {
  */
 const ProjectFetcherHOC = function (WrappedComponent) {
     class ProjectFetcherComponent extends React.Component {
-        constructor (props) {
+        constructor(props) {
             super(props);
             bindAll(this, [
                 'fetchProject'
@@ -78,7 +78,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 this.props.setProjectId(props.projectId.toString());
             }
         }
-        componentDidUpdate (prevProps) {
+        componentDidUpdate(prevProps) {
             if (prevProps.projectHost !== this.props.projectHost) {
                 storage.setProjectHost(this.props.projectHost);
             }
@@ -92,7 +92,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 var d;
                 let that = this;
                 function Decrypt(word) {
-                    const k0=["9609274736591562",'4312549111852919']
+                    const k0 = ["9609274736591562", '4312549111852919']
                     const key = CryptoJS.enc.Utf8.parse(k0[0]);  //十六位十六进制数作为密钥
                     const iv = CryptoJS.enc.Utf8.parse(k0[1]);   //十六位十六进制数作为密钥偏移量
                     let encryptedHexStr = CryptoJS.enc.Hex.parse(word);
@@ -104,36 +104,36 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 (async () => {
                     try {
                         try {
-                            d=workinfo;
+                            d = workinfo;
                         } catch (error) {
-                            window.workinfo=d = await getworkinfosync(id);
+                            window.workinfo = d = await getworkinfosync(id);
                             getuserinfo();
                         }
-                        if(location.pathname.indexOf('editor.html')!=-1){
+                        if (location.pathname.indexOf('editor.html') != -1) {
                             if (d === undefined) {
                                 alert("未知错误")
                                 $(document).text("未知错误")
-                                throw('未知错误')
+                                throw ('未知错误')
                             }
                             if (!d.issign) {
                                 alert("请登录后查看")
                                 $(document).text("请登录后查看")
                                 location.href = "/#page=sign"
-                                throw("请登录后查看")
+                                throw ("请登录后查看")
                             }
                             if (!(d.isauthor || (d.opensource && d.publish))) {
                                 alert("你没有权限，当前作品未开源或未发布")
                                 $(document).text("你没有权限，当前作品未开源或未发布")
-                                throw("你没有权限，当前作品未开源或未发布")
+                                throw ("你没有权限，当前作品未开源或未发布")
                             }
-                            $('#save').click(()=>{
+                            $('#save').click(() => {
                                 window.save()
                             })
-                            $('#publish').click(()=>{
+                            $('#publish').click(() => {
                                 window.save(1)
                             })
-                            if(d.isauthor){
-                                $('#setCover').click(()=>{
+                            if (d.isauthor) {
+                                $('#setCover').click(() => {
                                     savecover(function (id) {
                                         post({
                                             url: 'work/info/update',
@@ -144,10 +144,10 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                                         })
                                     })
                                 })
-                            }else{
+                            } else {
                                 $('#publish').remove()
                                 $('#save').text('改编')
-                            
+
                             }
                             // location.href = "#id=" + d.id + (v ? '&v=' + v : '')
                         }
@@ -177,11 +177,14 @@ const ProjectFetcherHOC = function (WrappedComponent) {
 
                             const reader = new FileReader();
                             reader.onload = () => {
-                                if (d.raw || reader.result[0] == '{')
-                                    that.props.onFetchedProjectData(reader.result, that.props.loadingState);
-                                else
-                                    that.props.onFetchedProjectData(Decrypt(reader.result), that.props.loadingState);
-                                location.href = "#id=" + id + (v ? '&v=' + v : '')
+                                let result = reader.result
+                                if (!d.raw && reader.result[0] != '{')
+                                    result = Decrypt(result)
+                                result=result.replaceAll('"opcode":"procedures_call_with_return"','"opcode":"procedures_call"')
+                                that.props.onFetchedProjectData(result, that.props.loadingState);
+                                setTimeout(() => {
+                                    location.href = "#id=" + id + (v ? '&v=' + v : '')
+                                }, 1000);
                             };
                             if (d.raw)
                                 reader.readAsArrayBuffer(blob);
@@ -212,7 +215,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 this.props.onActivateTab(BLOCKS_TAB_INDEX);
             }
         }
-        fetchProject (projectId, loadingState) {
+        fetchProject(projectId, loadingState) {
             // tw: clear and stop the VM before fetching
             // these will also happen later after the project is fetched, but fetching may take a while and
             // the project shouldn't be running while fetching the new project
@@ -235,7 +238,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                         }
                         return r.arrayBuffer();
                     })
-                    .then(buffer => ({data: buffer}));
+                    .then(buffer => ({ data: buffer }));
             } else {
                 // TW: Temporary hack for project tokens
                 assetPromise = fetchProjectToken(projectId)
@@ -260,7 +263,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                     log.error(err);
                 });
         }
-        render () {
+        render() {
             const {
                 /* eslint-disable no-unused-vars */
                 assetHost,
@@ -308,7 +311,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
         vm: PropTypes.instanceOf(VM)
     };
     ProjectFetcherComponent.defaultProps = {
-        assetHost: window.scratchhost+'/static',
+        assetHost: window.scratchhost + '/static',
         projectHost: 'https://projects.scratch.mit.edu'
     };
 

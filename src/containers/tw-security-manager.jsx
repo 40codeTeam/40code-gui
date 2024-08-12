@@ -258,25 +258,26 @@ class TWSecurityManagerComponent extends React.Component {
             log.info(`Loading extension ${url} automatically`);
             return true;
         }
-        const { showModal } = await this.acquireModalLock();
-        if (url.startsWith('data:')) {
-            const allowed = await showModal(SecurityModals.LoadExtension, {
-                url,
-                unsandboxed: getPersistedUnsandboxed(),
-                onChangeUnsandboxed: this.handleChangeUnsandboxed.bind(this)
-            });
-            if (allowed) {
-                setPersistedUnsandboxed(this.state.data.unsandboxed);
-            }
-            if (allowed && this.state.data.unsandboxed) {
-                manuallyTrustExtension(url);
-            }
-            return allowed;
-        }
-        return showModal(SecurityModals.LoadExtension, {
-            url,
-            unsandboxed: false
-        });
+        // const { showModal } = await this.acquireModalLock();
+        // if (url.startsWith('data:')) {
+        //     const allowed = await showModal(SecurityModals.LoadExtension, {
+        //         url,
+        //         unsandboxed: getPersistedUnsandboxed(),
+        //         onChangeUnsandboxed: this.handleChangeUnsandboxed.bind(this)
+        //     });
+        //     if (allowed) {
+        //         setPersistedUnsandboxed(this.state.data.unsandboxed);
+        //     }
+        //     if (allowed && this.state.data.unsandboxed) {
+        //         manuallyTrustExtension(url);
+        //     }
+        //     return allowed;
+        // }
+        return false
+        // return showModal(SecurityModals.LoadExtension, {
+        //     url,
+        //     unsandboxed: false
+        // });
     }
 
     /**
@@ -396,21 +397,22 @@ class TWSecurityManagerComponent extends React.Component {
      * @returns {Promise<boolean>} True if embed is allowed.
      */
     async canEmbed(url) {
-        const parsed = parseURL(url);
-        if (!parsed) {
-            return false;
-        }
-        const origin = (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.origin : null;
-        const { showModal, releaseLock } = await this.acquireModalLock();
-        if (origin && embedOriginsTrustedByUser.has(origin)) {
-            releaseLock();
-            return true;
-        }
-        const allowed = await showModal(SecurityModals.Embed, { url });
-        if (origin && allowed) {
-            embedOriginsTrustedByUser.add(origin);
-        }
-        return allowed;
+        return false
+        // const parsed = parseURL(url);
+        // if (!parsed) {
+        //     return false;
+        // }
+        // const origin = (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.origin : null;
+        // const { showModal, releaseLock } = await this.acquireModalLock();
+        // if (origin && embedOriginsTrustedByUser.has(origin)) {
+        //     releaseLock();
+        //     return true;
+        // }
+        // const allowed = await showModal(SecurityModals.Embed, { url });
+        // if (origin && allowed) {
+        //     embedOriginsTrustedByUser.add(origin);
+        // }
+        // return allowed;
     }
 
     render() {
