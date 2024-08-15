@@ -61,7 +61,7 @@ const fetchLibraryWithType = async (type = 'tw') => {
         descriptionTranslations: extension.descriptionTranslations || {},
         extensionId: type == 'tw' ?extension.id:extension.extId,
         extensionURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.slug}.js` :`${window.scratchhost}/ext/${extension.extId}.js`,
-        iconURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.image || 'images/unknown.svg'}` : 'images/unknown.svg',
+        iconURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.image || 'images/unknown.svg'}` : (extension.image || 'images/unknown.svg'),
         tags: [type],
         credits: [
             ...(extension.by || []),
@@ -126,7 +126,7 @@ function addSpacesToValues(arr) {
 
 const fetchLibrary = async () => {
     // return await fetchLibraryWithType('tw')
-    let data=addSpacesToValues(removeDuplicatesByKey([...(await fetchLibraryWithType('tw')), ...(await fetchLibraryWithType('40code'))],'extensionId'))
+    let data=addSpacesToValues(removeDuplicatesByKey([...(await fetchLibraryWithType('40code')), ...(await fetchLibraryWithType('tw'))],'extensionId'))
     console.log(data)
     return data
 }

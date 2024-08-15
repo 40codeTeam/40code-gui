@@ -495,4 +495,4 @@ var apihost = "https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/",
   scratchhost = "https://abc.520gxx.com";
 var id = getQueryString('id'),
   v = window.getQueryString('v')
-var temp2 = {}
+var temp2 = {apihost}
