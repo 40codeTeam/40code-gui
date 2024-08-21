@@ -22,7 +22,19 @@ const PackagerIntegrationHOC = function (WrappedComponent) {
         }
         handleClickPackager () {
             if (this.props.canOpenPackager) {
-                window.open(`${PACKAGER_URL}/?import_from=${location.origin}`);
+                // window.open(`${PACKAGER_URL}/?import_from=${location.origin}`);
+                const url = 'https://packager.40code.com';
+                const newTab = window.open(url);
+                const m = async e => {
+                    // if (e.event.origin !== url){
+                    //     return;
+                    // }
+                    window.removeEventListener('message', m);
+                    console.log(e);
+                    newTab.postMessage(await window.vm.saveProjectSb3(), '*');
+                };
+                window.addEventListener('message', m);
+                
             }
         }
         handleMessage (e) {

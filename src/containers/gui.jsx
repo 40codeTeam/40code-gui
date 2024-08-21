@@ -59,6 +59,9 @@ class GUI extends React.Component {
         this.props.onStorageInit(storage);
         this.props.onVmInit(this.props.vm);
         setProjectIdMetadata(this.props.projectId);
+        if(!window.scratch)window.scratch={}
+        window.scratch.getProjectCover=this.getProjectCover;
+        window.scratch.getProjectCoverBlob=this.getProjectCoverBlob;
     }
     componentDidUpdate (prevProps) {
         if (this.props.projectId !== prevProps.projectId) {
@@ -106,6 +109,21 @@ class GUI extends React.Component {
                 {children}
             </GUIComponent>
         );
+    }
+    getProjectCover (callback) {
+        vm.postIOData('video', {forceTransparentPreview: true});
+        vm.renderer.requestSnapshot(dataURI => {
+            vm.postIOData('video', {forceTransparentPreview: false});
+            callback(dataURI);
+        });
+        vm.renderer.draw();
+    }
+    getProjectCoverBlob(callback){
+        vm.renderer.draw()
+        let canvas = vm.renderer.canvas
+        canvas.toBlob(function(blob) {
+          callback(blob)
+        })
     }
 }
 
