@@ -11,10 +11,10 @@ const autoprefixer = require('autoprefixer');
 const postcssVars = require('postcss-simple-vars');
 const postcssImport = require('postcss-import');
 
-const STATIC_PATH = process.env.STATIC_PATH || (process.env.NODE_ENV === 'production' ?'https://abc.520gxx.com/scratch':'')+'/static';
+const STATIC_PATH = process.env.STATIC_PATH || `${process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch' : './'}static`;
 const {APP_NAME} = require('./src/lib/brand');
 
-const root = process.env.ROOT || (process.env.NODE_ENV === 'production' ?'https://abc.520gxx.com/scratch/':'/')
+const root = process.env.ROOT || (process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch/' : './');
 if (root.length > 0 && !root.endsWith('/')) {
     throw new Error('If ROOT is defined, it must have a trailing slash.');
 }
@@ -51,7 +51,7 @@ const base = {
         library: 'GUI',
         filename: process.env.NODE_ENV === 'production' ? 'js/[name].[contenthash].js' : 'js/[name].js',
         chunkFilename: process.env.NODE_ENV === 'production' ? 'js/[name].[contenthash].js' : 'js/[name].js',
-        publicPath:  root
+        publicPath: root
     },
     resolve: {
         symlinks: false,
@@ -141,6 +141,9 @@ const base = {
 if (!process.env.CI) {
     base.plugins.push(new webpack.ProgressPlugin());
 }
+
+// eslint-disable-next-line global-require
+// if (process.env.desktop) require('./toDesktop.js');
 
 module.exports = [
     // to run editor examples

@@ -547,4 +547,17 @@ window.markdownToHtml = e => {
   if (d.indexOf('iframe') == -1) return d;
   console.log('问问', d, modifyBilibiliTags(d))
   return modifyBilibiliTags(d)
+};
+window.userAgent = navigator.userAgent.toLowerCase()
+window.isElectron = userAgent.indexOf(' electron/') > -1
+if(window.isElectron){
+  var {shell}=eval('require("electron")')
+  window.$ = window.jQuery = eval('require("../other/jquery.min.js")')
+  window.mdui = eval('require("../other/mdui.min.js")')
+  window.shell=shell
+  window.prompt=async(t)=>{try{return await mdui.prompt({
+    headline: "t",
+    confirmText: "确定",
+    cancelText: "取消"
+  })}catch(e){return null}};
 }

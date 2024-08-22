@@ -89,8 +89,20 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                 storage.setAssetHost(this.props.assetHost);
             }
             if (this.props.isFetchingWithId && !prevProps.isFetchingWithId) {
+                const that = this;
+                if(window.isElectron){
+                    fetch('../other/1.sb3').then(r => r.blob()).then(blob => {
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            that.props.onFetchedProjectData(reader.result, that.props.loadingState);
+                        };
+                        reader.readAsArrayBuffer(blob);
+                    })
+                    $('#ch').remove()
+                    return
+                }
                 var d;
-                let that = this;
+                
                 function Decrypt(word) {
                     const k0 = ["9609274736591562", '4312549111852919']
                     const key = CryptoJS.enc.Utf8.parse(k0[0]);  //十六位十六进制数作为密钥

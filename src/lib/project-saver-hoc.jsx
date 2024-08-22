@@ -123,13 +123,25 @@ const ProjectSaverHOC = function (WrappedComponent) {
             this.props.onSetProjectThumbnailer(null);
             this.props.onSetProjectSaver(null);
         }
+        
         leavePageConfirm (e) {
             if (this.props.projectChanged) {
                 // both methods of returning a value may be necessary for browser compatibility
+                if (window.isElectron){
+                    mdui.confirm({
+                        headline: "确定要离开吗",
+                        confirmText: "是",
+                        cancelText: "否",
+                        onConfirm: () => eval("require('electron').ipcRenderer.send('win-close')"),
+                        onCancel: () => {},
+                    });
+                }
                 (e || window.event).returnValue = true;
-                return true;
+                    return true;
+            }else{
+                return;
             }
-            return; // Returning undefined prevents the prompt from coming up
+             // Returning undefined prevents the prompt from coming up
         }
         clearAutoSaveTimeout () {
             if (this.props.autoSaveTimeoutId !== null) {

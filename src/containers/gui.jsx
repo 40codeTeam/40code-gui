@@ -154,7 +154,7 @@ GUI.propTypes = {
 };
 
 GUI.defaultProps = {
-    isScratchDesktop: false,
+    isScratchDesktop: window.isElectron,
     isTotallyNormal: false,
     onStorageInit: storageInstance => storageInstance.addOfficialScratchWebStores(),
     onProjectLoaded: () => {},
