@@ -44,7 +44,7 @@ let cachedGallery = null;
 const fetchLibraryWithType = async (type = 'tw') => {
     let url
     if (type == 'tw')
-        url = 'https://extensions.turbowarp.org/generated-metadata/extensions-v0.json'
+        url = 'https://statics.40code.com/ext-t.json'//'https://extensions.turbowarp.org/generated-metadata/extensions-v0.json'
     else
         url = window.apihost + 'work/ext'
     const res = await fetch(url);

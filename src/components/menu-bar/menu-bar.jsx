@@ -1169,13 +1169,13 @@ class MenuBar extends React.Component {
                         </div>
                     )}
                     {!window.isElectron && (
-                        <span>
-                            <Button id="publish">
+                        <div className={classNames(styles.menuBarItem)}>
+                              <Button id="publish">
                                 <FormattedMessage defaultMessage="发布" id="1"/>
                             </Button>
                             <Button id="save"><FormattedMessage defaultMessage="保存" id="2"/></Button>
                             <Button id="setCover"><FormattedMessage defaultMessage="设置舞台为封面" id="3"/></Button>
-                        </span>
+                        </div>
                     )}
                 </div>
 

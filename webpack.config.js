@@ -14,10 +14,12 @@ const postcssImport = require('postcss-import');
 const STATIC_PATH = process.env.STATIC_PATH || `${process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch' : './'}static`;
 const {APP_NAME} = require('./src/lib/brand');
 
-const root = process.env.ROOT || (process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch/' : './');
+const root = process.env.ROOT || (process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch/' : '/');
 if (root.length > 0 && !root.endsWith('/')) {
     throw new Error('If ROOT is defined, it must have a trailing slash.');
 }
+
+console.log(STATIC_PATH)
 
 const htmlWebpackPluginCommon = {
     root: root,
@@ -25,7 +27,6 @@ const htmlWebpackPluginCommon = {
     APP_NAME
 };
 
-// console.log(process.env.NODE_ENV)
 
 const base = {
     mode: process.env.NODE_ENV === 'production' ? 'production' : 'development',

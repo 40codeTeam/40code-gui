@@ -204,6 +204,7 @@ class TWRestorePointManager extends React.Component {
     }
 
     createRestorePoint (type) {
+        if(window.top!=window) return;//防止在非创作页环境下创建还原点
         if (this.props.isModalVisible) {
             this.setState({
                 loading: true
