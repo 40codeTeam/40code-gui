@@ -171,6 +171,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                         //     };
                         //     reader.readAsArrayBuffer(blob);
                         // });
+                        console.log('fuck')
                         if (d.onlyFirefox && navigator.userAgent.indexOf("Firefox") == -1) {
                             alert('当前作品仅支持Firefox（火狐）浏览器打开，请切换至火狐浏览器')
                             throw new Error('仅支持Firefox')
@@ -181,7 +182,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                         }
                         toLogin()
                         window.onhashchange = toLogin
-                        fetch('https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/work/work?id=' + id + '&token=' + getCookie('token')
+                        fetch(`https://${window.apihost}work/work?id=` + id + '&token=' + getCookie('token')
                             + '&sha=' + getQueryString('sha')
                             + '&etime=' + getQueryString('etime')
                             + (v ? '&v=' + v : '')

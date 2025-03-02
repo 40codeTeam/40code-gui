@@ -11,10 +11,10 @@ const autoprefixer = require('autoprefixer');
 const postcssVars = require('postcss-simple-vars');
 const postcssImport = require('postcss-import');
 
-const STATIC_PATH = process.env.STATIC_PATH || `${process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch' : './'}static`;
+const STATIC_PATH = process.env.STATIC_PATH || `${process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch' : '/'}static`;
 const {APP_NAME} = require('./src/lib/brand');
 
-const root = process.env.ROOT || (process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch/' : '/');
+const root = process.env.ROOT || (process.env.NODE_ENV === 'production' && !process.env.desktop ? 'https://abc.520gxx.com/scratch/' : '');
 if (root.length > 0 && !root.endsWith('/')) {
     throw new Error('If ROOT is defined, it must have a trailing slash.');
 }
@@ -36,6 +36,7 @@ const base = {
         host: '0.0.0.0',
         disableHostCheck: true,
         compress: true,
+        // hot:true,
         port: process.env.PORT || 8601,
         // allows ROUTING_STYLE=wildcard to work properly
         historyApiFallback: {

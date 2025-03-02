@@ -1,4 +1,4 @@
-apihost = "https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/";
+apihost = "https://api.abc.520gxx.com/";
 window.waitRequest = {}, window.scratch = {
   search:(value)=>{
     let d=$('#mdl')[0].children
@@ -75,7 +75,7 @@ window.waitRequest = {}, window.scratch = {
   }
 };
 var temp2 = {
-  apihost: "https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/",
+  apihost: "https://api.abc.520gxx.com/",
 };
 function dataURLToBlob(dataurl) {
   var arr = dataurl.split(',');
