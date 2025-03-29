@@ -77,6 +77,7 @@
     "react-draggable": "3.0.5",
     "react-ga": "2.5.3",
     "react-intl": "2.9.0",
+    "react-json-editor-ajrm": "^2.5.14",
     "react-modal": "3.9.1",
     "react-popover": "0.5.10",
     "react-redux": "5.0.7",

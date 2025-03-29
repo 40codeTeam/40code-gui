@@ -490,7 +490,7 @@ function dataURLToBlob(dataurl) {
   }
   return new Blob([u8arr], { type: mime });
 }
-var apihost = "https://service-dq726wx5-1302921490.sh.apigw.tencentcs.com/",
+var apihost = "https://api.abc.520gxx.com/",
   mianhost = "http://127.0.0.1:5500",
   scratchhost = "https://abc.520gxx.com";
 var id = getQueryString('id'),
