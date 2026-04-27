@@ -1,14 +1,110 @@
-/* src/addons/json-script-converter/style.css */
+/* Styles for the JSON/script converter floating editor. */
 .jsonConverterContainer {
-    position: absolute;
-    top: 50px;
-    left: 50px;
-    background-color: white;
-    border: 1px solid black;
-    padding: 10px;
-    z-index: 1000; /* 确保悬浮在其他元素之上 */
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow: hidden;
 }
 
-.modalContent {
-  /* 这里可以添加 modal 内容的样式 */
+.jsonConverterContainer,
+.jsonConverterContainer * {
+  box-sizing: border-box;
+}
+
+.jsonConverterTitleBar span {
+  color: #172033;
+  font-size: 14px;
+  letter-spacing: 0;
+}
+
+.jsonConverterTitleBar::before {
+  content: "";
+  width: 4px;
+  height: 22px;
+  margin-right: 8px;
+  border-radius: 4px;
+  background: #2563eb;
+  flex: 0 0 auto;
+}
+
+.jsonConverterCloseButton,
+.jsonConverterActionButton,
+.jsonConverterLauncher,
+.jsonConverterEditor button {
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.jsonConverterCloseButton:hover {
+  background: #fee2e2 !important;
+  border-color: #fecaca !important;
+  color: #b42318 !important;
+}
+
+.jsonConverterCloseButton:focus-visible,
+.jsonConverterActionButton:focus-visible,
+.jsonConverterLauncher:focus-visible,
+.jsonConverterEditor button:focus-visible,
+.jsonConverterEditor input:focus-visible,
+.jsonConverterCheckbox:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, 0.35) !important;
+  outline-offset: 2px;
+}
+
+.jsonConverterToolbar {
+  min-height: 52px;
+}
+
+.jsonConverterActionButton:hover,
+.jsonConverterEditor button:hover {
+  background: #eef4ff !important;
+  border-color: #93b4f8 !important;
+  color: #174ea6 !important;
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.1) !important;
+}
+
+.jsonConverterModeButton:hover,
+.jsonConverterLauncher:hover {
+  background: #1d4ed8 !important;
+  border-color: #1d4ed8 !important;
+  color: #ffffff !important;
+}
+
+.jsonConverterLauncher:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 22px rgba(37, 99, 235, 0.28), 0 2px 6px rgba(15, 23, 42, 0.14) !important;
+}
+
+.jsonConverterSyncLabel:hover {
+  color: #174ea6 !important;
+}
+
+.jsonConverterEditor textarea::selection {
+  background: rgba(37, 99, 235, 0.22);
+}
+
+.jsonConverterEditor input:focus {
+  background: #ffffff !important;
+  border-color: #2563eb !important;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.jsonConverterStatus {
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+.jsonConverterContainer ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.jsonConverterContainer ::-webkit-scrollbar-track {
+  background: #eef2f7;
+}
+
+.jsonConverterContainer ::-webkit-scrollbar-thumb {
+  background: #b7c3d4;
+  border: 2px solid #eef2f7;
+  border-radius: 8px;
+}
+
+.jsonConverterContainer ::-webkit-scrollbar-thumb:hover {
+  background: #8fa0b6;
 }
