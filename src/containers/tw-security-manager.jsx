@@ -32,18 +32,6 @@ const isTrustedExtension = url => (
     extensionsTrustedByUser.has(url)
 );
 
-/**
- * Set of fetch resource origins that were manually trusted by the user.
- * @type {Set<string>}
- */
-const fetchOriginsTrustedByUser = new Set();
-
-/**
- * Set of origins manually trusted by the user for embedding.
- * @type {Set<string>}
- */
-const embedOriginsTrustedByUser = new Set();
-
 let list;
 
 /**
@@ -63,6 +51,7 @@ const isAlwaysTrustedForFetching = async parsed => {
         // GitHub API
         // GitHub Pages allows redirects, so not included here.
         parsed.origin === 'https://raw.githubusercontent.com' ||
+        parsed.origin === 'https://gist.githubusercontent.com' ||
         parsed.origin === 'https://api.github.com' ||
 
         // GitLab API
@@ -93,29 +82,38 @@ const isAlwaysTrustedForFetching = async parsed => {
     return list.indexOf(parsed.origin)!==-1
 };
 
+const FETCHABLE_PROTOCOLS = [
+    'http:',
+    'https:',
+    'data:',
+    'blob:',
+    'ws:',
+    'wss:'
+];
+
+const VISITABLE_PROTOCOLS = [
+    // The important one we want to exclude is javascript:
+    'http:',
+    'https:',
+    'data:',
+    'blob:',
+    'mailto:',
+    'steam:',
+    'calculator:'
+];
+
 /**
  * @param {string} url Original URL string
+ * @param {string[]} protocols List of allowed protocols
  * @returns {URL|null} A URL object if it is valid and of a known protocol, otherwise null.
  */
-const parseURL = url => {
+const parseURL = (url, protocols) => {
     let parsed;
     try {
         parsed = new URL(url);
     } catch (e) {
         return null;
     }
-    const protocols = [
-        // The important one we want to exclude is javascript:
-        'http:',
-        'https:',
-        'ws:',
-        'wss:',
-        'data:',
-        'blob:',
-        'mailto:',
-        'steam:',
-        'calculator:'
-    ];
     if (!protocols.includes(parsed.protocol)) {
         return null;
     }
@@ -139,7 +137,8 @@ const SECURITY_MANAGER_METHODS = [
     'canReadClipboard',
     'canNotify',
     'canGeolocate',
-    'canEmbed'
+    'canEmbed',
+    'canDownload'
 ];
 
 class TWSecurityManagerComponent extends React.Component {
@@ -285,26 +284,14 @@ class TWSecurityManagerComponent extends React.Component {
      * @returns {Promise<boolean>} True if the resource is allowed to be fetched
      */
     async canFetch(url) {
-        const parsed = parseURL(url);
+        const parsed = parseURL(url, FETCHABLE_PROTOCOLS);
         if (!parsed) {
             return false;
         }
         if (await isAlwaysTrustedForFetching(parsed)) {
             return true;
         }
-        
-        // const {showModal, releaseLock} = await this.acquireModalLock();
-        // if (fetchOriginsTrustedByUser.has(origin)) {
-        //     releaseLock();
-        //     return true;
-        // }
-        // const allowed = await showModal(SecurityModals.Fetch, {
-        //     url
-        // });
-        // if (allowed) {
-        //     fetchOriginsTrustedByUser.add(origin);
-        // }
-        // return allowed;
+        return false;
     }
 
     /**
@@ -312,7 +299,7 @@ class TWSecurityManagerComponent extends React.Component {
      * @returns {Promise<boolean>} True if the website can be opened
      */
     async canOpenWindow(url) {
-        const parsed = parseURL(url);
+        const parsed = parseURL(url, VISITABLE_PROTOCOLS);
         if (!parsed) {
             return false;
         }
@@ -327,7 +314,7 @@ class TWSecurityManagerComponent extends React.Component {
      * @returns {Promise<boolean>} True if the website can be redirected to
      */
     async canRedirect(url) {
-        const parsed = parseURL(url);
+        const parsed = parseURL(url, VISITABLE_PROTOCOLS);
         if (!parsed) {
             return false;
         }
@@ -398,21 +385,23 @@ class TWSecurityManagerComponent extends React.Component {
      */
     async canEmbed(url) {
         return false
-        // const parsed = parseURL(url);
-        // if (!parsed) {
-        //     return false;
-        // }
-        // const origin = (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.origin : null;
-        // const { showModal, releaseLock } = await this.acquireModalLock();
-        // if (origin && embedOriginsTrustedByUser.has(origin)) {
-        //     releaseLock();
-        //     return true;
-        // }
-        // const allowed = await showModal(SecurityModals.Embed, { url });
-        // if (origin && allowed) {
-        //     embedOriginsTrustedByUser.add(origin);
-        // }
-        // return allowed;
+    }
+
+    /**
+     * @param {string} url URL to download
+     * @param {string} name Name to download as
+     * @returns {Promise<boolean>} True if allowed
+     */
+    async canDownload (url, name) {
+        const parsed = parseURL(url, FETCHABLE_PROTOCOLS);
+        if (!parsed) {
+            return false;
+        }
+        const {showModal} = await this.acquireModalLock();
+        return showModal(SecurityModals.Download, {
+            url,
+            name
+        });
     }
 
     render() {

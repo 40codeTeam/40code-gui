@@ -349,9 +349,14 @@ class MenuBar extends React.Component {
     }
     handleKeyPress(event) {
         const modifier = bowser.mac ? event.metaKey : event.ctrlKey;
-        if (modifier && event.key.toLowerCase() === "s") {
-            this.props.handleSaveProject();
-            event.preventDefault();
+        if (modifier) {
+            if (event.key.toLowerCase() === "s") {
+                this.props.handleSaveProject();
+                event.preventDefault();
+            } else if (event.key.toLowerCase() === "o") {
+                event.preventDefault();
+                this.props.onStartSelectingFileUpload();
+            }
         }
     }
     getSaveToComputerHandler(downloadProjectCallback) {
@@ -498,8 +503,13 @@ class MenuBar extends React.Component {
         );
         // Show the About button only if we have a handler for it (like in the desktop app)
         const aboutButton = this.buildAboutMenu(this.props.onClickAbout);
-        return (
-            <Box className={classNames(this.props.className, styles.menuBar)}>
+        const menuBar = (
+            <Box
+                className={classNames(
+                    this.props.className,
+                    styles.menuBar
+                )}
+            >
                 <div className={styles.mainMenu}>
                     <div className={styles.fileGroup}>
                         {this.props.errors.length > 0 && (
@@ -1187,6 +1197,13 @@ class MenuBar extends React.Component {
 
                 {aboutButton}
             </Box>
+        );
+
+        return (
+            <React.Fragment>
+                {menuBar}
+                {/* <TWNews /> */}
+            </React.Fragment>
         );
     }
 }

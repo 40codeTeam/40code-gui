@@ -87,7 +87,7 @@ const fetchLibraryWithType = async (type = 'tw') => {
             href: `${process.env.ROOT}editor?project_url=https://extensions.turbowarp.org/samples/${encodeURIComponent(sample)}.sb3`,
             text: sample
         })) : null,
-        incompatibleWithScratch: true,
+        incompatibleWithScratch: !extension.scratchCompatible,
         featured: true
     }));
 };
@@ -214,6 +214,7 @@ class ExtensionLibrary extends React.PureComponent {
                 try {
                     library.push(
                         ...this.state.gallery
+                            .filter(i => i.extensionId !== 'faceSensing')
                             .map(i => translateGalleryItem(i, locale))
                             .map(toLibraryItem)
                     );
