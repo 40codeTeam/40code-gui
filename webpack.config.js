@@ -19,7 +19,7 @@ if (root.length > 0 && !root.endsWith('/')) {
     throw new Error('If ROOT is defined, it must have a trailing slash.');
 }
 
-console.log(STATIC_PATH)
+console.log(STATIC_PATH);
 
 const htmlWebpackPluginCommon = {
     root: root,

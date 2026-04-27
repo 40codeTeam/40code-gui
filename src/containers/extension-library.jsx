@@ -2,7 +2,7 @@ import bindAll from 'lodash.bindall';
 import PropTypes from 'prop-types';
 import React from 'react';
 import VM from 'scratch-vm';
-import { defineMessages, injectIntl, intlShape } from 'react-intl';
+import {defineMessages, injectIntl, intlShape} from 'react-intl';
 import log from '../lib/log';
 
 import extensionLibraryContent, {
@@ -42,31 +42,34 @@ const translateGalleryItem = (extension, locale) => ({
 let cachedGallery = null;
 
 const fetchLibraryWithType = async (type = 'tw') => {
-    let url
-    if (type == 'tw')
-        url = 'https://statics.40code.com/ext-t.json'//'https://extensions.turbowarp.org/generated-metadata/extensions-v0.json'
-    else
-        url = window.apihost + 'work/ext'
+    let url;
+    if (type == 'tw') {
+        url = 'https://statics.40code.com/ext-t.json';
+    }// 'https://extensions.turbowarp.org/generated-metadata/extensions-v0.json'
+    else {
+        url = `${window.apihost}work/ext`;
+    }
     const res = await fetch(url);
     if (!res.ok) {
         throw new Error(`HTTP status ${res.status}`);
     }
     let data = await res.json();
-    if (type == 'tw')
-        data = data.extensions
+    if (type == 'tw') {
+        data = data.extensions;
+    }
     return data.map(extension => ({
         name: extension.name,
         nameTranslations: extension.nameTranslations || {},
         description: extension.description,
         descriptionTranslations: extension.descriptionTranslations || {},
-        extensionId: type == 'tw' ?extension.id:extension.extId,
-        extensionURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.slug}.js` :`${window.scratchhost}/ext/${extension.extId}.js`,
+        extensionId: type == 'tw' ? extension.id : extension.extId,
+        extensionURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.slug}.js` : `${window.scratchhost}/ext/${extension.extId}.js`,
         iconURL: type == 'tw' ? `https://extensions.turbowarp.org/${extension.image || 'images/unknown.svg'}` : (extension.image || 'images/unknown.svg'),
         tags: [type],
         credits: [
             ...(extension.by || []),
             ...(extension.original || []),
-            {name:extension.author}
+            {name: extension.author}
         ].map(credit => {
             if (credit.link) {
                 return (
@@ -91,7 +94,7 @@ const fetchLibraryWithType = async (type = 'tw') => {
         featured: true
     }));
 };
-function removeDuplicatesByKey(arr, key) {
+function removeDuplicatesByKey (arr, key) {
     const seen = new Map();
     return arr.filter(item => {
         if (!item.hasOwnProperty(key)) return false; // 如果没有指定的键，直接过滤掉
@@ -99,17 +102,17 @@ function removeDuplicatesByKey(arr, key) {
         const keyValue = item[key];
         if (seen.has(keyValue)) {
             return false; // 如果这个键值已经出现过，则过滤掉
-        } else {
-            seen.set(keyValue, true); // 否则添加到 Map 中
-            return true; // 保留这个项
         }
+        seen.set(keyValue, true); // 否则添加到 Map 中
+        return true; // 保留这个项
+        
     });
 }
-function addSpacesToValues(arr) {
+function addSpacesToValues (arr) {
     const seen = {};
 
     return arr.map(obj => {
-        const newObj = { ...obj };
+        const newObj = {...obj};
         
         if (newObj.name) {
             if (!seen[newObj.name]) {
@@ -126,13 +129,13 @@ function addSpacesToValues(arr) {
 
 const fetchLibrary = async () => {
     // return await fetchLibraryWithType('tw')
-    let data=addSpacesToValues(removeDuplicatesByKey([...(await fetchLibraryWithType('40code')), ...(await fetchLibraryWithType('tw'))],'extensionId'))
-    console.log(data)
-    return data
-}
+    const data = addSpacesToValues(removeDuplicatesByKey([...(await fetchLibraryWithType('40code')), ...(await fetchLibraryWithType('tw'))], 'extensionId'));
+    console.log(data);
+    return data;
+};
 
 class ExtensionLibrary extends React.PureComponent {
-    constructor(props) {
+    constructor (props) {
         super(props);
         bindAll(this, [
             'handleItemSelect'
@@ -143,7 +146,7 @@ class ExtensionLibrary extends React.PureComponent {
             galleryTimedOut: false
         };
     }
-    componentDidMount() {
+    componentDidMount () {
         if (!this.state.gallery) {
             const timeout = setTimeout(() => {
                 this.setState({
@@ -168,7 +171,7 @@ class ExtensionLibrary extends React.PureComponent {
                 });
         }
     }
-    handleItemSelect(item) {
+    handleItemSelect (item) {
         if (item.href) {
             return;
         }
@@ -203,7 +206,7 @@ class ExtensionLibrary extends React.PureComponent {
             }
         }
     }
-    render() {
+    render () {
         let library = null;
         if (this.state.gallery || this.state.galleryError || this.state.galleryTimedOut) {
             library = extensionLibraryContent.map(toLibraryItem);
@@ -219,8 +222,8 @@ class ExtensionLibrary extends React.PureComponent {
                             .map(toLibraryItem)
                     );
                 } catch (error) {
-                    console.log(this.state.gallery)
-                    console.error(error)
+                    console.log(this.state.gallery);
+                    console.error(error);
                 }
                 
             } else if (this.state.galleryError) {
