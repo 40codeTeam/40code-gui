@@ -26,3 +26,9 @@ npm-*
 
 # for act
 .secrets
+
+# Local runtime artifacts
+*.log
+*.err
+*.out
+*.pid
