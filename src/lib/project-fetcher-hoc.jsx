@@ -7,6 +7,7 @@ import { connect } from 'react-redux';
 import { setProjectUnchanged } from '../reducers/project-changed';
 import {
     LoadingStates,
+    defaultProjectId,
     getIsCreatingNew,
     getIsFetchingWithId,
     getIsLoading,
@@ -50,6 +51,20 @@ const fetchProjectToken = async projectId => {
     }
 };
 
+const isLocalhost = () => {
+    const {hostname} = location;
+    return hostname === 'localhost' ||
+        hostname === '0.0.0.0' ||
+        hostname === '::1' ||
+        hostname === '[::1]' ||
+        /^127\.\d+\.\d+\.\d+$/.test(hostname);
+};
+
+const shouldLoadDefaultProjectLocally = projectId => (
+    isLocalhost() &&
+    `${projectId}` === defaultProjectId
+);
+
 /* Higher Order Component to provide behavior for loading projects by id. If
  * there's no id, the default project is loaded.
  * @param {React.Component} WrappedComponent component to receive projectData prop
@@ -90,6 +105,10 @@ const ProjectFetcherHOC = function (WrappedComponent) {
             }
             if (this.props.isFetchingWithId && !prevProps.isFetchingWithId) {
                 const that = this;
+                if (shouldLoadDefaultProjectLocally(this.props.reduxProjectId)) {
+                    this.fetchProject(defaultProjectId, this.props.loadingState);
+                    return;
+                }
                 if(window.isElectron){
                     fetch('../other/1.sb3').then(r => r.blob()).then(blob => {
                         const reader = new FileReader();
