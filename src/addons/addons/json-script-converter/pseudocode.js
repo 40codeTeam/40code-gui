@@ -743,6 +743,27 @@ const renderPseudocode = (blocks, ctx, options) => {
         if (b.opcode === 'procedures_call') {
             return renderProceduresCall(b, 'expr');
         }
+        if (b.opcode === 'operator_not') {
+            const operand = b.inputs && b.inputs.OPERAND;
+            const innerId = operand && typeof operand[1] === 'string' ? operand[1] : null;
+            const inner = innerId && working[innerId];
+            if (inner && !Array.isArray(inner) && (
+                inner.opcode === 'operator_lt' ||
+                inner.opcode === 'operator_gt' ||
+                inner.opcode === 'operator_equals'
+            )) {
+                const innerDef = opcodeToDef.get(inner.opcode);
+                const leftInput = inner.inputs && inner.inputs[innerDef.args[0].name];
+                const rightInput = inner.inputs && inner.inputs[innerDef.args[1].name];
+                const left = leftInput ? renderInput(leftInput, innerDef.args[0], innerDef.infix.prec) : '""';
+                const right = rightInput ? renderInput(rightInput, innerDef.args[1], innerDef.infix.prec + 1) : '""';
+                const op = inner.opcode === 'operator_lt'
+                    ? '>='
+                    : (inner.opcode === 'operator_gt' ? '<=' : '!=');
+                const s = `${left} ${op} ${right}`;
+                return innerDef.infix.prec < parentPrec ? `(${s})` : s;
+            }
+        }
         const def = opcodeToDef.get(b.opcode);
         if (!def) return renderGenericCall(b);
         if (def.prefix) {
@@ -884,6 +905,52 @@ const renderPseudocode = (blocks, ctx, options) => {
         return escapeString(name);
     };
 
+    const getVariableRefFromInput = inputArr => {
+        if (!Array.isArray(inputArr)) return null;
+        const primary = inputArr[1];
+        if (Array.isArray(primary) && primary[0] === 12) {
+            return {name: primary[1], id: primary[2]};
+        }
+        if (typeof primary === 'string') {
+            const refBlock = working[primary];
+            const field = refBlock && !Array.isArray(refBlock) && refBlock.opcode === 'data_variable' &&
+                refBlock.fields && refBlock.fields.VARIABLE;
+            if (field) return {name: field[0], id: field[1]};
+        }
+        return null;
+    };
+
+    const sameVariableRef = (a, b) => {
+        if (!a || !b) return false;
+        if (a.id && b.id) return a.id === b.id;
+        return a.name === b.name;
+    };
+
+    const tryRenderCompoundSet = block => {
+        const compoundOps = {
+            operator_add: '+=',
+            operator_subtract: '-=',
+            operator_multiply: '*=',
+            operator_divide: '/=',
+            operator_mod: '%='
+        };
+        const vf = block.fields && block.fields.VARIABLE;
+        const valueInput = block.inputs && block.inputs.VALUE;
+        const valueBlockId = valueInput && typeof valueInput[1] === 'string' ? valueInput[1] : null;
+        const valueBlock = valueBlockId && working[valueBlockId];
+        if (!vf || !valueBlock || Array.isArray(valueBlock)) return null;
+        const op = compoundOps[valueBlock.opcode];
+        if (!op) return null;
+        const def = opcodeToDef.get(valueBlock.opcode);
+        if (!def || !def.infix || !def.args || def.args.length < 2) return null;
+        const leftInput = valueBlock.inputs && valueBlock.inputs[def.args[0].name];
+        const rightInput = valueBlock.inputs && valueBlock.inputs[def.args[1].name];
+        const targetRef = {name: vf[0], id: vf[1]};
+        if (!sameVariableRef(targetRef, getVariableRefFromInput(leftInput))) return null;
+        const right = rightInput ? renderInput(rightInput, def.args[1], def.infix.prec + 1) : '""';
+        return `${renderVarLHS(vf[0])} ${op} ${right}`;
+    };
+
     const renderStmtBlock = (blockId, depth) => {
         const out = [];
         let cur = blockId;
@@ -910,6 +977,12 @@ const renderPseudocode = (blocks, ctx, options) => {
                 const vf = b.fields && b.fields.VARIABLE;
                 const varName = vf ? vf[0] : '';
                 const vInput = b.inputs && b.inputs.VALUE;
+                const compound = tryRenderCompoundSet(b);
+                if (compound) {
+                    out.push(indent(depth) + compound);
+                    cur = b.next;
+                    continue;
+                }
                 const valueStr = vInput ? renderInput(vInput, def.args[1], 0) : '""';
                 out.push(indent(depth) + `${renderVarLHS(varName)} = ${valueStr}`);
             } else if (b.opcode === 'data_changevariableby') {
@@ -1077,7 +1150,7 @@ const T = {
     OP: 'OP', NEWLINE: 'NL', EOF: 'EOF',
     HASH_KEYWORD: 'HASH'
 };
-const OPS_2CHAR = ['==', '!=', '<=', '>=', '&&', '||', '+='];
+const OPS_2CHAR = ['==', '!=', '<=', '>=', '&&', '||', '+=', '-=', '*=', '/=', '%='];
 const OPS_1CHAR = ['+', '-', '*', '/', '%', '<', '>', '!'];
 
 const tokenize = (source) => {
@@ -1200,11 +1273,12 @@ const BIN_OP_TO_OPCODE = {
 };
 const BIN_OP_ARGS = {
     '+': ['NUM1', 'NUM2', 4], '-': ['NUM1', 'NUM2', 4], '*': ['NUM1', 'NUM2', 4], '/': ['NUM1', 'NUM2', 4], '%': ['NUM1', 'NUM2', 4],
-    '==': ['OPERAND1', 'OPERAND2', 10], '<': ['OPERAND1', 'OPERAND2', 10], '>': ['OPERAND1', 'OPERAND2', 10],
+    '==': ['OPERAND1', 'OPERAND2', 10], '!=': ['OPERAND1', 'OPERAND2', 10], '<': ['OPERAND1', 'OPERAND2', 10], '>': ['OPERAND1', 'OPERAND2', 10],
+    '<=': ['OPERAND1', 'OPERAND2', 10], '>=': ['OPERAND1', 'OPERAND2', 10],
     '&&': ['OPERAND1', 'OPERAND2', null], '||': ['OPERAND1', 'OPERAND2', null]
 };
 const BIN_OP_PREC = {
-    '||': 3, '&&': 4, '==': 5, '<': 6, '>': 6, '+': 8, '-': 8, '*': 9, '/': 9, '%': 9
+    '||': 3, '&&': 4, '==': 5, '!=': 5, '<': 6, '>': 6, '<=': 6, '>=': 6, '+': 8, '-': 8, '*': 9, '/': 9, '%': 9
 };
 
 const parsePseudocode = (source, ctx) => {
@@ -1694,6 +1768,18 @@ const parsePseudocode = (source, ctx) => {
             return {blockId: id};
         }
         if (ast.kind === 'binop') {
+            if (ast.op === '>=' || ast.op === '<=' || ast.op === '!=') {
+                const compareOp = ast.op === '>=' ? '<' : (ast.op === '<=' ? '>' : '==');
+                const notId = addBlock('operator_not', {parent: parentId});
+                const compareId = addBlock(BIN_OP_TO_OPCODE[compareOp], {parent: notId});
+                const [a1, a2, primType] = BIN_OP_ARGS[compareOp];
+                const rL = compileExpr(ast.left, compareId, primType);
+                const rR = compileExpr(ast.right, compareId, primType);
+                setInputRef(compareId, a1, rL, primType);
+                setInputRef(compareId, a2, rR, primType);
+                setInputRef(notId, 'OPERAND', {blockId: compareId}, null);
+                return {blockId: notId};
+            }
             const opcode = BIN_OP_TO_OPCODE[ast.op];
             const [a1, a2, primType] = BIN_OP_ARGS[ast.op];
             const id = addBlock(opcode, {parent: parentId});
@@ -2010,22 +2096,49 @@ const parsePseudocode = (source, ctx) => {
         return heads.length ? heads[0] : null;
     };
 
-    // 复合赋值：target += RHS  → data_changevariableby(target, RHS)
-    const parseChangeBy = (parentBlockId) => {
+    const varRefAst = name => ({
+        kind: 'call',
+        name: 'var',
+        args: [{kind: 'strlit', value: name}],
+        kwargs: {}
+    });
+
+    // 复合赋值：
+    // target += RHS  → data_changevariableby(target, RHS)
+    // target -= RHS / *= / /= / %= → set target to target op RHS
+    const parseCompoundAssignment = (parentBlockId) => {
         const tok = peek();
         const name = String(tok.value);
         eat(); // target token
-        eat(); // '+='
+        const opToken = peek();
+        const assignOp = String(opToken.value || '');
+        const mathOp = assignOp.slice(0, -1);
+        eat(); // compound operator
         const rhsAst = parseExpression(0);
         const ref = resolveVariableRef(name);
-        const id = addBlock('data_changevariableby', {parent: parentBlockId});
+        const id = addBlock(assignOp === '+=' ? 'data_changevariableby' : 'data_setvariableto', {parent: parentBlockId});
         outBlocks[id].fields.VARIABLE = [ref.name, ref.id];
-        const r = compileExpr(rhsAst, id, 4);
-        setInputRef(id, 'VALUE', r, 4);
+        if (assignOp === '+=') {
+            const r = compileExpr(rhsAst, id, 4);
+            setInputRef(id, 'VALUE', r, 4);
+            return id;
+        }
+        if (!BIN_OP_TO_OPCODE[mathOp]) {
+            errors.push({line: opToken.line, col: opToken.col, message: `不支持的复合赋值运算符: ${assignOp}`});
+            return null;
+        }
+        const r = compileExpr({
+            kind: 'binop',
+            op: mathOp,
+            left: varRefAst(name),
+            right: rhsAst
+        }, id, 10);
+        setInputRef(id, 'VALUE', r, 10);
         return id;
     };
 
-    // 赋值语句：target (= target)* = RHS   （连等右结合；所有 target 拿同一个 RHS 值）
+    // 赋值语句：target (= target)* = RHS
+    // 连等按右结合顺序执行：c = b = a = a * 5  →  a = a * 5; b = a; c = b
     // 左侧可以是裸标识符（会经 sanitize 反查真实变量名）或字符串字面量（直接当变量名）。
     const parseAssignment = (parentBlockId) => {
         const targetNames = [];
@@ -2037,11 +2150,13 @@ const parsePseudocode = (source, ctx) => {
         }
         const rhsAst = parseExpression(0);
         const ids = [];
-        for (const t of targetNames) {
+        for (let i = targetNames.length - 1; i >= 0; i--) {
+            const t = targetNames[i];
+            const valueAst = i === targetNames.length - 1 ? rhsAst : varRefAst(targetNames[i + 1].raw);
             const ref = resolveVariableRef(t.raw);
             const id = addBlock('data_setvariableto', {parent: parentBlockId});
             outBlocks[id].fields.VARIABLE = [ref.name, ref.id];
-            const r = compileExpr(rhsAst, id, 10);
+            const r = compileExpr(valueAst, id, 10);
             setInputRef(id, 'VALUE', r, 10);
             ids.push(id);
         }
@@ -2245,10 +2360,10 @@ const parsePseudocode = (source, ctx) => {
         if ((peek().type === T.IDENT || peek().type === T.STRING) && peek(1).type === T.EQUALS) {
             return parseAssignment(parentBlockId);
         }
-        // 复合赋值：IDENT += ... / STRING += ...
+        // 复合赋值：IDENT +=, -=, *=, /=, %= ... / STRING 同理
         if ((peek().type === T.IDENT || peek().type === T.STRING)
-                && peek(1).type === T.OP && peek(1).value === '+=') {
-            return parseChangeBy(parentBlockId);
+                && peek(1).type === T.OP && ['+=', '-=', '*=', '/=', '%='].indexOf(peek(1).value) >= 0) {
+            return parseCompoundAssignment(parentBlockId);
         }
         const t = peek();
         if (t.type !== T.IDENT) {
@@ -2433,10 +2548,10 @@ const parsePseudocode = (source, ctx) => {
             skipNewlines();
             continue;
         }
-        // 顶层赋值：IDENT = ... / STRING = ...（含连等）或 IDENT += ...
+        // 顶层赋值：IDENT = ... / STRING = ...（含连等）或复合赋值
         if ((after.type === T.IDENT || after.type === T.STRING)
                 && (peek(1).type === T.EQUALS
-                    || (peek(1).type === T.OP && peek(1).value === '+='))) {
+                    || (peek(1).type === T.OP && ['+=', '-=', '*=', '/=', '%='].indexOf(peek(1).value) >= 0))) {
             const id = parseStatement(null);
             if (id) {
                 outBlocks[id].topLevel = true;

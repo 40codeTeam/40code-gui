@@ -1,4 +1,4 @@
-/* Styles for the JSON/script converter floating editor. */
+/* Styles for the block script assistant floating editor. */
 .jsonConverterContainer {
   font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   overflow: hidden;
@@ -88,6 +88,46 @@
 
 .jsonConverterStatus {
   font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+.jsonConverterAiSpinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #cbd5e1;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: jsonConverterAiSpin 700ms linear infinite;
+  flex: 0 0 auto;
+}
+
+@keyframes jsonConverterAiSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.jsonConverterAiModelMenu {
+  scrollbar-width: thin;
+  scrollbar-color: #94a3b8 #f1f5f9;
+}
+
+.jsonConverterAiModelMenu::-webkit-scrollbar {
+  width: 10px;
+}
+
+.jsonConverterAiModelMenu::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 8px;
+}
+
+.jsonConverterAiModelMenu::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border: 2px solid #f1f5f9;
+  border-radius: 8px;
+}
+
+.jsonConverterAiModelMenu::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
 }
 
 .jsonConverterContainer ::-webkit-scrollbar {
