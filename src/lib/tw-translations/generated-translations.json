@@ -4685,6 +4685,7 @@
         "tw.viewOnScratch": "Xem dự án trên Scratch"
     },
     "zh-cn": {
+        "paint.modeTools.cornerRadius": "\u5706\u89d2\u5c3a\u5bf8",
         "tw.accent.blue": "蓝色",
         "tw.accent.purple": "紫色",
         "tw.accent.rainbow": "彩虹色",
@@ -4949,6 +4950,7 @@
         "tw.viewOnScratch": "在 Scratch 网站上查看作品"
     },
     "zh-tw": {
+        "paint.modeTools.cornerRadius": "\u5713\u89d2\u5c3a\u5bf8",
         "tw.alerts.lostPeripheralConnection": "與{extensionName}的連線中斷了。",
         "tw.backpack.rename": "新名稱:",
         "tw.blocks.addons": "擴充功能",
