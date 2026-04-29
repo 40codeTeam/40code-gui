@@ -5,7 +5,11 @@ import {connect} from 'react-redux';
 import log from '../lib/log';
 import CustomExtensionModalComponent from '../components/tw-custom-extension-modal/custom-extension-modal.jsx';
 import {closeCustomExtensionModal} from '../reducers/modals';
-import {manuallyTrustExtension, isTrustedExtension} from './tw-security-manager.jsx';
+import {
+    isAllowedRemoteExtensionURL,
+    isTrustedExtension,
+    manuallyTrustExtension
+} from '../lib/tw-extension-url-policy';
 import {getPersistedUnsandboxed, setPersistedUnsandboxed} from '../lib/tw-persisted-unsandboxed.js';
 
 /**
@@ -74,16 +78,7 @@ class CustomExtensionModal extends React.Component {
 
     hasValidInput () {
         if (this.state.type === 'url') {
-            try {
-                const parsed = new URL(this.state.url);
-                return (
-                    parsed.protocol === 'https:' ||
-                    parsed.protocol === 'http:' ||
-                    parsed.protocol === 'data:'
-                );
-            } catch (e) {
-                return false;
-            }
+            return isAllowedRemoteExtensionURL(this.state.url);
         }
 
         if (this.state.type === 'file') {
@@ -127,10 +122,8 @@ class CustomExtensionModal extends React.Component {
 
             if (this.state.type !== 'url') {
                 setPersistedUnsandboxed(this.state.unsandboxed);
-                if (this.state.unsandboxed) {
-                    for (const url of urls) {
-                        manuallyTrustExtension(url);
-                    }
+                for (const url of urls) {
+                    manuallyTrustExtension(url);
                 }
             }
 

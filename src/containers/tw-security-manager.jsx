@@ -5,32 +5,13 @@ import log from '../lib/log';
 import bindAll from 'lodash.bindall';
 import SecurityManagerModal from '../components/tw-security-manager-modal/security-manager-modal.jsx';
 import SecurityModals from '../lib/tw-security-manager-constants';
-import {getPersistedUnsandboxed, setPersistedUnsandboxed} from '../lib/tw-persisted-unsandboxed.js';
+import {
+    installExtensionURLPolicy,
+    isTrustedExtension,
+    manuallyTrustExtension
+} from '../lib/tw-extension-url-policy';
 
 /* eslint-disable require-atomic-updates */
-
-/**
- * Set of extension URLs that the user has manually trusted to load unsandboxed.
- */
-const extensionsTrustedByUser = new Set();
-
-const manuallyTrustExtension = url => {
-    extensionsTrustedByUser.add(url);
-};
-
-/**
- * Trusted extensions are loaded automatically and without a sandbox.
- * @param {string} url URL as a string.
- * @returns {boolean} True if the extension can is trusted
- */
-const isTrustedExtension = url => (
-    // Always trust our official extension repostiory.
-    url.startsWith('https://extensions.turbowarp.org/') ||
-    // For development.
-    url.startsWith('http://localhost:8000/') ||
-
-    extensionsTrustedByUser.has(url)
-);
 
 let list;
 
@@ -76,8 +57,10 @@ const isAlwaysTrustedForFetching = async parsed => {
     if (canLoad) return true;
     if (!list){
         try {
-            list = await (await fetch(`${apihost}work/urllist`)).json();
-        } catch (error) {}
+            list = await (await fetch(`${window.apihost}work/urllist`)).json();
+        } catch (error) {
+            // Ignore network failures; unknown URLs will remain untrusted.
+        }
     }
     return list.indexOf(parsed.origin) !== -1;
 };
@@ -160,6 +143,7 @@ class TWSecurityManagerComponent extends React.Component {
     }
 
     componentDidMount () {
+        installExtensionURLPolicy(this.props.vm);
         const vmSecurityManager = this.props.vm.extensionManager.securityManager;
         const propsSecurityManager = this.props.securityManager;
         for (const method of SECURITY_MANAGER_METHODS) {
@@ -252,7 +236,7 @@ class TWSecurityManagerComponent extends React.Component {
      * @param {string} url The extension's URL
      * @returns {Promise<boolean>} Whether the extension can be loaded
      */
-    async canLoadExtensionFromProject (url) {
+    canLoadExtensionFromProject (url) {
         if (isTrustedExtension(url)) {
             log.info(`Loading extension ${url} automatically`);
             return true;
@@ -380,10 +364,9 @@ class TWSecurityManagerComponent extends React.Component {
     }
 
     /**
-     * @param {string} url Frame URL
-     * @returns {Promise<boolean>} True if embed is allowed.
+     * @returns {boolean} True if embed is allowed.
      */
-    async canEmbed (url) {
+    canEmbed () {
         return false;
     }
 

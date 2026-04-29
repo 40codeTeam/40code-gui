@@ -4,7 +4,7 @@
 // 支持：常用 ~80 个 opcode 使用友好名；其余走 op("opcode", inputs={...}, fields={...}) 通用语法。
 //
 // 往返原则：
-//   - 每次导出都会在头部附带 vars/broadcasts/lists 名-ID 映射表（#vars{ ... }）
+//   - 每次导出都会在头部附带 vars/lists 名-ID 映射表（#vars{ ... }）；广播由引用自动创建
 //   - 导出顶层脚本时带 at(x, y) 位置注解
 //   - primType 由 OPCODE_DEFS 的 args 声明决定；reporter 作输入时自动包 [3, ..., shadow]
 //   - menu shadow（如 motion_goto_menu）由 args 的 menu 元信息自动生成/解析
@@ -465,6 +465,43 @@ for (const def of OPCODE_DEFS) {
     nameToDef.set(def.opcode, def);
 }
 
+const MATH_OP_NAME_TO_OPERATOR = new Map([
+    ['abs', 'abs'],
+    ['floor', 'floor'],
+    ['ceiling', 'ceiling'],
+    ['ceil', 'ceiling'],
+    ['sqrt', 'sqrt'],
+    ['sin', 'sin'],
+    ['cos', 'cos'],
+    ['tan', 'tan'],
+    ['asin', 'asin'],
+    ['acos', 'acos'],
+    ['atan', 'atan'],
+    ['ln', 'ln'],
+    ['log', 'log'],
+    ['exp', 'e ^'],
+    ['e_pow', 'e ^'],
+    ['pow_e', 'e ^'],
+    ['pow10', '10 ^'],
+    ['ten_pow', '10 ^']
+]);
+const MATH_OP_OPERATOR_TO_NAME = new Map([
+    ['abs', 'abs'],
+    ['floor', 'floor'],
+    ['ceiling', 'ceiling'],
+    ['sqrt', 'sqrt'],
+    ['sin', 'sin'],
+    ['cos', 'cos'],
+    ['tan', 'tan'],
+    ['asin', 'asin'],
+    ['acos', 'acos'],
+    ['atan', 'atan'],
+    ['ln', 'ln'],
+    ['log', 'log'],
+    ['e ^', 'exp'],
+    ['10 ^', 'pow10']
+]);
+
 // ========================= UTIL =========================
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
 // 包含 CJK 的合法标识符（用于裸引用变量名）
@@ -525,6 +562,7 @@ const shortIdAt = index => {
 // 输出：伪代码字符串
 const renderPseudocode = (blocks, ctx, options) => {
     const includeCoords = !options || options.includeCoords !== false;
+    const targetComments = (ctx && ctx.target && ctx.target.comments) || {};
     // 1) 先把压缩 primitive 块展开——我们在渲染器内部操作时，反而更方便处理"规整"形态。
     //    不修改输入：深拷贝。
     const working = JSON.parse(JSON.stringify(blocks));
@@ -532,7 +570,7 @@ const renderPseudocode = (blocks, ctx, options) => {
     // 且 VALUE 名字在这集合里时，裸标识符/字符串渲染（可读）；
     // 否则退回 arg("...") / arg_bool("...") 这种全限定形式（防御无 define 场景）。
     let currentProcArgs = null;
-    // 2) 收集所有 variable/broadcast/list 的 name→id 映射（用于 #vars / #broadcasts / #lists 头部）
+    // 2) 收集所有 variable/broadcast/list 的 name→id 映射（变量/列表用于头部，广播用于引用）
     const varMap = new Map(); // name -> id
     const broadcastMap = new Map();
     const listMap = new Map();
@@ -659,9 +697,33 @@ const renderPseudocode = (blocks, ctx, options) => {
     const {global: globalLists, local: localLists} = splitByScope(listMap, 'list');
     renderHeader('#vars', globalVars);
     renderHeader('#localvars', localVars);
-    renderHeader('#broadcasts', [...broadcastMap.keys()].sort());
     renderHeader('#lists', globalLists);
     renderHeader('#locallists', localLists);
+
+    const renderCommentLines = (text, depth) => {
+        const normalized = String(text == null ? '' : text).replace(/\r\n?/g, '\n').trim();
+        if (!normalized) return [];
+        const prefix = indent(depth);
+        return normalized.split('\n').map(line => `${prefix}// ${line}`);
+    };
+    const renderBlockCommentLines = (block, depth) => {
+        const commentId = block && !Array.isArray(block) && block.comment;
+        if (!commentId) return [];
+        const comment = targetComments && targetComments[commentId];
+        return renderCommentLines(comment && comment.text, depth);
+    };
+    const getWorkspaceComments = () => Object.keys(targetComments || {})
+        .map(id => ({id, ...targetComments[id]}))
+        .filter(comment => comment && !comment.blockId)
+        .sort((a, b) => {
+            const ay = Number.isFinite(Number(a.y)) ? Number(a.y) : 0;
+            const by = Number.isFinite(Number(b.y)) ? Number(b.y) : 0;
+            if (ay !== by) return ay - by;
+            const ax = Number.isFinite(Number(a.x)) ? Number(a.x) : 0;
+            const bx = Number.isFinite(Number(b.x)) ? Number(b.x) : 0;
+            if (ax !== bx) return ax - bx;
+            return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+        });
 
     // 6) 渲染每段脚本
     const renderExpr = (value, prec) => {
@@ -742,6 +804,16 @@ const renderPseudocode = (blocks, ctx, options) => {
         }
         if (b.opcode === 'procedures_call') {
             return renderProceduresCall(b, 'expr');
+        }
+        if (b.opcode === 'operator_mathop') {
+            const field = b.fields && b.fields.OPERATOR;
+            const operator = field ? String(field[0]) : '';
+            const name = MATH_OP_OPERATOR_TO_NAME.get(operator);
+            if (name) {
+                const input = b.inputs && b.inputs.NUM;
+                const value = input ? renderInput(input, {type: 'input', name: 'NUM', primType: 4}, 0) : '0';
+                return `${name}(${value})`;
+            }
         }
         if (b.opcode === 'operator_not') {
             const operand = b.inputs && b.inputs.OPERAND;
@@ -957,6 +1029,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         while (cur) {
             const b = working[cur];
             if (!b || Array.isArray(b)) break;
+            out.push(...renderBlockCommentLines(b, depth));
             // procedures 专用语法优先
             if (b.opcode === 'procedures_call') {
                 out.push(indent(depth) + renderProceduresCall(b, 'stmt'));
@@ -1082,6 +1155,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         const b = working[topId];
         const atPrefix = (includeCoords && b.topLevel !== false && (b.x !== undefined || b.y !== undefined)) ?
             `at(${Math.round(b.x || 0)}, ${Math.round(b.y || 0)}) ` : '';
+        const topCommentLines = Array.isArray(b) ? [] : renderBlockCommentLines(b, 0);
         if (Array.isArray(b)) {
             // 孤立 primitive（不常见，当"漂浮值"输出）
             lines.push(`${atPrefix}${renderPrimitive(b)}`);
@@ -1090,6 +1164,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         }
         // procedures 专用语法：定义和调用都走独立一行（不套 {}）
         if (b.opcode === 'procedures_definition') {
+            lines.push(...topCommentLines);
             lines.push(...renderProceduresDefine(topId, atPrefix));
             lines.push('');
             continue;
@@ -1098,11 +1173,13 @@ const renderPseudocode = (blocks, ctx, options) => {
             // 顶层：stmt call → 隐式 "proccode"(args) 形式；reporter call（mutation.return="1"）→ 必须显式 callret，
             // 否则 parser 会把裸 "proccode"(args) 当 stmt-call 而丢失 return 语义。
             const mode = (b.mutation && b.mutation.return === '1') ? 'topReturn' : 'stmt';
+            lines.push(...topCommentLines);
             lines.push(`${atPrefix}${renderProceduresCall(b, mode)}`);
             lines.push('');
             continue;
         }
         if (b.opcode === 'argument_reporter_string_number' || b.opcode === 'argument_reporter_boolean') {
+            lines.push(...topCommentLines);
             lines.push(`${atPrefix}${renderBlockAsExpr(topId, 0)}`);
             lines.push('');
             continue;
@@ -1111,6 +1188,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         if (def && def.kind === 'hat') {
             const argsStr = def.args.map(a => renderArg(b, a)).join(', ');
             const head = `${atPrefix}${def.name}(${argsStr})`;
+            lines.push(...topCommentLines);
             if (b.next) {
                 lines.push(`${head} {`);
                 lines.push(...renderStmtBlock(b.next, 1));
@@ -1125,12 +1203,19 @@ const renderPseudocode = (blocks, ctx, options) => {
             lines.push('}');
         } else if (def && (def.kind === 'reporter' || def.kind === 'boolean')) {
             // 浮动 reporter（Scratch 里可以从积木栏拖出单独的 reporter）
+            lines.push(...topCommentLines);
             lines.push(`${atPrefix}${renderBlockAsExpr(topId, 0)}`);
         } else {
             lines.push(`${atPrefix}{`);
             lines.push(...renderStmtBlock(topId, 1));
             lines.push('}');
         }
+        lines.push('');
+    }
+
+    const workspaceComments = getWorkspaceComments();
+    for (const comment of workspaceComments) {
+        lines.push(...renderCommentLines(comment.text, 0));
         lines.push('');
     }
 
@@ -1148,7 +1233,7 @@ const T = {
     LPAREN: '(', RPAREN: ')', LBRACE: '{', RBRACE: '}',
     COMMA: ',', COLON: ':', EQUALS: '=',
     OP: 'OP', NEWLINE: 'NL', EOF: 'EOF',
-    HASH_KEYWORD: 'HASH'
+    HASH_KEYWORD: 'HASH', COMMENT: 'COMMENT'
 };
 const OPS_2CHAR = ['==', '!=', '<=', '>=', '&&', '||', '+=', '-=', '*=', '/=', '%='];
 const OPS_1CHAR = ['+', '-', '*', '/', '%', '<', '>', '!'];
@@ -1157,7 +1242,12 @@ const tokenize = (source) => {
     const tokens = [];
     const errors = [];
     let i = 0, line = 1, col = 1;
-    const push = (type, value) => tokens.push({type, value, line, col});
+    const push = (type, value, pos) => tokens.push({
+        type,
+        value,
+        line: pos && pos.line != null ? pos.line : line,
+        col: pos && pos.col != null ? pos.col : col
+    });
     const advance = (n) => {
         for (let k = 0; k < n; k++) {
             if (source[i] === '\n') { line++; col = 1; } else { col++; }
@@ -1169,7 +1259,7 @@ const tokenize = (source) => {
         if (c === '\n') { push(T.NEWLINE, '\n'); advance(1); continue; }
         if (c === ' ' || c === '\t' || c === '\r') { advance(1); continue; }
         if (c === '#') {
-            // # 行首关键字：#vars / #broadcasts / #lists（或中文 #变量 / #广播 / #列表）
+            // # 行首关键字：#vars / #lists / #localvars / #locallists（或中文 #变量 / #列表 / #局部变量 / #局部列表）
             let j = i + 1;
             while (j < source.length && /[a-zA-Z_0-9\u4e00-\u9fa5]/.test(source[j])) j++;
             const word = source.slice(i + 1, j);
@@ -1178,7 +1268,28 @@ const tokenize = (source) => {
             continue;
         }
         if (c === '/' && source[i + 1] === '/') {
+            const startLine = line;
+            const startCol = col;
+            advance(2);
+            const start = i;
             while (i < source.length && source[i] !== '\n') advance(1);
+            push(T.COMMENT, source.slice(start, i).trim(), {line: startLine, col: startCol});
+            continue;
+        }
+        if (c === '/' && source[i + 1] === '*') {
+            const startLine = line;
+            const startCol = col;
+            advance(2);
+            const start = i;
+            while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) {
+                advance(1);
+            }
+            if (i >= source.length) {
+                errors.push({line: startLine, col: startCol, message: '未闭合的块注释'});
+                break;
+            }
+            push(T.COMMENT, source.slice(start, i).trim(), {line: startLine, col: startCol});
+            advance(2);
             continue;
         }
         if (c === '(') { push(T.LPAREN, '('); advance(1); continue; }
@@ -1397,7 +1508,66 @@ const parsePseudocode = (source, ctx) => {
     let cursor = 0;
     const peek = (k = 0) => tokens[Math.min(cursor + k, tokens.length - 1)];
     const eat = () => tokens[cursor++];
-    const skipNewlines = () => { while (peek().type === T.NEWLINE) cursor++; };
+    const outComments = {};
+    let commentCounter = 0;
+    let pendingComments = [];
+    const cleanCommentText = text => String(text == null ? '' : text).replace(/\r\n?/g, '\n').trim();
+    const queueCommentToken = tok => {
+        const text = cleanCommentText(tok && tok.value);
+        if (text) pendingComments.push(text);
+    };
+    const takePendingComments = () => {
+        const comments = pendingComments;
+        pendingComments = [];
+        return comments;
+    };
+    const makeCommentRecord = (blockId, text) => {
+        const lines = text.split('\n');
+        const maxLineLength = lines.reduce((m, line) => Math.max(m, line.length), 0);
+        return {
+            blockId,
+            text,
+            x: null,
+            y: null,
+            width: Math.max(160, Math.min(360, maxLineLength * 7 + 28)),
+            height: Math.max(80, Math.min(260, lines.length * 18 + 36)),
+            minimized: false
+        };
+    };
+    const appendWorkspaceComment = comments => {
+        const text = (comments || []).map(cleanCommentText).filter(Boolean).join('\n');
+        if (!text) return false;
+        const commentId = `comment_${shortIdAt(commentCounter++)}`;
+        outComments[commentId] = makeCommentRecord(null, text);
+        return true;
+    };
+    const appendCommentsToBlock = (blockId, comments) => {
+        const block = blockId && outBlocks[blockId];
+        const text = (comments || []).map(cleanCommentText).filter(Boolean).join('\n');
+        if (!block || Array.isArray(block) || !text) return false;
+        if (block.comment && outComments[block.comment]) {
+            outComments[block.comment].text += `\n${text}`;
+            return true;
+        }
+        const commentId = `comment_${shortIdAt(commentCounter++)}`;
+        block.comment = commentId;
+        outComments[commentId] = makeCommentRecord(blockId, text);
+        return true;
+    };
+    const skipNewlines = () => {
+        while (peek().type === T.NEWLINE || peek().type === T.COMMENT) {
+            if (peek().type === T.COMMENT) queueCommentToken(peek());
+            cursor++;
+        }
+    };
+    const appendInlineCommentsToBlock = blockId => {
+        const comments = [];
+        while (peek().type === T.COMMENT) {
+            comments.push(peek().value);
+            cursor++;
+        }
+        if (comments.length) appendCommentsToBlock(blockId, comments);
+    };
     const expect = (type, value) => {
         const t = peek();
         if (t.type !== type || (value !== undefined && t.value !== value)) {
@@ -1627,7 +1797,7 @@ const parsePseudocode = (source, ctx) => {
                 right = parseBinaryRHS(right, prec + 1);
                 break;
             }
-            left = {kind: 'binop', op: t.value, left, right};
+            left = {kind: 'binop', op: t.value, left, right, line: t.line, col: t.col};
         }
     };
 
@@ -1729,6 +1899,17 @@ const parsePseudocode = (source, ctx) => {
         return {kind: 'strlit', value: ''};
     };
 
+    const isDefinitelyStringExpr = ast => {
+        if (!ast) return false;
+        if (ast.kind === 'strlit') return true;
+        if (ast.kind === 'call') {
+            return ast.name === 'join' || ast.name === 'letter_of';
+        }
+        if (ast.kind === 'binop') return isDefinitelyStringExpr(ast.left) || isDefinitelyStringExpr(ast.right);
+        if (ast.kind === 'not') return isDefinitelyStringExpr(ast.inner);
+        return false;
+    };
+
     // AST → blocks：把 reporter AST 编译成一个 block id（reporter / boolean 块）或直接内联 primitive
     // 返回："emitted": 'block' | 'prim', id (block id) 或 prim (Array)
     const compileExpr = (ast, parentId, expectedPrimType) => {
@@ -1768,6 +1949,14 @@ const parsePseudocode = (source, ctx) => {
             return {blockId: id};
         }
         if (ast.kind === 'binop') {
+            if (ast.op === '+' && (isDefinitelyStringExpr(ast.left) || isDefinitelyStringExpr(ast.right))) {
+                errors.push({
+                    line: ast.line || 0,
+                    col: ast.col || 0,
+                    message: '字符串拼接不能使用 +；请使用 join(a, b)。多个片段请嵌套 join，例如 join(join("第", n), "关")。'
+                });
+                return {prim: [10, '']};
+            }
             if (ast.op === '>=' || ast.op === '<=' || ast.op === '!=') {
                 const compareOp = ast.op === '>=' ? '<' : (ast.op === '<=' ? '>' : '==');
                 const notId = addBlock('operator_not', {parent: parentId});
@@ -1824,6 +2013,14 @@ const parsePseudocode = (source, ctx) => {
             if (ast.name === 'broadcast_ref' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
                 const n = ast.args[0].value;
                 return {prim: [11, n, resolveBroadcastId(n)]};
+            }
+            const mathOperator = MATH_OP_NAME_TO_OPERATOR.get(ast.name);
+            if (mathOperator && ast.args.length === 1) {
+                const id = addBlock('operator_mathop', {parent: parentId});
+                outBlocks[id].fields.OPERATOR = [mathOperator, null];
+                const r = compileExpr(ast.args[0], id, 4);
+                setInputRef(id, 'NUM', r, 4);
+                return {blockId: id};
             }
             const def = nameToDef.get(ast.name);
             // 裸标识符：无参调用且 def 要么不是 reporter/boolean、要么根本没登记 → 当成对变量/列表的引用。
@@ -2019,14 +2216,22 @@ const parsePseudocode = (source, ctx) => {
             }
             // input
             if (arg.menu) {
-                // 预期菜单 shadow：要求实参是字符串字面量，生成菜单 shadow 块
+                // 菜单槽既可以是下拉值，也可以拖入 reporter。字面量生成 menu shadow；
+                // 变量/表达式生成 reporter + menu shadow fallback，匹配 Scratch 的输入 shape。
                 const str = astToPlainString(ast);
                 const menuId = addBlock(arg.menu.opcode, {
                     parent: blockId,
                     shadow: true,
                     fields: {[arg.menu.field]: [str, null]}
                 });
-                outBlocks[blockId].inputs[arg.name] = [1, menuId];
+                if (ast.kind === 'strlit' || ast.kind === 'numlit' || ast.kind === 'boollit') {
+                    outBlocks[blockId].inputs[arg.name] = [1, menuId];
+                    continue;
+                }
+                const r = compileExpr(ast, blockId, null);
+                if (r.blockId) outBlocks[blockId].inputs[arg.name] = [3, r.blockId, menuId];
+                else if (r.prim) outBlocks[blockId].inputs[arg.name] = [3, r.prim, menuId];
+                else outBlocks[blockId].inputs[arg.name] = [1, menuId];
                 continue;
             }
             const r = compileExpr(ast, blockId, arg.primType);
@@ -2076,9 +2281,23 @@ const parsePseudocode = (source, ctx) => {
         skipNewlines();
         while (true) {
             const t = peek();
-            if (t.type === T.RBRACE || t.type === T.EOF) break;
+            if (t.type === T.RBRACE || t.type === T.EOF) {
+                if (pendingComments.length) {
+                    const fallbackBlockId = heads.length ? heads[heads.length - 1] : parentBlockId;
+                    if (fallbackBlockId) appendCommentsToBlock(fallbackBlockId, takePendingComments());
+                    else appendWorkspaceComment(takePendingComments());
+                }
+                break;
+            }
+            const leadingComments = takePendingComments();
             const id = parseStatement(parentBlockId);
-            if (id) heads.push(id);
+            if (id) {
+                appendCommentsToBlock(id, leadingComments);
+                appendInlineCommentsToBlock(id);
+                heads.push(id);
+            } else if (leadingComments.length) {
+                pendingComments = leadingComments.concat(pendingComments);
+            }
             skipNewlines();
         }
         for (let i = 0; i < heads.length; i++) {
@@ -2115,6 +2334,14 @@ const parsePseudocode = (source, ctx) => {
         const mathOp = assignOp.slice(0, -1);
         eat(); // compound operator
         const rhsAst = parseExpression(0);
+        if (assignOp === '+=' && isDefinitelyStringExpr(rhsAst)) {
+            errors.push({
+                line: opToken.line || 0,
+                col: opToken.col || 0,
+                message: '字符串拼接不能使用 +=；请使用 join(a, b) 后再赋值，例如 name = join(name, "后缀")。'
+            });
+            return null;
+        }
         const ref = resolveVariableRef(name);
         const id = addBlock(assignOp === '+=' ? 'data_changevariableby' : 'data_setvariableto', {parent: parentBlockId});
         outBlocks[id].fields.VARIABLE = [ref.name, ref.id];
@@ -2311,6 +2538,26 @@ const parsePseudocode = (source, ctx) => {
         return retId;
     };
 
+    const isJsStyleVarDeclarationStart = () => {
+        const t0 = peek();
+        const t1 = peek(1);
+        return t0.type === T.IDENT &&
+            (t0.value === 'var' || t0.value === 'let') &&
+            (t1.type === T.IDENT || t1.type === T.STRING);
+    };
+
+    const rejectJsStyleVarDeclaration = () => {
+        const tok = peek();
+        errors.push({
+            line: tok.line,
+            col: tok.col,
+            message: '不支持 var/let 临时变量声明；请在伪代码开头使用 #vars 或 #localvars 声明变量，然后直接写赋值语句。'
+        });
+        while (peek().type !== T.NEWLINE && peek().type !== T.RBRACE && peek().type !== T.EOF) eat();
+        if (peek().type === T.NEWLINE) eat();
+        return null;
+    };
+
     // 解析一条语句
     const parseStatement = (parentBlockId) => {
         // procedures 专用关键字优先（让 define/call/return 不被赋值路径吞掉，也绕开未知语句错误）
@@ -2320,6 +2567,7 @@ const parsePseudocode = (source, ctx) => {
             if (kw === 'call') return parseCallStmt(parentBlockId);
             if (kw === 'return') return parseReturn(parentBlockId);
         }
+        if (isJsStyleVarDeclarationStart()) return rejectJsStyleVarDeclaration();
         // 隐式 stmt procedure call：`"proccode"(args)` 或裸 `foo(args)`（foo 非已登记 opcode/关键字）
         const implicitProc = (() => {
             const t0 = peek();
@@ -2506,7 +2754,6 @@ const parsePseudocode = (source, ctx) => {
             const kw = t.value;
             eat();
             if (kw === 'vars' || kw === '变量') parseHeaderBlock(declaredVars);
-            else if (kw === 'broadcasts' || kw === '广播') parseHeaderBlock(declaredBroadcasts);
             else if (kw === 'lists' || kw === '列表') parseHeaderBlock(declaredLists);
             else if (kw === 'localvars' || kw === '局部变量') parseHeaderBlock(declaredLocalVars);
             else if (kw === 'locallists' || kw === '局部列表') parseHeaderBlock(declaredLocalLists);
@@ -2519,6 +2766,7 @@ const parsePseudocode = (source, ctx) => {
             continue;
         }
         // 可选 at(x,y) 前缀
+        let leadingComments = takePendingComments();
         let topX = 0, topY = 0, hasAt = false;
         if (t.type === T.IDENT && t.value === 'at' && peek(1).type === T.LPAREN) {
             eat(); // at
@@ -2532,8 +2780,18 @@ const parsePseudocode = (source, ctx) => {
             hasAt = true;
             // 允许跟换行
             skipNewlines();
+            leadingComments = leadingComments.concat(takePendingComments());
         }
+        const attachTopLevelComments = id => {
+            appendCommentsToBlock(id, leadingComments);
+            appendInlineCommentsToBlock(id);
+        };
         const after = peek();
+        if (isJsStyleVarDeclarationStart()) {
+            rejectJsStyleVarDeclaration();
+            skipNewlines();
+            continue;
+        }
         if (after.type === T.LBRACE) {
             // 顶层无名脚本：一串语句
             eat();
@@ -2544,6 +2802,7 @@ const parsePseudocode = (source, ctx) => {
                 outBlocks[firstId].x = topX;
                 outBlocks[firstId].y = topY;
                 outBlocks[firstId].parent = null;
+                attachTopLevelComments(firstId);
             }
             skipNewlines();
             continue;
@@ -2558,6 +2817,7 @@ const parsePseudocode = (source, ctx) => {
                 outBlocks[id].x = topX;
                 outBlocks[id].y = topY;
                 outBlocks[id].parent = null;
+                attachTopLevelComments(id);
             }
             skipNewlines();
             continue;
@@ -2570,6 +2830,7 @@ const parsePseudocode = (source, ctx) => {
                 outBlocks[id].x = topX;
                 outBlocks[id].y = topY;
                 outBlocks[id].parent = null;
+                attachTopLevelComments(id);
             }
             skipNewlines();
             continue;
@@ -2588,12 +2849,16 @@ const parsePseudocode = (source, ctx) => {
                     outBlocks[id].x = topX;
                     outBlocks[id].y = topY;
                     outBlocks[id].parent = null;
+                    attachTopLevelComments(id);
                 }
                 skipNewlines();
                 continue;
             }
         }
-        if (after.type === T.EOF) break;
+        if (after.type === T.EOF) {
+            if (leadingComments.length) appendWorkspaceComment(leadingComments);
+            break;
+        }
         // 其他：当作浮动表达式（top-level reporter/boolean 块）
         const expr = parseExpression(0);
         const r = compileExpr(expr, null, null);
@@ -2602,13 +2867,16 @@ const parsePseudocode = (source, ctx) => {
             outBlocks[r.blockId].x = topX;
             outBlocks[r.blockId].y = topY;
             outBlocks[r.blockId].parent = null;
+            attachTopLevelComments(r.blockId);
         } else if (r.prim) {
             // 浮动字面量：存为独立的 primitive 块
             const pid = addPrimitiveBlock(r.prim);
             // primitive 条目是数组形态，无法挂 topLevel/x/y；退而求其次保留为输出
+            if (leadingComments.length) appendWorkspaceComment(leadingComments);
         }
         skipNewlines();
     }
+    if (pendingComments.length) appendWorkspaceComment(takePendingComments());
 
     // 压缩 primitive：任何被 input 引用的 primitive-ish 块保留为对象形态也可，
     // 但为了输出更贴近 sb3.serialize 的样子，保持我们已经用数组形式 addPrimitiveBlock 的内联。
@@ -2618,7 +2886,8 @@ const parsePseudocode = (source, ctx) => {
         blocks: outBlocks, errors,
         declaredVars, declaredLists, declaredBroadcasts,
         declaredLocalVars, declaredLocalLists,
-        pendingVars, pendingLists, pendingBroadcasts
+        pendingVars, pendingLists, pendingBroadcasts,
+        comments: outComments
     };
 };
 
@@ -2639,10 +2908,10 @@ const translatePseudocode = (source, target) => {
             if (def.cname) map.set(def.cname, def.opcode);
         }
     }
-    // 头部关键字 #vars / #broadcasts / #lists ↔ #变量 / #广播 / #列表
+    // 头部关键字 #vars / #lists / #localvars / #locallists ↔ #变量 / #列表 / #局部变量 / #局部列表
     const headerMap = new Map();
     const headerPairs = [
-        ['vars', '变量'], ['broadcasts', '广播'], ['lists', '列表'],
+        ['vars', '变量'], ['lists', '列表'],
         ['localvars', '局部变量'], ['locallists', '局部列表']
     ];
     for (const [en, zh] of headerPairs) {
@@ -2700,6 +2969,7 @@ const translatePseudocode = (source, target) => {
 // 补全用的关键词池：三套标识符 + 少量语法关键词。
 const KEYWORD_NAMES = Array.from(new Set(
     OPCODE_DEFS.flatMap(d => [d.name, d.cname, d.opcode]).filter(Boolean)
+        .concat([...MATH_OP_NAME_TO_OPERATOR.keys()])
         .concat(['var', 'list', 'broadcast', 'true', 'false', 'else', 'define', 'warp', 'at', 'op',
             'call', 'callret', 'arg', 'arg_bool', 'return', 'as'])
 )).sort();
@@ -2709,5 +2979,6 @@ export default {
     parsePseudocode,
     translatePseudocode,
     sanitizeIdent,
-    keywordNames: KEYWORD_NAMES
+    keywordNames: KEYWORD_NAMES,
+    opcodeDefs: OPCODE_DEFS
 };

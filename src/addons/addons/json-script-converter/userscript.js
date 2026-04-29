@@ -151,7 +151,7 @@ const looksLikeBlocksObject = obj => {
 };
 
 // 伪代码里顶层脚本被空行分隔（renderPseudocode 每个脚本末尾 push ''）。
-// 文本开头还有 #vars / #broadcasts / #lists 这几个头部声明块，它们也被空行分隔，但并**不**对应
+// 文本开头还有 #vars / #lists 这几个头部声明块，它们也被空行分隔，但并**不**对应
 // 任何顶层积木 —— 如果也当作脚本算进去，ranges 和 topBlocks 的索引就错位了。过滤掉以 # 开头的段。
 // 返回每个脚本的行区间 [{startLine, endLine}, ...]，endLine 不含。
 const scriptLineRanges = text => {
@@ -175,11 +175,11 @@ const scriptLineRanges = text => {
     return ranges;
 };
 
-// 找到伪代码文本顶部连续头部块（#vars/#broadcasts/#lists 及中文形态）占据的字节范围。
+// 找到伪代码文本顶部连续头部块（#vars/#lists/#localvars/#locallists 及中文形态）占据的字节范围。
 // 返回 {end, indexAfterHeaderBlank}，end 是最后一个头部块右大括号后的位置（不含尾部换行）；
 // indexAfterHeaderBlank 是跳过紧随其后的一次空白/换行后的位置（即"正文开始处"）。
 // 没有头部时两者都返回 0。
-const HEADER_KW_RE = /^#(?:vars|变量|broadcasts|广播|lists|列表|localvars|局部变量|locallists|局部列表)(?![a-zA-Z_0-9\u4e00-\u9fa5])/;
+const HEADER_KW_RE = /^#(?:vars|变量|lists|列表|localvars|局部变量|locallists|局部列表)(?![a-zA-Z_0-9\u4e00-\u9fa5])/;
 const findHeaderRegion = text => {
     let scan = 0;
     let end = 0;
@@ -547,7 +547,7 @@ export default async ({addon, console, msg}) => {
     // 伪代码语法高亮：
     //   - 双引号字符串 → 绿色
     //   - 数字 → 蓝色
-    //   - #vars / #lists / #broadcasts / #localvars / #locallists 头部关键字 → 橙色
+    //   - #vars / #lists / #localvars / #locallists 头部关键字 → 橙色
     //   - @op / @ident → 红色
     //   - 语法控制关键字（if/else/define/warp/return/true/false/null/at 等） → 紫红色
     //   - 内置引用 helper（var/list/broadcast/broadcast_ref/arg/arg_bool） → 紫色
@@ -846,41 +846,122 @@ export default async ({addon, console, msg}) => {
                 top: padding + (lineNum + 1) * lineHeight - ta.scrollTop
             };
         };
+        getAutocompleteCallContext = (text, pos) => {
+            const lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+            const source = text.slice(lineStart, pos);
+            const stack = [];
+            let inString = false;
+            let stringStart = -1;
+            let escape = false;
+            const isIdentChar = ch => /[a-zA-Z0-9_\u4e00-\u9fa5]/.test(ch);
+            for (let i = 0; i < source.length; i++) {
+                const ch = source[i];
+                if (inString) {
+                    if (escape) { escape = false; continue; }
+                    if (ch === '\\') { escape = true; continue; }
+                    if (ch === '"') {
+                        inString = false;
+                        stringStart = -1;
+                    }
+                    continue;
+                }
+                if (ch === '/' && source[i + 1] === '/') break;
+                if (ch === '"') {
+                    inString = true;
+                    stringStart = i;
+                    continue;
+                }
+                if (ch === '(') {
+                    let j = i - 1;
+                    while (j >= 0 && /\s/.test(source[j])) j--;
+                    const end = j + 1;
+                    while (j >= 0 && isIdentChar(source[j])) j--;
+                    const callName = source.slice(j + 1, end);
+                    stack.push({callName, argIndex: 0, openIndex: i});
+                    continue;
+                }
+                if (ch === ')') {
+                    stack.pop();
+                    continue;
+                }
+                if (ch === ',' && stack.length) {
+                    stack[stack.length - 1].argIndex++;
+                }
+            }
+            if (!stack.length) return null;
+            const top = stack[stack.length - 1];
+            const beforeOpen = source.slice(0, top.openIndex);
+            const isDefineParams = /(^|\s)define\s+(?:"[^"]+"|[a-zA-Z0-9_\u4e00-\u9fa5]+)\s*$/.test(beforeOpen);
+            if (!top.callName && !isDefineParams) return null;
+            return {
+                callName: top.callName,
+                argIndex: top.argIndex,
+                inString,
+                stringStart: inString ? lineStart + stringStart : -1,
+                isDefineParams
+            };
+        };
         maybeOpenAutocomplete = () => {
             const baseKeywords = this.props.completionKeywords || [];
             const dynamic = typeof this.props.getDynamicKeywords === 'function'
                 ? (this.props.getDynamicKeywords() || []) : [];
-            const keywords = dynamic.length
-                ? Array.from(new Set([...baseKeywords, ...dynamic]))
-                : baseKeywords;
-            if (!keywords.length) { this.closeAutocomplete(); return; }
             const ta = this.textareaRef.current;
             if (!ta) return;
             const pos = ta.selectionStart;
             if (pos !== ta.selectionEnd) { this.closeAutocomplete(); return; }
             const text = this.state.text;
+            const context = this.getAutocompleteCallContext(text, pos);
+            const hasContextualProvider = !!(context && typeof this.props.getContextualCompletions === 'function');
+            const contextual = hasContextualProvider
+                ? (this.props.getContextualCompletions(context) || [])
+                : [];
             // 向前扫描获取光标处"单词前缀"；标识符范围和 pseudocode tokenizer 对齐（含 CJK）
             let start = pos;
-            while (start > 0 && /[a-zA-Z0-9_\u4e00-\u9fa5]/.test(text[start - 1])) start--;
+            if (context && context.inString && context.stringStart >= 0) {
+                start = context.stringStart + 1;
+            } else {
+                while (start > 0 && /[a-zA-Z0-9_\u4e00-\u9fa5]/.test(text[start - 1])) start--;
+            }
             const word = text.slice(start, pos);
-            if (word.length < 1) { this.closeAutocomplete(); return; }
+            const keywords = hasContextualProvider
+                ? contextual
+                : (dynamic.length ? Array.from(new Set([...baseKeywords, ...dynamic])) : baseKeywords);
+            if (!keywords.length) { this.closeAutocomplete(); return; }
+            if (word.length < 1 && !hasContextualProvider) { this.closeAutocomplete(); return; }
             const lower = word.toLowerCase();
             // 子串匹配（不只匹前缀），前缀命中排在前、其次按首次匹配位置、最后按长度升序。
             // k !== word 跳过完全等于当前词的项（弹层就是帮输入补全用的，没必要再显示自己）。
+            const normalizedKeywords = [];
+            const seenKeyword = new Set();
+            keywords.forEach((item, order) => {
+                const isObject = item && typeof item === 'object';
+                const label = String(isObject ? item.value : item);
+                if (!label || seenKeyword.has(label)) return;
+                seenKeyword.add(label);
+                normalizedKeywords.push({
+                    label,
+                    priority: isObject && Number.isFinite(Number(item.priority)) ? Number(item.priority) : 10,
+                    order
+                });
+            });
             const candidates = [];
-            for (const k of keywords) {
-                if (k === word) continue;
-                const idx = k.toLowerCase().indexOf(lower);
+            for (const item of normalizedKeywords) {
+                if (item.label === word) continue;
+                const label = item.label;
+                const searchable = label.replace(/^"([\s\S]*)"$/, '$1').toLowerCase();
+                const idx = lower ? searchable.indexOf(lower) : 0;
                 if (idx < 0) continue;
-                candidates.push({k, idx, len: k.length});
+                candidates.push({k: label, idx, len: searchable.length, priority: item.priority, order: item.order});
             }
             candidates.sort((a, b) => {
+                if (contextual.length && a.priority !== b.priority) return a.priority - b.priority;
                 if ((a.idx === 0) !== (b.idx === 0)) return a.idx === 0 ? -1 : 1;
                 if (a.idx !== b.idx) return a.idx - b.idx;
                 if (a.len !== b.len) return a.len - b.len;
+                if (contextual.length && a.order !== b.order) return a.order - b.order;
                 return a.k < b.k ? -1 : (a.k > b.k ? 1 : 0);
             });
-            const items = candidates.slice(0, 10).map(c => c.k);
+            const items = candidates.slice(0, 16).map(c => c.k);
             if (!items.length) { this.closeAutocomplete(); return; }
             const {left, top} = this.getCursorPixel();
             this.setState({autoComplete: {items, selectedIndex: 0, wordStart: start, left, top}});
@@ -980,7 +1061,10 @@ export default async ({addon, console, msg}) => {
                             findMatches: this.state.findQuery ? computeMatches(newText, this.state.findQuery) : [],
                             findIndex: 0
                         }, () => {
-                            if (this.textareaRef.current) this.textareaRef.current.setSelectionRange(newSelStart, newSelEnd);
+                            if (this.textareaRef.current) {
+                                this.textareaRef.current.setSelectionRange(newSelStart, newSelEnd);
+                                this.maybeOpenAutocomplete();
+                            }
                         });
                         if (this.props.onChange) this.props.onChange();
                         return;
@@ -996,6 +1080,7 @@ export default async ({addon, console, msg}) => {
                     if (start === end && this.state.text[start] === e.key) {
                         e.preventDefault();
                         ta.setSelectionRange(start + 1, start + 1);
+                        this.maybeOpenAutocomplete();
                         return;
                     }
                 }
@@ -1381,8 +1466,11 @@ export default async ({addon, console, msg}) => {
     const PSEUDO_KEYWORDS = pseudoConverter.keywordNames || [];
     const AI_CONFIG_STORAGE_KEY = 'jsonScriptConverter.aiConfig.v1';
     const AI_CHAT_STORAGE_KEY = 'jsonScriptConverter.aiChats.v1';
+    const UI_STATE_STORAGE_KEY = 'jsonScriptConverter.uiState.v1';
     const AI_CHAT_MAX_CONVERSATIONS = 40;
     const AI_CHAT_MAX_MESSAGES = 160;
+    const AI_CHAT_RENDER_INITIAL_MESSAGES = 36;
+    const AI_CHAT_RENDER_BATCH_MESSAGES = 24;
     const AI_MAX_TOOL_ROUNDS = 20;
     const AI_MAX_TOTAL_ROUNDS = 50;
     const AI_MAX_TOOL_CALLS_PER_BATCH = 16;
@@ -1408,6 +1496,27 @@ export default async ({addon, console, msg}) => {
     const saveAiConfig = config => {
         try {
             localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(config || {}));
+        } catch (_) { /* ignore */ }
+    };
+    const loadUiState = () => {
+        try {
+            const raw = JSON.parse(localStorage.getItem(UI_STATE_STORAGE_KEY) || '{}') || {};
+            const mode = raw.mode === 'json' ? 'json' : 'pseudo';
+            const aiChatOpen = !!raw.aiChatOpen;
+            return {
+                mode: aiChatOpen ? 'pseudo' : mode,
+                aiChatOpen
+            };
+        } catch (_) {
+            return {mode: 'pseudo', aiChatOpen: false};
+        }
+    };
+    const saveUiState = uiState => {
+        try {
+            localStorage.setItem(UI_STATE_STORAGE_KEY, JSON.stringify({
+                mode: uiState && uiState.mode === 'json' ? 'json' : 'pseudo',
+                aiChatOpen: !!(uiState && uiState.aiChatOpen)
+            }));
         } catch (_) { /* ignore */ }
     };
     const hasAiConfig = config => !!(config && config.endpoint && config.model);
@@ -1681,6 +1790,73 @@ export default async ({addon, console, msg}) => {
                 .map(normalizeAiChatDetail)
                 .filter(Boolean)
         };
+    };
+    const getAiVisibleDetailsForRender = (message, showProcessLog) => {
+        const rawDetails = Array.isArray(message && message.details) ? message.details : [];
+        return showProcessLog
+            ? rawDetails
+            : rawDetails.filter(detail => !detail || detail.key !== 'process');
+    };
+    const shouldRenderAiChatMessage = (message, showProcessLog) => {
+        if (!message) return false;
+        if (message.pending) return true;
+        if (String(message.text || '').trim()) return true;
+        return getAiVisibleDetailsForRender(message, showProcessLog).length > 0;
+    };
+    const getRenderableAiChatMessages = (messages, showProcessLog) => (Array.isArray(messages) ? messages : [])
+        .filter(message => shouldRenderAiChatMessage(message, showProcessLog));
+    const formatAiExportTime = time => {
+        const d = new Date(Number(time) || Date.now());
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+    const sanitizeAiExportFileName = value => {
+        const name = String(value || '聊天记录')
+            .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return (name || '聊天记录').slice(0, 80);
+    };
+    const formatAiConversationAsTxt = conversation => {
+        const item = conversation || {};
+        const lines = [
+            '积木脚本助手聊天记录',
+            `标题：${item.title || '新的聊天'}`,
+            `创建时间：${formatAiExportTime(item.createdAt)}`,
+            `更新时间：${formatAiExportTime(item.updatedAt)}`,
+            `导出时间：${formatAiExportTime(Date.now())}`,
+            '',
+            '========================================',
+            ''
+        ];
+        for (const message of item.messages || []) {
+            const role = message.role === 'user' ? '用户' : (message.kind === 'status' ? '系统' : 'AI');
+            lines.push(`[${formatAiExportTime(message.time)}] ${role}`);
+            const text = String(message.text || '').trim();
+            lines.push(text || '(无可见文本)');
+            for (const detail of message.details || []) {
+                const title = detail && detail.title ? detail.title : '详情';
+                const content = detail && detail.content ? String(detail.content) : '';
+                lines.push('');
+                lines.push(`--- ${title} ---`);
+                lines.push(content || '(空)');
+            }
+            lines.push('');
+            lines.push('----------------------------------------');
+            lines.push('');
+        }
+        return lines.join('\n');
+    };
+    const downloadTextFile = (filename, text) => {
+        const blob = new Blob([String(text || '')], {type: 'text/plain;charset=utf-8'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
     const normalizeAiConversations = conversations => (Array.isArray(conversations) ? conversations : [])
         .map(conversation => {
@@ -1961,6 +2137,32 @@ export default async ({addon, console, msg}) => {
             height: height && height > 0 ? height : 360
         };
     };
+    const decodeAiSvgData = data => {
+        if (typeof data === 'string') return data;
+        if (!data) return '';
+        if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+            return new TextDecoder().decode(data);
+        }
+        return String(data);
+    };
+    const fixAiSvgTextForVanilla = svgText => {
+        if (typeof fixForVanilla !== 'function') return svgText;
+        const bytes = new TextEncoder().encode(svgText);
+        try {
+            return decodeAiSvgData(fixForVanilla(bytes));
+        } catch (byteErr) {
+            try {
+                return decodeAiSvgData(fixForVanilla(svgText));
+            } catch (_) {
+                throw byteErr;
+            }
+        }
+    };
+    const sanitizeAiSvgText = svgText => {
+        const fixed = fixAiSvgTextForVanilla(svgText);
+        if (!sanitizeSvg || typeof sanitizeSvg.sanitizeSvgText !== 'function') return fixed.trim();
+        return decodeAiSvgData(sanitizeSvg.sanitizeSvgText(fixed)).trim();
+    };
     const validateAiSvgText = rawSvg => {
         let svg = String(rawSvg || '').trim();
         svg = stripCodeFence(svg).trim();
@@ -1976,8 +2178,7 @@ export default async ({addon, console, msg}) => {
         }
         if (/url\(\s*['"]?(?!#)/i.test(svg)) return {ok: false, error: 'SVG 不能使用外部 url() 资源'};
         try {
-            svg = fixForVanilla(svg);
-            svg = sanitizeSvg.sanitizeSvgText(svg).trim();
+            svg = sanitizeAiSvgText(svg);
         } catch (err) {
             return {ok: false, error: `SVG 清理失败: ${err.message}`};
         }
@@ -2151,6 +2352,482 @@ export default async ({addon, console, msg}) => {
             cursorY = (typeof block.y === 'number' ? block.y : cursorY) + 120;
         }
     };
+    const AI_EXTENSION_CATALOG = [
+        {id: 'pen', name: 'Pen / 画笔', builtin: true, aliases: ['pen', '画笔'], opcodePrefixes: ['pen']},
+        {id: 'music', name: 'Music / 音乐', builtin: true, aliases: ['music', '音乐'], opcodePrefixes: ['music']},
+        {id: 'videoSensing', name: 'Video Sensing / 视频侦测', builtin: true, aliases: ['video', 'videoSensing', '视频侦测'], opcodePrefixes: ['videoSensing']},
+        {id: 'text2speech', name: 'Text to Speech / 文字朗读', builtin: true, aliases: ['tts', 'text2speech', '文字朗读', '朗读'], opcodePrefixes: ['text2speech']},
+        {id: 'translate', name: 'Translate / 翻译', builtin: true, aliases: ['translate', '翻译'], opcodePrefixes: ['translate']},
+        {id: 'makeymakey', name: 'Makey Makey', builtin: true, hardware: true, aliases: ['makeymakey', 'makey makey'], opcodePrefixes: ['makeymakey']},
+        {id: 'microbit', name: 'micro:bit', builtin: true, hardware: true, aliases: ['microbit', 'micro:bit'], opcodePrefixes: ['microbit']},
+        {id: 'ev3', name: 'LEGO EV3', builtin: true, hardware: true, aliases: ['ev3', 'lego ev3'], opcodePrefixes: ['ev3']},
+        {id: 'boost', name: 'LEGO BOOST', builtin: true, hardware: true, aliases: ['boost', 'lego boost'], opcodePrefixes: ['boost']},
+        {id: 'wedo2', name: 'LEGO WeDo 2.0', builtin: true, hardware: true, aliases: ['wedo2', 'wedo', 'lego wedo'], opcodePrefixes: ['wedo2']},
+        {id: 'gdxfor', name: 'Go Direct Force & Acceleration', builtin: true, hardware: true, aliases: ['gdxfor', 'vernier'], opcodePrefixes: ['gdxfor']},
+        {id: 'tw', name: 'TurboWarp Blocks', builtin: true, aliases: ['tw', 'turbowarp'], opcodePrefixes: ['tw']},
+        {id: 'lazyAudio', name: 'Lazy Audio', builtin: true, aliases: ['lazyAudio', 'lazyaudio'], opcodePrefixes: ['lazyAudio']},
+        {id: 'canvas', name: 'Canvas', builtin: true, aliases: ['canvas'], opcodePrefixes: ['canvas']},
+        {id: 'yun', name: 'Cloud Data', builtin: true, aliases: ['yun'], opcodePrefixes: ['yun']},
+        {id: 'js', name: 'JS', builtin: true, aliases: ['js'], opcodePrefixes: ['js']},
+        {id: 'jsonfetch', name: 'JSON Fetch', builtin: true, aliases: ['jsonfetch'], opcodePrefixes: ['jsonfetch']},
+        {id: 'three', name: '3D Engine', builtin: true, aliases: ['three'], opcodePrefixes: ['three']},
+        {id: 'p3d', name: '3D Physics', builtin: true, aliases: ['p3d'], opcodePrefixes: ['p3d']},
+        {id: 'box2d', name: '2D Physics', builtin: true, aliases: ['box2d'], opcodePrefixes: ['box2d']},
+        {id: 'ws', name: 'WebSocket', builtin: true, aliases: ['ws'], opcodePrefixes: ['ws']},
+        {id: 'community', name: 'Community', builtin: true, aliases: ['community'], opcodePrefixes: ['community']},
+        {id: 'community2', name: 'Community 2', builtin: true, aliases: ['community2'], opcodePrefixes: ['community2']},
+        {id: 'yx', name: 'Math / 运算', builtin: true, aliases: ['yx'], opcodePrefixes: ['yx']},
+        {id: 'set', name: 'Advanced Settings', builtin: true, aliases: ['set'], opcodePrefixes: ['set']},
+        {id: 'tc', name: 'Layers', builtin: true, aliases: ['tc'], opcodePrefixes: ['tc']},
+        {id: 'touch', name: 'Touch', builtin: true, aliases: ['touch'], opcodePrefixes: ['touch']},
+        {id: 'faceSensing', name: 'Face Sensing', builtin: false, url: 'https://extensions.turbowarp.org/lab/face-sensing.js', aliases: ['faceSensing', 'face sensing'], opcodePrefixes: ['faceSensing']}
+    ];
+    const AI_CORE_OPCODE_PREFIXES = new Set([
+        'argument', 'control', 'data', 'event', 'looks', 'motion', 'operator',
+        'procedures', 'sensing', 'sound',
+        // Scratch shadow/input helper blocks, not extensions.
+        'colour', 'math', 'text', 'note'
+    ]);
+    const AI_CORE_EXTENSION_CONTEXT = [
+        'motion', 'looks', 'sound', 'events', 'control',
+        'sensing', 'operators', 'variables', 'lists', 'myBlocks'
+    ];
+    const AI_EXTENSION_ID_MAP = new Map(AI_EXTENSION_CATALOG.map(item => [item.id, item]));
+    const AI_EXTENSION_ALIAS_MAP = (() => {
+        const map = new Map();
+        for (const item of AI_EXTENSION_CATALOG) {
+            const aliases = [item.id, item.name].concat(item.aliases || []);
+            for (const alias of aliases) {
+                const key = String(alias || '').trim().toLowerCase();
+                if (key) map.set(key, item.id);
+            }
+        }
+        return map;
+    })();
+    const AI_EXTENSION_OPCODE_PREFIX_MAP = (() => {
+        const map = new Map();
+        for (const item of AI_EXTENSION_CATALOG) {
+            for (const prefix of item.opcodePrefixes || []) {
+                map.set(String(prefix).toLowerCase(), item.id);
+            }
+        }
+        return map;
+    })();
+    const AI_REMOTE_EXTENSION_SOURCES = [
+        {
+            id: 'tw-official',
+            name: 'TurboWarp official',
+            url: 'https://extensions.turbowarp.org/generated-metadata/extensions-v0.json'
+        }
+    ];
+    let aiRemoteExtensionCatalog = null;
+    let aiRemoteExtensionCatalogPromise = null;
+    let aiRemoteExtensionCatalogError = null;
+    const isAiExtensionUrl = value => /^(?:https?:|data:|file:)/i.test(String(value || '').trim());
+    const normalizeAiExtensionSlug = value => String(value || '')
+        .trim()
+        .replace(/^https:\/\/extensions\.turbowarp\.org\//i, '')
+        .replace(/\.js(?:[?#].*)?$/i, '')
+        .replace(/^\/+/, '');
+    const normalizeAiExtensionId = value => {
+        const text = String(value || '').trim();
+        if (!text) return '';
+        if (AI_EXTENSION_ID_MAP.has(text)) return text;
+        const lower = text.toLowerCase();
+        if (AI_EXTENSION_ALIAS_MAP.has(lower)) return AI_EXTENSION_ALIAS_MAP.get(lower);
+        return text;
+    };
+    const getAiExtensionRecord = value => {
+        const id = normalizeAiExtensionId(value);
+        return AI_EXTENSION_ID_MAP.get(id) || null;
+    };
+    const normalizeAiRemoteExtensionRecord = (source, extension) => {
+        if (!extension || typeof extension !== 'object') return null;
+        const sourceId = source && source.id;
+        const isTw = sourceId === 'tw-official';
+        const id = String(isTw ? extension.id : (extension.extId || extension.extensionId || extension.id) || '').trim();
+        const slug = normalizeAiExtensionSlug(extension.slug || extension.path || '');
+        const name = String(extension.name || id || slug || '').trim();
+        if (!id && !slug && !name) return null;
+        let url = String(extension.extensionURL || extension.url || '').trim();
+        if (!url && isTw && slug) url = `https://extensions.turbowarp.org/${slug}.js`;
+        if (!url) return null;
+        return {
+            id: id || slug || url,
+            name: name || id || slug || url,
+            slug,
+            url,
+            source: 'tw-official',
+            remote: true,
+            builtin: false,
+            hardware: false,
+            scratchCompatible: extension.scratchCompatible !== false,
+            description: String(extension.description || '').trim(),
+            aliases: [
+                id,
+                slug,
+                name,
+                String(extension.author || '').trim()
+            ].filter(Boolean)
+        };
+    };
+    const fetchAiRemoteExtensionSource = async source => {
+        const url = source.getUrl ? source.getUrl() : source.url;
+        if (!url) return [];
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${source.name}: HTTP ${response.status}`);
+        const data = await response.json();
+        const rawList = Array.isArray(data)
+            ? data
+            : (Array.isArray(data && data.extensions) ? data.extensions : []);
+        return rawList
+            .map(item => normalizeAiRemoteExtensionRecord(source, item))
+            .filter(Boolean);
+    };
+    const getAiRemoteExtensionCatalog = async () => {
+        if (aiRemoteExtensionCatalog) return aiRemoteExtensionCatalog;
+        if (aiRemoteExtensionCatalogPromise) return aiRemoteExtensionCatalogPromise;
+        aiRemoteExtensionCatalogPromise = Promise.allSettled(
+            AI_REMOTE_EXTENSION_SOURCES.map(source => fetchAiRemoteExtensionSource(source))
+        ).then(results => {
+            const items = [];
+            const errors = [];
+            const seen = new Set();
+            for (const result of results) {
+                if (result.status !== 'fulfilled') {
+                    errors.push(result.reason && result.reason.message ? result.reason.message : String(result.reason));
+                    continue;
+                }
+                for (const item of result.value || []) {
+                    const key = `${item.id || ''}|${item.url || ''}`.toLowerCase();
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    items.push(item);
+                }
+            }
+            aiRemoteExtensionCatalogError = errors.join('；');
+            aiRemoteExtensionCatalog = items.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+            return aiRemoteExtensionCatalog;
+        }).finally(() => {
+            aiRemoteExtensionCatalogPromise = null;
+        });
+        return aiRemoteExtensionCatalogPromise;
+    };
+    const findAiRemoteExtensionRecord = async value => {
+        const query = String(value || '').trim();
+        if (!query) return null;
+        const normalizedQuery = normalizeAiExtensionSlug(query).toLowerCase();
+        const catalog = await getAiRemoteExtensionCatalog();
+        const exact = catalog.find(item => {
+            const aliases = [item.id, item.slug, item.name, ...(item.aliases || [])]
+                .map(alias => normalizeAiExtensionSlug(alias).toLowerCase())
+                .filter(Boolean);
+            return aliases.includes(normalizedQuery);
+        });
+        if (exact) return exact;
+        return catalog.find(item => {
+            const text = [item.id, item.slug, item.name, item.description, item.source]
+                .concat(item.aliases || [])
+                .join(' ')
+                .toLowerCase();
+            return text.includes(normalizedQuery);
+        }) || null;
+    };
+    const makeAiTurboWarpExtensionUrl = slug => {
+        const clean = normalizeAiExtensionSlug(slug);
+        if (!clean || clean.includes('..') || /^[a-z]+:/i.test(clean)) return '';
+        return `https://extensions.turbowarp.org/${clean}.js`;
+    };
+    const getAiLoadedExtensionIds = vm => {
+        const manager = vm && vm.extensionManager;
+        const loaded = manager && manager._loadedExtensions;
+        if (loaded && typeof loaded.keys === 'function') return Array.from(loaded.keys()).sort();
+        return [];
+    };
+    const isAiExtensionLoaded = (vm, extensionId) => {
+        const manager = vm && vm.extensionManager;
+        return !!(manager && typeof manager.isExtensionLoaded === 'function' && manager.isExtensionLoaded(extensionId));
+    };
+    const summarizeAiExtension = (vm, recordOrId) => {
+        const record = typeof recordOrId === 'string'
+            ? (AI_EXTENSION_ID_MAP.get(recordOrId) || {id: recordOrId, name: recordOrId})
+            : recordOrId;
+        const id = record && record.id ? record.id : '';
+        return {
+            id,
+            name: record && record.name ? record.name : id,
+            loaded: !!(id && isAiExtensionLoaded(vm, id)),
+            builtin: !!(record && record.builtin),
+            hardware: !!(record && record.hardware),
+            remote: !!(record && record.remote),
+            source: record && record.source ? record.source : undefined,
+            slug: record && record.slug ? record.slug : undefined,
+            url: record && record.url ? record.url : undefined,
+            description: record && record.description ? record.description : undefined
+        };
+    };
+    const getAiExtensionSummaries = (vm, remoteItems) => {
+        const summaries = AI_EXTENSION_CATALOG.map(item => summarizeAiExtension(vm, item));
+        const seen = new Set(summaries.map(item => item.id));
+        for (const item of remoteItems || []) {
+            const summary = summarizeAiExtension(vm, item);
+            const key = `${summary.id || ''}|${summary.url || ''}`.toLowerCase();
+            if (seen.has(summary.id) || seen.has(key)) continue;
+            seen.add(summary.id);
+            seen.add(key);
+            summaries.push(summary);
+        }
+        for (const id of getAiLoadedExtensionIds(vm)) {
+            if (seen.has(id)) continue;
+            summaries.push(summarizeAiExtension(vm, id));
+        }
+        return summaries;
+    };
+    const getAiLoadedExtensionSummaries = vm => {
+        const loadedIds = getAiLoadedExtensionIds(vm);
+        return loadedIds.map(id => summarizeAiExtension(vm, AI_EXTENSION_ID_MAP.get(id) || id));
+    };
+    const getAiLocalExtensionSummaries = vm => AI_EXTENSION_CATALOG.map(item => {
+        const summary = summarizeAiExtension(vm, item);
+        return {
+            id: summary.id,
+            name: summary.name,
+            loaded: summary.loaded,
+            builtin: summary.builtin,
+            hardware: summary.hardware
+        };
+    });
+    const getAiExtensionContext = vm => ({
+        core: AI_CORE_EXTENSION_CONTEXT,
+        loadedIds: getAiLoadedExtensionIds(vm),
+        loaded: getAiLoadedExtensionSummaries(vm),
+        localAvailable: getAiLocalExtensionSummaries(vm)
+    });
+    const getAiExtensionIdForOpcode = opcode => {
+        const text = String(opcode || '').trim();
+        const match = text.match(/^([A-Za-z0-9]+)_/);
+        if (!match) return '';
+        const prefix = match[1];
+        if (AI_CORE_OPCODE_PREFIXES.has(prefix)) return '';
+        return AI_EXTENSION_OPCODE_PREFIX_MAP.get(prefix.toLowerCase()) || prefix;
+    };
+    const getAiRequiredExtensionsFromBlocks = blocks => {
+        const ids = new Set();
+        for (const block of Object.values(blocks || {})) {
+            if (!block || Array.isArray(block) || typeof block.opcode !== 'string') continue;
+            const id = getAiExtensionIdForOpcode(block.opcode);
+            if (id) ids.add(id);
+        }
+        return Array.from(ids);
+    };
+    const getAiContextKeywords = vm => {
+        const defs = Array.isArray(pseudoConverter.opcodeDefs) ? pseudoConverter.opcodeDefs : [];
+        const loaded = new Set(getAiLoadedExtensionIds(vm));
+        const names = [];
+        for (const def of defs) {
+            if (!def || !def.opcode) continue;
+            const extensionId = getAiExtensionIdForOpcode(def.opcode);
+            if (extensionId && !loaded.has(extensionId)) continue;
+            names.push(def.name, def.cname, def.opcode);
+        }
+        return names.filter(Boolean).slice(0, 260);
+    };
+    const formatAiExtensionsDetail = result => {
+        const extensions = (result && result.extensions) || [];
+        const header = result && result.remoteError ? `远程扩展列表部分读取失败：${result.remoteError}\n\n` : '';
+        if (!extensions.length) return `${header}没有可显示的扩展。`;
+        const body = extensions.map(item => [
+            `${item.loaded ? '已加载' : '未加载'} ${item.id} - ${item.name}`,
+            item.remote ? `远程来源: ${item.source || 'remote'}${item.slug ? ` / ${item.slug}` : ''}` : '',
+            item.hardware ? '硬件扩展' : '',
+            item.url ? `url: ${item.url}` : ''
+        ].filter(Boolean).join('\n')).join('\n\n');
+        const footer = result && result.truncated ? `\n\n只显示前 ${extensions.length} 个，共 ${result.total} 个。` : '';
+        return `${header}${body}${footer}`;
+    };
+    const formatAiLoadedExtensions = extensions => (extensions || [])
+        .map(item => `${item.id || ''}${item.name ? ` (${item.name})` : ''}`.trim())
+        .filter(Boolean)
+        .join('、');
+    const getAiMaybeMessageText = value => {
+        if (value == null) return '';
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+        if (typeof value === 'object') {
+            return String(value.default || value.defaultMessage || value.message || value.id || '').trim();
+        }
+        return '';
+    };
+    const getAiExtensionBlockCategories = (vm, extensionId) => {
+        const runtime = vm && vm.runtime;
+        const blockInfo = Array.isArray(runtime && runtime._blockInfo) ? runtime._blockInfo : [];
+        const loaded = new Set(getAiLoadedExtensionIds(vm));
+        const requested = String(extensionId || '').trim();
+        if (requested) {
+            return blockInfo.filter(category => category && category.id === requested);
+        }
+        return blockInfo.filter(category => category && category.id && loaded.has(category.id));
+    };
+    const normalizeAiExtensionMenuItems = menuInfo => {
+        if (!menuInfo) return null;
+        const items = menuInfo.items;
+        if (typeof items === 'function') return {dynamic: true, items: []};
+        if (!Array.isArray(items)) return null;
+        const normalized = items.slice(0, 30).map(item => {
+            if (typeof item === 'string' || typeof item === 'number') {
+                return {text: String(item), value: String(item)};
+            }
+            if (!item || typeof item !== 'object') return null;
+            const text = getAiMaybeMessageText(item.text || item.name || item.label || item.value);
+            const value = item.value != null ? String(item.value) : text;
+            return text || value ? {text: text || value, value} : null;
+        }).filter(Boolean);
+        return {
+            dynamic: false,
+            items: normalized,
+            truncated: items.length > normalized.length
+        };
+    };
+    const normalizeAiExtensionArgument = (category, name, argInfo) => {
+        const arg = argInfo && typeof argInfo === 'object' ? argInfo : {};
+        const menuInfo = arg.menu && category && category.menuInfo ? category.menuInfo[arg.menu] : null;
+        const isDropdownField = !!(arg.menu && menuInfo && menuInfo.acceptReporters === false);
+        const defaultValue = getAiMaybeMessageText(
+            arg.defaultValue !== undefined ? arg.defaultValue : (arg.default !== undefined ? arg.default : '')
+        );
+        return {
+            name,
+            kind: isDropdownField ? 'field' : 'input',
+            type: arg.type || '',
+            menu: arg.menu || undefined,
+            acceptReporters: !!(arg.menu && menuInfo && menuInfo.acceptReporters),
+            defaultValue,
+            menuItems: normalizeAiExtensionMenuItems(menuInfo)
+        };
+    };
+    const makeAiExtensionOpExample = block => {
+        const fields = [];
+        const inputs = [];
+        for (const slot of block.slots || []) {
+            const value = slot.defaultValue || (slot.type === 'number' ? '10' : 'value');
+            if (slot.kind === 'field') {
+                fields.push(`${JSON.stringify(slot.name)}:${JSON.stringify(value)}`);
+            } else {
+                const inputValue = /^-?\d+(?:\.\d+)?$/.test(value) ? value : JSON.stringify(value);
+                inputs.push(`${JSON.stringify(slot.name)}:${inputValue}`);
+            }
+        }
+        const pieces = [JSON.stringify(block.opcode)];
+        if (fields.length) pieces.push(`fields={${fields.join(', ')}}`);
+        if (inputs.length) pieces.push(`inputs={${inputs.join(', ')}}`);
+        return `@op(${pieces.join(', ')})`;
+    };
+    const summarizeAiExtensionBlock = (category, convertedBlock) => {
+        const info = convertedBlock && convertedBlock.info;
+        const json = convertedBlock && convertedBlock.json;
+        if (!info || typeof info !== 'object' || !info.opcode) return null;
+        const opcode = json && json.type ? String(json.type) : `${category.id}_${info.opcode}`;
+        const args = info.arguments && typeof info.arguments === 'object' ? info.arguments : {};
+        const slots = Object.keys(args).map(name => normalizeAiExtensionArgument(category, name, args[name]));
+        const text = Array.isArray(info.text)
+            ? info.text.map(getAiMaybeMessageText).filter(Boolean).join(' | ')
+            : getAiMaybeMessageText(info.text);
+        const result = {
+            opcode,
+            rawOpcode: String(info.opcode),
+            blockType: String(info.blockType || ''),
+            text,
+            slots,
+            terminal: !!info.isTerminal,
+            hidden: !!(info.hide || info.hideFromPalette),
+            filter: Array.isArray(info.filter) ? info.filter.slice() : undefined
+        };
+        result.opExample = makeAiExtensionOpExample(result);
+        return result;
+    };
+    const getAiExtensionBlocks = (vm, tool) => {
+        const extensionId = normalizeAiExtensionId(
+            (tool && (tool.extensionId || tool.id || tool.name || tool.extension)) || ''
+        );
+        const categories = getAiExtensionBlockCategories(vm, extensionId);
+        if (extensionId && !categories.length) {
+            const loaded = getAiLoadedExtensionIds(vm);
+            return {
+                ok: false,
+                type: 'get_extension_blocks',
+                error: `扩展 ${extensionId} 尚未加载或没有 block metadata。请先 load_extension。`,
+                loaded
+            };
+        }
+        if (!categories.length) {
+            return {
+                ok: false,
+                type: 'get_extension_blocks',
+                error: '当前没有已加载扩展的 block metadata。请先 load_extension。',
+                loaded: getAiLoadedExtensionIds(vm)
+            };
+        }
+        const limit = Math.min(300, Math.max(1, Number(tool && (tool.limit || tool.maxResults)) || AI_EXTENSION_BLOCK_LIMIT));
+        const query = String(tool && (tool.query || tool.keyword || '') || '').trim().toLowerCase();
+        const extensions = [];
+        let totalBlocks = 0;
+        let matchedBlocks = 0;
+        let returnedBlocks = 0;
+        for (const category of categories) {
+            const blocks = [];
+            for (const convertedBlock of category.blocks || []) {
+                const block = summarizeAiExtensionBlock(category, convertedBlock);
+                if (!block) continue;
+                totalBlocks++;
+                if (query) {
+                    const text = [block.opcode, block.rawOpcode, block.text, block.blockType]
+                        .join(' ')
+                        .toLowerCase();
+                    if (!text.includes(query)) continue;
+                }
+                matchedBlocks++;
+                if (returnedBlocks >= limit) continue;
+                blocks.push(block);
+                returnedBlocks++;
+            }
+            extensions.push({
+                id: category.id,
+                name: category.name || category.id,
+                color1: category.color1,
+                color2: category.color2,
+                blockCount: blocks.length,
+                blocks
+            });
+        }
+        return {
+            ok: true,
+            type: 'get_extension_blocks',
+            extensionId: extensionId || null,
+            extensions,
+            totalBlocks,
+            matchedBlocks,
+            returnedBlocks,
+            truncated: returnedBlocks < matchedBlocks
+        };
+    };
+    const formatAiExtensionBlocksDetail = result => {
+        if (!result || !Array.isArray(result.extensions) || !result.extensions.length) return '没有扩展积木信息。';
+        const lines = [];
+        for (const extension of result.extensions) {
+            lines.push(`${extension.id} - ${extension.name}`);
+            for (const block of extension.blocks || []) {
+                const slots = (block.slots || []).map(slot => {
+                    const menu = slot.menu ? ` menu=${slot.menu}${slot.acceptReporters ? '+reporter' : ''}` : '';
+                    return `${slot.kind}:${slot.name}${slot.type ? `/${slot.type}` : ''}${menu}`;
+                }).join(', ');
+                lines.push(`- ${block.opcode} [${block.blockType}] ${block.text || ''}`);
+                if (slots) lines.push(`  slots: ${slots}`);
+                lines.push(`  @op: ${block.opExample}`);
+            }
+        }
+        if (result.truncated) lines.push(`只显示 ${result.returnedBlocks}/${result.matchedBlocks || result.totalBlocks} 个匹配积木。`);
+        return lines.join('\n');
+    };
     const getAiProjectContext = (target, vm, currentText, summarizeTarget) => {
         const stage = vm && vm.runtime && vm.runtime.getTargetForStage ? vm.runtime.getTargetForStage() : null;
         const summarize = typeof summarizeTarget === 'function'
@@ -2181,8 +2858,9 @@ export default async ({addon, console, msg}) => {
                 global: getTargetNamesByType(stage, 'list')
             },
             broadcasts: getTargetNamesByType(stage, 'broadcast_msg'),
+            extensions: getAiExtensionContext(vm),
             procedures: defineLines,
-            keywords: PSEUDO_KEYWORDS.slice(0, 260)
+            keywords: getAiContextKeywords(vm)
         };
     };
     const formatPseudoErrors = errors => (errors || [])
@@ -2198,43 +2876,111 @@ export default async ({addon, console, msg}) => {
     const AI_TOOL_CLOSE = '</AI_TOOL>';
     const AI_EDIT_OPEN = '<AI_EDIT>';
     const AI_EDIT_CLOSE = '</AI_EDIT>';
+    const AI_ACTION_OPEN = '<ACTION>';
+    const AI_ACTION_CLOSE = '</ACTION>';
+    const AI_PROVIDER_TOOL_OPEN = '<|tool_calls_section_begin|>';
+    const AI_PROVIDER_TOOL_CLOSE = '<|tool_calls_section_end|>';
     const AI_THINK_OPEN = '<think>';
     const AI_THINK_CLOSE = '</think>';
     const AI_HIDDEN_TOKENS = [
+        {type: 'action', open: AI_ACTION_OPEN, close: AI_ACTION_CLOSE},
         {type: 'tool', open: AI_TOOL_OPEN, close: AI_TOOL_CLOSE},
-        {type: 'edit', open: AI_EDIT_OPEN, close: AI_EDIT_CLOSE}
+        {type: 'edit', open: AI_EDIT_OPEN, close: AI_EDIT_CLOSE},
+        {type: 'provider_tool', open: AI_PROVIDER_TOOL_OPEN, close: AI_PROVIDER_TOOL_CLOSE}
     ];
     const AI_PSEUDOCODE_PREVIEW_LIMIT = 12000;
+    const AI_TOOL_TRACE_STRING_LIMIT = 2400;
+    const AI_TOOL_TRACE_ARRAY_LIMIT = 30;
+    const AI_TOOL_TRACE_DEPTH_LIMIT = 5;
     const AI_SEARCH_RESULT_LIMIT = 80;
+    const AI_EXTENSION_BLOCK_LIMIT = 120;
     const AI_PSEUDOCODE_SYNTAX_GUIDE = [
-        'Scratch pseudocode syntax guide:',
-        '- Use English friendly opcode names from context.keywords unless the existing pseudocode is already using Chinese names or raw opcodes.',
-        '- Header declarations are optional but useful: #vars { score }, #localvars { temp }, #lists { items }, #locallists { cache }, #broadcasts { game_over }.',
-        '- Top-level scripts are separated by blank lines. A hat script looks like: on_flag_clicked() { ... }.',
-        '- A top-level stack without a hat can be written as { ... }. Optional coordinates can prefix a script: at(120, 80) on_flag_clicked() { ... }.',
-        '- Statement blocks use name(arg1, arg2). C-shaped blocks use braces, for example forever() { ... }, repeat(10) { ... }, repeat_until(condition) { ... }.',
-        '- If/else must use: if (condition) { ... } else { ... }. A plain if can use only the first body.',
-        '- Variables can be set with assignment: score = 0. Change numeric variables with +=, for example score += 1.',
-        '- Expressions can use numbers, quoted strings, variables/reporters, true/false/null, parentheses, !, +, -, *, /, %, <, >, <=, >=, ==, !=, &&, ||.',
-        '- Strings must be double quoted when they contain spaces, punctuation, or menu values. Escape quotes with \\\".',
-        '- Custom blocks can be defined as define my_block(arg, bool flag) { ... } or define my_block(arg, bool flag) warp { ... }, called as my_block(1, true), or explicitly with call my_block(1).',
-        '- In a custom block definition, warp means Scratch/TurboWarp "run without screen refresh". Without warp, assume each block/step inside the custom block takes about one frame. With warp, the body runs as fast as possible until it yields or finishes.',
-        '- Use warp for pure calculations, tight loops, list processing, recursion, and helper procedures that should finish in the same frame. Avoid warp for visible animation, wait-based timing, or code that should update the screen between steps.',
-        '- Use return expr only inside custom block definitions. Use callret/procedure reporter only when a reporter custom block already exists.',
-        '- Unknown Scratch opcodes can use @op(opcode="...", inputs={...}, fields={...}, mutation="..."), but prefer normal friendly names.',
-        '- For AI_EDIT edits, prefer line patches for small changes and full replacement only for new or heavily rewritten scripts.',
-        'Example:',
-        '#vars { score }',
-        '#broadcasts { game_over }',
+        '伪代码文件结构：',
+        '1. 可选头部声明。',
+        '2. 一个或多个顶层脚本。',
+        '3. 一个或多个自定义块 define。',
+        '',
+        '头部声明规则：',
+        '- 变量、列表、广播声明应放在伪代码最前面，先写声明，再写脚本。',
+        '- 全局变量使用 #vars { 名字1, 名字2 }。',
+        '- 角色局部变量使用 #localvars { 名字1, 名字2 }。',
+        '- 全局列表使用 #lists { 名字1, 名字2 }。',
+        '- 角色局部列表使用 #locallists { 名字1, 名字2 }。',
+                        '- 广播消息不需要头部声明；使用 broadcast("消息名")、broadcast_and_wait("消息名") 或 on_broadcast("消息名") 时会自动创建。',
+                        '- 中文别名也可用：#变量、#局部变量、#列表、#局部列表。',
+        '- 不要在 on_flag_clicked、define、forever、if 等脚本体内部写头部声明。',
+                        '- 标准写法使用复数：#vars、#localvars、#lists、#locallists。',
+        '',
+        '伪代码规则：',
+        '- 使用 context.keywords 中的英文友好积木名，除非现有伪代码已经使用中文名或原始 opcode。',
+        '- 顶层脚本之间用空行分隔。事件脚本示例：on_flag_clicked() { ... }。',
+        '- 没有帽子积木的顶层堆栈可以写成 { ... }。可用 at(120, 80) on_flag_clicked() { ... } 指定坐标。',
+        '- 普通语句写成 name(arg1, arg2)。C 型积木用 braces，例如 forever() { ... }、repeat(10) { ... }、repeat_until(condition) { ... }。',
+        '- if 必须写成 if (条件) { ... }，else 写成 if (...) { ... } else { ... }。',
+        '- 表达式支持数字、字符串、变量/reporter、true/false/null、括号、!、+、-、*、/、%、<、>、<=、>=、==、!=、&&、||。',
+        '- +、-、*、/、% 是数学运算，不是 JavaScript 字符串拼接。字符串拼接必须使用 join(a, b)；多个片段使用嵌套 join，例如 join(join("第", 关卡编号), "关")。',
+        '- 数学单参函数使用简洁写法：abs(x)、floor(x)、ceiling(x)、sqrt(x)、sin(x)、cos(x)、tan(x)、asin(x)、acos(x)、atan(x)、ln(x)、log(x)、exp(x)、pow10(x)。旧写法 math_op("abs", x) 兼容但不推荐。',
+        '- 赋值支持 a = 1、a += 1、a -= 1、a *= 2、a /= 2、a %= 2。',
+        '- 注释支持 // 行注释 和 /* 块注释 */，会同步为 Scratch 可视化注释气泡。注释只作为说明，不要把必须执行的逻辑写进注释里。',
+        '- 不要写 JavaScript 风格临时变量声明，例如 var x = 1 或 let x = 1。需要变量时，在头部用 #vars 或 #localvars 声明，然后直接赋值。',
+        '- 字符串包含空格、标点或菜单值时必须用双引号。双引号内部用 \\\" 转义。',
+        '- Scratch 下拉输入槽分两类：帽子积木/字段型下拉必须写菜单字符串；普通输入型下拉既可以写菜单字符串，也可以写变量/reporter 表达式。',
+        '- 菜单字符串示例：on_key_pressed("space")、key_pressed("left arrow")、goto("_mouse_")、create_clone_of("_myself_")、switch_costume("造型1")。',
+        '- 可拖入 reporter 的菜单槽示例：switch_costume(当前造型编号)、switch_backdrop(背景编号)、goto(目标角色名)、key_pressed(按键名)。造型/背景切换中，数字表示第几个，字符串表示名称。',
+                        '- 需要广播时直接使用 broadcast("消息名") 或 on_broadcast("消息名")，不要写 #broadcasts 头部。',
+        '- 自定义块写成 define my_block(arg, bool flag) { ... } 或 define my_block(arg, bool flag) warp { ... }，调用写成 my_block(1, true) 或 call my_block(1)。',
+        '- define 中的 warp 表示 Scratch/TurboWarp “不刷新屏幕运行”。没有 warp 时，自定义块内部每个积木/步骤大约按一帧执行；有 warp 时，函数体尽可能快地执行，直到让步或结束。',
+        '- 纯计算、紧密循环、列表处理、递归、批量初始化适合 warp。动画、等待、需要看到过程的代码不要使用 warp。',
+        '- return expr 只在自定义块里使用。只有已有 reporter 自定义块时才使用 callret/procedure reporter。',
+        '- 未知 Scratch opcode 可以使用 @op(opcode="...", inputs={...}, fields={...}, mutation="...")，但优先使用普通友好名称。',
+        '',
+        '变量作用域规则：',
+        '- #vars 是全局变量，适合“当前关卡”“总分”“游戏状态”。',
+        '- #localvars 是角色局部变量，适合“本克隆编号”“本按钮关卡”“本敌人血量”。',
+        '- #lists 是全局列表，适合全项目共享的数据。',
+        '- #locallists 是角色局部列表，适合角色或克隆相关的临时数据。',
+        '- 克隆体各自不同的数据必须使用 #localvars 或 #locallists。',
+        '- 不要用全局变量保存每个克隆自己的身份，否则多个克隆会互相覆盖。',
+        '- 批量创建带编号克隆（选关按钮、敌人、菜单项、列表项）时，使用一个 #vars 全局创建标记递增，再在 on_clone_start 的第一句复制到 #localvars 克隆身份变量。',
+        '- 创建循环中写：创建标记 += 1；create_clone_of("_myself_")；wait(0)。wait(0) 会等待一帧，让刚创建的克隆先执行 on_clone_start 并读到当前标记，再进入下一次循环。',
+        '- 克隆的位置、造型、血量、点击响应、广播参数等，都应读取克隆身份变量，不要读取还会继续变化的创建标记。',
+        '',
+        '头部声明示例：',
+        '#vars { 当前关卡, 总分 }',
+        '#localvars { 本关卡编号 }',
+        '#lists { 已解锁关卡 }',
+        '#locallists { 临时路径 }',
+                        '脚本示例：',
         'on_flag_clicked() {',
-        '    score = 0',
+        '    当前关卡 = 0',
         '    forever() {',
         '        move(10)',
         '        if_on_edge_bounce()',
-        '        if (score > 10) {',
-        '            broadcast("game_over")',
+        '        if (当前关卡 > 8) {',
+        '            broadcast("游戏结束")',
         '        }',
         '    }',
+        '}',
+        '',
+        '带编号克隆示例：',
+        '#vars { 创建标记, 选中编号 }',
+        '#localvars { 本克隆编号 }',
+        'on_flag_clicked() {',
+        '    hide()',
+        '    创建标记 = 0',
+        '    repeat(8) {',
+        '        创建标记 += 1',
+        '        create_clone_of("_myself_")',
+        '        wait(0)',
+        '    }',
+        '}',
+        'on_clone_start() {',
+        '    本克隆编号 = 创建标记',
+        '    show()',
+        '    switch_costume(本克隆编号 + 1)',
+        '}',
+        'on_sprite_clicked() {',
+        '    选中编号 = 本克隆编号',
         '}'
     ].join('\n');
     const formatAiPseudocodePreview = pseudocode => {
@@ -2243,6 +2989,56 @@ export default async ({addon, console, msg}) => {
         if (text.length <= AI_PSEUDOCODE_PREVIEW_LIMIT) return text;
         return `${text.slice(0, AI_PSEUDOCODE_PREVIEW_LIMIT)}\n\n...（伪代码较长，后续内容已写入编辑器）`;
     };
+    const formatAiToolTraceName = tool => {
+        const type = String(tool && (tool.type || tool.toolType || tool.action) || '').trim();
+        return type || 'unknown';
+    };
+    const sanitizeAiToolTraceValue = (value, depth = 0, seen = new Set()) => {
+        if (value == null) return value;
+        const valueType = typeof value;
+        if (valueType === 'string') {
+            if (/^data:image\//i.test(value)) return `[image data url, ${value.length} chars]`;
+            if (value.length > AI_TOOL_TRACE_STRING_LIMIT) {
+                return `${value.slice(0, AI_TOOL_TRACE_STRING_LIMIT)}\n...（已截断，原长度 ${value.length} 字符）`;
+            }
+            return value;
+        }
+        if (valueType === 'number' || valueType === 'boolean') return value;
+        if (valueType === 'function' || valueType === 'symbol') return `[${valueType}]`;
+        if (seen.has(value)) return '[Circular]';
+        if (depth >= AI_TOOL_TRACE_DEPTH_LIMIT) return '[Object]';
+        seen.add(value);
+        if (Array.isArray(value)) {
+            const items = value.slice(0, AI_TOOL_TRACE_ARRAY_LIMIT)
+                .map(item => sanitizeAiToolTraceValue(item, depth + 1, seen));
+            if (value.length > AI_TOOL_TRACE_ARRAY_LIMIT) {
+                items.push(`...（已截断，剩余 ${value.length - AI_TOOL_TRACE_ARRAY_LIMIT} 项）`);
+            }
+            seen.delete(value);
+            return items;
+        }
+        const result = {};
+        for (const key of Object.keys(value)) {
+            const lowerKey = key.toLowerCase();
+            if (
+                lowerKey === 'data' ||
+                lowerKey === 'bytes' ||
+                lowerKey === 'arraybuffer' ||
+                lowerKey === 'imagedata' ||
+                lowerKey === 'dataurl'
+            ) {
+                const raw = value[key];
+                result[key] = typeof raw === 'string'
+                    ? `[omitted ${raw.length} chars]`
+                    : '[omitted binary data]';
+                continue;
+            }
+            result[key] = sanitizeAiToolTraceValue(value[key], depth + 1, seen);
+        }
+        seen.delete(value);
+        return result;
+    };
+    const formatAiToolTraceJson = value => JSON.stringify(sanitizeAiToolTraceValue(value), null, 2);
     const formatAiAppliedMultiResult = (summary, applications) => {
         const names = (applications || [])
             .map(item => item && item.targetName)
@@ -2606,7 +3402,64 @@ export default async ({addon, console, msg}) => {
         }
         return {ok: true, text: lines.join('\n')};
     };
+    const getAiHiddenTokenLabel = token => {
+        if (!token) return 'AI 隐藏块';
+        if (token.type === 'action') return 'AI 动作块';
+        if (token.type === 'tool' || token.type === 'provider_tool') return 'AI 工具块';
+        if (token.type === 'edit') return 'AI 修改块';
+        return 'AI 隐藏块';
+    };
+    const parseAiJsonFromText = text => {
+        const clean = stripCodeFence(text);
+        return JSON.parse(clean);
+    };
+    const parseAiProviderToolPayload = text => {
+        const raw = String(text || '');
+        const marker = '<|tool_call_argument_begin|>';
+        const endMarkers = [
+            '<|tool_call_end|>',
+            '<|tool_call_argument_end|>',
+            '<|tool_calls_section_end|>'
+        ];
+        const payloads = [];
+        let index = raw.indexOf(marker);
+        while (index >= 0) {
+            const start = index + marker.length;
+            let end = raw.length;
+            for (const endMarker of endMarkers) {
+                const candidate = raw.indexOf(endMarker, start);
+                if (candidate >= 0 && candidate < end) end = candidate;
+            }
+            const chunk = raw.slice(start, end).trim();
+            if (chunk) payloads.push(parseAiJsonFromText(chunk));
+            index = raw.indexOf(marker, end);
+        }
+        if (payloads.length === 1) return payloads[0];
+        if (payloads.length > 1) return {type: 'batch', calls: payloads};
+        const firstBrace = raw.indexOf('{');
+        const lastBrace = raw.lastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+            return parseAiJsonFromText(raw.slice(firstBrace, lastBrace + 1));
+        }
+        throw new Error('没有找到工具参数 JSON');
+    };
+    const normalizeAiCallablePayload = parsed => {
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+        const type = String(parsed.type || parsed.name || parsed.action || parsed.toolType || '').trim();
+        let args = parsed.arguments;
+        if (typeof args === 'string') {
+            try { args = JSON.parse(args); } catch (_) { args = null; }
+        }
+        if (args && typeof args === 'object' && !Array.isArray(args)) {
+            return {
+                ...args,
+                type: args.type || type
+            };
+        }
+        return parsed;
+    };
     const normalizeAiSingleToolPayload = parsed => {
+        parsed = normalizeAiCallablePayload(parsed);
         const type = String(parsed && (parsed.type || parsed.action || parsed.toolType) || '').trim();
         const targetIds = normalizeAiToolTargetIds(parsed);
         const lineRanges = normalizeAiToolLineRanges(parsed);
@@ -2646,6 +3499,51 @@ export default async ({addon, console, msg}) => {
             type === 'inspect_stage'
         ) {
             return {ok: true, tool: {type: 'get_stage_snapshot', raw: parsed}};
+        }
+        if (type === 'list_extensions' || type === 'get_extensions' || type === 'get_extension_list') {
+            return {
+                ok: true,
+                tool: {
+                    type: 'list_extensions',
+                    query: String(parsed.query || parsed.keyword || parsed.search || '').trim(),
+                    source: String(parsed.source || parsed.provider || '').trim(),
+                    includeRemote: parsed.includeRemote !== false,
+                    limit: parsed.limit || parsed.maxResults,
+                    raw: parsed
+                }
+            };
+        }
+        if (type === 'load_extension' || type === 'enable_extension' || type === 'add_extension') {
+            const extensionId = String(parsed.extensionId || parsed.id || parsed.name || parsed.extension || '').trim();
+            const extensionUrl = String(parsed.extensionUrl || parsed.url || parsed.extensionURL || '').trim();
+            const slug = String(parsed.slug || parsed.turbowarpSlug || parsed.twSlug || '').trim();
+            if (!extensionId && !extensionUrl && !slug) return {ok: false, error: 'load_extension 动作缺少 extensionId、slug 或 url。'};
+            return {
+                ok: true,
+                tool: {
+                    type: 'load_extension',
+                    extensionId,
+                    url: extensionUrl,
+                    slug,
+                    raw: parsed
+                }
+            };
+        }
+        if (
+            type === 'get_extension_blocks' ||
+            type === 'get_extension_opcodes' ||
+            type === 'get_extension_block_info'
+        ) {
+            return {
+                ok: true,
+                tool: {
+                    type: 'get_extension_blocks',
+                    extensionId: String(parsed.extensionId || parsed.id || parsed.name || parsed.extension || '').trim(),
+                    query: String(parsed.query || parsed.keyword || parsed.search || '').trim(),
+                    limit: parsed.limit || parsed.maxResults,
+                    raw: parsed
+                }
+            };
         }
         if (type === 'get_pseudocode' && (targetIds.length || lineRanges.some(range => range.targetId))) {
             return {ok: true, tool: {type: 'get_pseudocode', targetIds, lineRanges}};
@@ -2690,7 +3588,78 @@ export default async ({addon, console, msg}) => {
                 }
             };
         }
-        return {ok: false, error: 'AI 工具块必须是 get_pseudocode、get_target_info、get_costume_info、search_text、造型工具或项目结构工具。'};
+        return {ok: false, error: 'AI 工具块必须是 get_pseudocode、get_target_info、get_costume_info、search_text、list_extensions、load_extension、get_extension_blocks、造型工具或项目结构工具。'};
+    };
+    const isAiEditActionType = type => [
+        'edit_pseudocode',
+        'edit',
+        'apply_edit',
+        'apply_pseudocode',
+        'modify_pseudocode',
+        'replace_pseudocode'
+    ].indexOf(type) >= 0;
+    const normalizeAiSingleActionPayload = parsed => {
+        const payload = normalizeAiCallablePayload(parsed);
+        const type = String(payload && (payload.type || payload.action || payload.toolType) || '').trim();
+        if (isAiEditActionType(type) || (payload && (typeof payload.pseudocode === 'string' || Array.isArray(payload.edits)))) {
+            if (!payload || (typeof payload.pseudocode !== 'string' && !Array.isArray(payload.edits))) {
+                return {ok: false, error: 'edit_pseudocode 动作缺少 pseudocode 或 edits 字段。'};
+            }
+            return {ok: true, action: {kind: 'edit', type: 'edit_pseudocode', edit: payload}};
+        }
+        const normalized = normalizeAiSingleToolPayload(payload);
+        if (!normalized.ok) return normalized;
+        return {ok: true, action: {kind: 'tool', type: normalized.tool.type, tool: normalized.tool}};
+    };
+    const normalizeAiActionPayload = parsed => {
+        const payload = normalizeAiCallablePayload(parsed);
+        const rawActions = Array.isArray(payload)
+            ? payload
+            : (Array.isArray(payload && payload.calls)
+                ? payload.calls
+                : (Array.isArray(payload && payload.tools)
+                    ? payload.tools
+                    : (Array.isArray(payload && payload.toolCalls)
+                        ? payload.toolCalls
+                        : (Array.isArray(payload && payload.actions) ? payload.actions : null))));
+        const actionItems = rawActions || [payload];
+        if (!actionItems.length) return {ok: false, error: 'AI 动作列表为空。'};
+        if (actionItems.length > AI_MAX_TOOL_CALLS_PER_BATCH) {
+            return {
+                ok: false,
+                error: `AI 单次最多可以批量执行 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个动作。`
+            };
+        }
+        const actions = [];
+        for (let i = 0; i < actionItems.length; i++) {
+            const normalized = normalizeAiSingleActionPayload(actionItems[i]);
+            if (!normalized.ok) {
+                return {ok: false, error: `第 ${i + 1} 个动作无效：${normalized.error}`};
+            }
+            actions.push(normalized.action);
+        }
+        return {ok: true, actions};
+    };
+    const buildAiHiddenActionResult = (visibleText, actions) => {
+        const actionList = Array.isArray(actions) ? actions : [];
+        const tools = actionList
+            .filter(item => item && item.kind === 'tool' && item.tool)
+            .map(item => item.tool);
+        const editAction = actionList.find(item => item && item.kind === 'edit' && item.edit);
+        const legacyAction = actionList.length === 1 && editAction
+            ? {type: 'edit', edit: editAction.edit, actions: actionList}
+            : (actionList.length && tools.length === actionList.length
+                ? {type: 'tool', tool: tools[0] || null, tools, actions: actionList}
+                : {type: 'actions', actions: actionList});
+        return {
+            visibleText,
+            action: legacyAction,
+            actions: actionList,
+            tool: tools[0] || null,
+            tools,
+            edit: editAction ? editAction.edit : null,
+            error: null
+        };
     };
     const normalizeAiToolPayload = parsed => {
         const rawTools = Array.isArray(parsed)
@@ -2744,47 +3713,60 @@ export default async ({addon, console, msg}) => {
         }
         const closeIndex = raw.indexOf(token.close, openIndex + token.open.length);
         const visibleText = raw.slice(0, openIndex).trim();
+        const parseHiddenPayload = clean => {
+            const parsed = token.type === 'provider_tool'
+                ? parseAiProviderToolPayload(clean)
+                : JSON.parse(clean);
+            if (token.type === 'action' || token.type === 'provider_tool') {
+                const normalized = normalizeAiActionPayload(parsed);
+                if (!normalized.ok) {
+                    return {visibleText, action: null, tool: null, tools: null, edit: null, error: normalized.error};
+                }
+                return buildAiHiddenActionResult(visibleText, normalized.actions);
+            }
+            if (token.type === 'tool') {
+                const normalized = normalizeAiToolPayload(parsed);
+                if (!normalized.ok) {
+                    return {visibleText, action: null, tool: null, tools: null, edit: null, error: normalized.error};
+                }
+                return buildAiHiddenActionResult(
+                    visibleText,
+                    normalized.tools.map(tool => ({kind: 'tool', type: tool.type, tool}))
+                );
+            }
+            if (parsed && (typeof parsed.pseudocode === 'string' || Array.isArray(parsed.edits))) {
+                return buildAiHiddenActionResult(
+                    visibleText,
+                    [{kind: 'edit', type: 'edit_pseudocode', edit: parsed}]
+                );
+            }
+            return {visibleText, action: null, tool: null, tools: null, edit: null, error: 'AI 修改块缺少 pseudocode 或 edits 字段。'};
+        };
         if (closeIndex < 0) {
+            const cleanTail = stripCodeFence(raw.slice(openIndex + token.open.length).trim());
+            if (cleanTail) {
+                try {
+                    const parsedTail = parseHiddenPayload(cleanTail);
+                    if (!parsedTail.error) return {...parsedTail, missingCloseAccepted: true};
+                    return parsedTail;
+                } catch (_) {
+                    // fall through to the clearer "missing close" error below
+                }
+            }
             return {
                 visibleText,
                 action: null,
                 tool: null,
                 tools: null,
                 edit: null,
-                error: token.type === 'tool' ? 'AI 工具块没有结束。' : 'AI 修改块没有结束。'
+                error: `${getAiHiddenTokenLabel(token)}没有结束。`
             };
         }
         const clean = stripCodeFence(raw.slice(openIndex + token.open.length, closeIndex).trim());
         try {
-            const parsed = JSON.parse(clean);
-            if (token.type === 'tool') {
-                const normalized = normalizeAiToolPayload(parsed);
-                if (!normalized.ok) {
-                    return {visibleText, action: null, tool: null, tools: null, edit: null, error: normalized.error};
-                }
-                const tool = normalized.tools[0] || null;
-                return {
-                    visibleText,
-                    action: {type: 'tool', tool, tools: normalized.tools},
-                    tool,
-                    tools: normalized.tools,
-                    edit: null,
-                    error: null
-                };
-            }
-            if (parsed && (typeof parsed.pseudocode === 'string' || Array.isArray(parsed.edits))) {
-                return {
-                    visibleText,
-                    action: {type: 'edit', edit: parsed},
-                    tool: null,
-                    tools: null,
-                    edit: parsed,
-                    error: null
-                };
-            }
-            return {visibleText, action: null, tool: null, tools: null, edit: null, error: 'AI 修改块缺少 pseudocode 或 edits 字段。'};
+            return parseHiddenPayload(clean);
         } catch (err) {
-            const label = token.type === 'tool' ? 'AI 工具块' : 'AI 修改块';
+            const label = getAiHiddenTokenLabel(token);
             return {visibleText, action: null, tool: null, tools: null, edit: null, error: `${label}不是合法 JSON: ${err.message}`};
         }
     };
@@ -2909,13 +3891,15 @@ export default async ({addon, console, msg}) => {
         return best;
     };
     class AiResponseProcessor {
-        constructor (onVisibleDelta, onHiddenStart, onReasoningDelta) {
+        constructor (onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) {
             this.onVisibleDelta = onVisibleDelta;
             this.onHiddenStart = onHiddenStart;
             this.onReasoningDelta = onReasoningDelta;
+            this.onHiddenEnd = onHiddenEnd;
             this.raw = '';
             this.visibleSent = 0;
             this.hiddenStarted = false;
+            this.hiddenClosed = false;
             this.hiddenType = null;
             this.buffer = '';
             this.inThink = false;
@@ -2931,6 +3915,13 @@ export default async ({addon, console, msg}) => {
                 this.hiddenStarted = true;
                 this.hiddenType = hidden.type;
                 if (this.onHiddenStart) this.onHiddenStart(hidden.type);
+            }
+            if (hidden && this.hiddenStarted && !this.hiddenClosed) {
+                const closeIndex = this.raw.indexOf(hidden.close, hidden.index + hidden.open.length);
+                if (closeIndex >= 0) {
+                    this.hiddenClosed = true;
+                    if (this.onHiddenEnd) this.onHiddenEnd(hidden.type, true);
+                }
             }
             const visibleEnd = hidden
                 ? hidden.index
@@ -2987,11 +3978,15 @@ export default async ({addon, console, msg}) => {
                 this.emitVisible(this.raw.slice(this.visibleSent));
                 this.visibleSent = this.raw.length;
             }
+            if (this.hiddenStarted && !this.hiddenClosed && this.onHiddenEnd) {
+                this.onHiddenEnd(this.hiddenType, false);
+            }
             const action = parseHiddenAction(this.raw);
             return {
                 raw: this.raw,
                 visibleText: action.visibleText,
                 hiddenType: this.hiddenType,
+                hiddenClosed: this.hiddenClosed,
                 action
             };
         }
@@ -3006,10 +4001,10 @@ export default async ({addon, console, msg}) => {
         const message = data && data.error && data.error.message ? data.error.message : text;
         return new Error(message || `HTTP ${response.status}`);
     };
-    const requestAiTextNonStreaming = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta) => {
+    const requestAiTextNonStreaming = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
         const headers = {'Content-Type': 'application/json'};
         if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-        const processor = new AiResponseProcessor(onVisibleDelta, onHiddenStart, onReasoningDelta);
+        const processor = new AiResponseProcessor(onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         const response = await fetch(normalizeAiEndpoint(config.endpoint), {
             method: 'POST',
             headers,
@@ -3017,7 +4012,7 @@ export default async ({addon, console, msg}) => {
             body: JSON.stringify({
                 model: config.model,
                 messages,
-                temperature: 0.15
+                temperature: 1
             })
         });
         if (!response.ok) throw await getAiHttpError(response);
@@ -3031,7 +4026,7 @@ export default async ({addon, console, msg}) => {
         processor.append(content);
         return processor.finish();
     };
-    const requestAiTextStreaming = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta) => {
+    const requestAiTextStreaming = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
         const headers = {'Content-Type': 'application/json'};
         if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
         const response = await fetch(normalizeAiEndpoint(config.endpoint), {
@@ -3041,18 +4036,18 @@ export default async ({addon, console, msg}) => {
             body: JSON.stringify({
                 model: config.model,
                 messages,
-                temperature: 0.15,
+                temperature: 1,
                 stream: true
             })
         });
         if (!response.ok) throw await getAiHttpError(response);
         if (!response.body || typeof response.body.getReader !== 'function') {
-            return requestAiTextNonStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta);
+            return requestAiTextNonStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        const processor = new AiResponseProcessor(onVisibleDelta, onHiddenStart, onReasoningDelta);
+        const processor = new AiResponseProcessor(onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         let eventBuffer = '';
         let wireText = '';
         let sawSseData = false;
@@ -3131,14 +4126,14 @@ export default async ({addon, console, msg}) => {
         if (!result.raw) throw new Error('AI response is empty');
         return result;
     };
-    const requestAiText = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta) => {
+    const requestAiText = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
         try {
-            return await requestAiTextStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta);
+            return await requestAiTextStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         } catch (err) {
             if (err && err.name === 'AbortError') throw err;
             if (err && err.partialContent) throw err;
             console.warn('[json-script-converter] AI stream failed; falling back to non-streaming', err);
-            return requestAiTextNonStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta);
+            return requestAiTextNonStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         }
     };
     const testAiConfig = async (config, signal) => {
@@ -3151,7 +4146,7 @@ export default async ({addon, console, msg}) => {
             body: JSON.stringify({
                 model: config.model,
                 messages: [{role: 'user', content: 'Reply with ok.'}],
-                temperature: 0,
+                temperature: 1,
                 max_tokens: 8
             })
         });
@@ -3192,7 +4187,7 @@ export default async ({addon, console, msg}) => {
                         }
                     ]
                 }],
-                temperature: 0,
+                temperature: 1,
                 max_tokens: 40
             })
         });
@@ -3247,13 +4242,14 @@ export default async ({addon, console, msg}) => {
             super(props);
             const storedAiConfig = loadAiConfig();
             const storedAiChats = loadAiChatState();
+            const storedUiState = loadUiState();
             const activeAiConversation = storedAiChats.conversations.find(
                 conversation => conversation.id === storedAiChats.activeConversationId
             );
             // 伪代码比 JSON 友好，默认就用它
             this.state = {
-                mode: 'pseudo',
-                aiChatOpen: false,
+                mode: storedUiState.mode,
+                aiChatOpen: storedUiState.aiChatOpen,
                 aiBusy: false,
                 aiConfigTesting: false,
                 aiModelsLoading: false,
@@ -3266,6 +4262,7 @@ export default async ({addon, console, msg}) => {
                 aiActiveConversationId: storedAiChats.activeConversationId,
                 aiSidebarCollapsed: storedAiChats.sidebarCollapsed,
                 aiMessages: activeAiConversation ? activeAiConversation.messages : [],
+                aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES,
                 aiShowProcessLog: false,
                 aiConfig: storedAiConfig
             };
@@ -3290,9 +4287,12 @@ export default async ({addon, console, msg}) => {
             this.aiModelsAutoFetchTimer = null;
             this.aiModelsAbortController = null;
             this.aiLastModelsFetchKey = '';
+            this.aiLastEndpointInputKey = '';
             this.aiMessagesScrollRAF = null;
             this.aiMessagesScrollTimer = null;
+            this.aiLoadingOlderMessages = false;
             this.aiProgrammaticScrollUntil = 0;
+            this.aiUserMessageScrollUntil = 0;
             this.aiActiveMessageId = null;
             this.aiUserAborted = false;
             this.aiProcessStartedAt = 0;
@@ -3323,12 +4323,25 @@ export default async ({addon, console, msg}) => {
         componentDidMount () {
             this.syncAiInputKeyListener();
             this.installAiDebugApi();
+            this.syncUiChrome();
             this.syncAiTitleActions();
             window.addEventListener('beforeunload', this.persistAiChatState);
+            window.addEventListener('beforeunload', this.persistUiState);
+            if (this.state.aiChatOpen) {
+                this.scrollAiMessagesToBottomSoon(true);
+                setTimeout(() => {
+                    const needsConfig = !this.state.aiConfigReady;
+                    if (needsConfig && this.aiEndpointRef.current) {
+                        this.aiEndpointRef.current.focus();
+                        this.handleAiEndpointInputChange();
+                    } else if (this.aiInputRef.current) this.aiInputRef.current.focus();
+                }, 0);
+            }
         }
         componentDidUpdate () {
             this.syncAiInputKeyListener();
             this.installAiDebugApi();
+            this.syncUiChrome();
             this.syncAiTitleActions();
         }
         componentWillUnmount () {
@@ -3359,11 +4372,28 @@ export default async ({addon, console, msg}) => {
                 this.aiChatPersistTimer = null;
                 this.persistAiChatState();
             }
+            this.persistUiState();
             if (window.__jsonScriptConverterAiDebug === this.aiDebugApi) {
                 delete window.__jsonScriptConverterAiDebug;
             }
             window.removeEventListener('beforeunload', this.persistAiChatState);
+            window.removeEventListener('beforeunload', this.persistUiState);
         }
+        persistUiState = () => {
+            saveUiState({
+                mode: this.state.mode,
+                aiChatOpen: this.state.aiChatOpen
+            });
+        };
+        syncUiChrome = () => {
+            if (buttonContainer) buttonContainer.style.display = this.state.aiChatOpen ? 'none' : 'flex';
+            if (modeToggleButton) {
+                modeToggleButton.textContent = this.state.mode === 'json' ? '当前: JSON' : '当前: 伪代码';
+            }
+            if (typeof updateSyncCheckboxVisibility === 'function') {
+                updateSyncCheckboxVisibility(this.state.mode);
+            }
+        };
         syncAiTitleActions = () => {
             if (!titleAiActions || !titleAiConfigButton || !titleAiCloseButton) return;
             if (!this.state.aiChatOpen) {
@@ -3512,6 +4542,19 @@ export default async ({addon, console, msg}) => {
                     });
                 },
                 getStageSnapshot: async () => this.getAiStageSnapshot(),
+                listExtensions: options => this.listAiExtensions(options || {}),
+                loadExtension: async (extensionIdOrUrl, options) => this.loadAiExtension({
+                    type: 'load_extension',
+                    extensionId: isAiExtensionUrl(extensionIdOrUrl) ? '' : extensionIdOrUrl,
+                    url: isAiExtensionUrl(extensionIdOrUrl) ? extensionIdOrUrl : '',
+                    slug: options && options.slug
+                }),
+                getExtensionBlocks: (extensionId, options) => getAiExtensionBlocks(vm, {
+                    type: 'get_extension_blocks',
+                    extensionId,
+                    query: options && options.query,
+                    limit: options && options.limit
+                }),
                 createSvgCostume: async (targetIdOrName, name, svg, options) => {
                     const resolved = this.resolveAiTarget(targetIdOrName || (vm.editingTarget && vm.editingTarget.id));
                     if (!resolved.target) return {ok: false, error: resolved.error};
@@ -3571,10 +4614,15 @@ export default async ({addon, console, msg}) => {
                 applyAiEditPayload: payload => {
                     let parsed = payload;
                     if (typeof payload === 'string') {
-                        if (payload.indexOf(AI_EDIT_OPEN) >= 0 || payload.indexOf(AI_TOOL_OPEN) >= 0) {
+                        if (
+                            payload.indexOf(AI_ACTION_OPEN) >= 0 ||
+                            payload.indexOf(AI_EDIT_OPEN) >= 0 ||
+                            payload.indexOf(AI_TOOL_OPEN) >= 0 ||
+                            payload.indexOf(AI_PROVIDER_TOOL_OPEN) >= 0
+                        ) {
                             const action = parseHiddenAction(payload);
                             if (action.error) return {ok: false, error: action.error};
-                            if (!action.edit) return {ok: false, error: '隐藏块不是 AI_EDIT 修改。'};
+                            if (!action.edit) return {ok: false, error: '隐藏块不是伪代码修改动作。'};
                             parsed = action.edit;
                         } else {
                             try { parsed = JSON.parse(stripCodeFence(payload)); } catch (err) { return {ok: false, error: err.message}; }
@@ -3598,19 +4646,29 @@ export default async ({addon, console, msg}) => {
                     let parsed = payload;
                     let tools = null;
                     if (typeof payload === 'string') {
-                        if (payload.indexOf(AI_TOOL_OPEN) >= 0) {
+                        if (
+                            payload.indexOf(AI_ACTION_OPEN) >= 0 ||
+                            payload.indexOf(AI_TOOL_OPEN) >= 0 ||
+                            payload.indexOf(AI_PROVIDER_TOOL_OPEN) >= 0
+                        ) {
                             const action = parseHiddenAction(payload);
                             if (action.error) return {ok: false, error: action.error};
-                            if (!action.tool) return {ok: false, error: '隐藏块不是 AI_TOOL 工具。'};
-                            tools = action.tools || [action.tool];
+                            if (!action.tools || !action.tools.length) return {ok: false, error: '隐藏块不是项目结构工具动作。'};
+                            if (action.actions && action.actions.some(item => item && item.kind !== 'tool')) {
+                                return {ok: false, error: '项目结构调试接口只能执行工具动作。'};
+                            }
+                            tools = action.tools;
                         } else {
                             try { parsed = JSON.parse(stripCodeFence(payload)); } catch (err) { return {ok: false, error: err.message}; }
                         }
                     }
                     if (!tools) {
-                        const normalized = normalizeAiToolPayload(parsed);
+                        const normalized = normalizeAiActionPayload(parsed);
                         if (!normalized.ok) return {ok: false, error: normalized.error};
-                        tools = normalized.tools;
+                        if (normalized.actions.some(action => action.kind !== 'tool')) {
+                            return {ok: false, error: '项目结构调试接口只能执行工具动作。'};
+                        }
+                        tools = normalized.actions.map(action => action.tool);
                     }
                     const results = [];
                     for (const tool of tools) {
@@ -3745,6 +4803,7 @@ export default async ({addon, console, msg}) => {
                 aiChatOpen: true,
                 aiConfigPanelOpen: needsConfig
             }, () => {
+                this.persistUiState();
                 this.aiShouldAutoScrollMessages = true;
                 this.scrollAiMessagesToBottomSoon(true);
                 if (needsConfig && this.aiEndpointRef.current) {
@@ -3756,8 +4815,7 @@ export default async ({addon, console, msg}) => {
 
         closeAiChat = () => {
             this.abortAiRequest();
-            buttonContainer.style.display = 'flex';
-            this.setState({aiChatOpen: false});
+            this.setState({aiChatOpen: false}, this.persistUiState);
         };
 
         openAiConfigPanel = () => {
@@ -3978,13 +5036,25 @@ export default async ({addon, console, msg}) => {
         };
 
         handleAiEndpointInputChange = () => {
-            const value = this.aiEndpointRef.current ? this.aiEndpointRef.current.value.trim() : '';
+            const input = this.aiEndpointRef.current;
+            const value = input ? input.value.trim() : '';
             if (!value) return;
+            let normalized;
             try {
-                normalizeAiEndpoint(value);
+                normalized = normalizeAiEndpoint(value);
             } catch (_) {
                 return;
             }
+            if (input && input.value.trim() !== normalized) input.value = normalized;
+            const apiKey = this.aiApiKeyRef.current ? this.aiApiKeyRef.current.value.trim() : '';
+            const endpointKey = `${normalized}|${apiKey}`;
+            if (endpointKey === this.aiLastEndpointInputKey) return;
+            this.aiLastEndpointInputKey = endpointKey;
+            this.aiLastModelsFetchKey = '';
+            this.setState({
+                aiModels: [],
+                aiModelMenuOpen: true
+            });
             this.scheduleAiModelsAutoFetch();
         };
 
@@ -4092,7 +5162,8 @@ export default async ({addon, console, msg}) => {
                     .concat(Array.isArray(prev.aiConversations) ? prev.aiConversations : [])
                     .slice(0, AI_CHAT_MAX_CONVERSATIONS),
                 aiActiveConversationId: conversation.id,
-                aiMessages: []
+                aiMessages: [],
+                aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES
             }), () => {
                 this.persistAiChatState();
                 this.scrollAiMessagesToBottomSoon(true);
@@ -4110,7 +5181,8 @@ export default async ({addon, console, msg}) => {
             this.aiShouldAutoScrollMessages = true;
             this.setState({
                 aiActiveConversationId: conversation.id,
-                aiMessages: Array.isArray(conversation.messages) ? conversation.messages : []
+                aiMessages: Array.isArray(conversation.messages) ? conversation.messages : [],
+                aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES
             }, () => {
                 this.persistAiChatState();
                 this.scrollAiMessagesToBottomSoon(true);
@@ -4124,15 +5196,80 @@ export default async ({addon, console, msg}) => {
             }), this.persistAiChatState);
         };
 
+        deleteAiConversation = id => {
+            if (this.state.aiBusy) {
+                this.setInfo('AI 回复中，先中断或等待完成后再删除聊天。');
+                return;
+            }
+            const conversation = (this.state.aiConversations || []).find(item => item && item.id === id);
+            if (!conversation) return;
+            const title = conversation.title || '新的聊天';
+            if (!window.confirm(`确定要删除聊天记录“${title}”吗？此操作不能撤销。`)) return;
+            const conversations = (this.state.aiConversations || []).filter(item => item && item.id !== id);
+            const deletingActive = id === this.state.aiActiveConversationId;
+            const activeConversation = deletingActive
+                ? (conversations[0] || null)
+                : (conversations.find(item => item && item.id === this.state.aiActiveConversationId) || conversations[0] || null);
+            this.aiShouldAutoScrollMessages = true;
+            this.setState({
+                aiConversations: conversations,
+                aiActiveConversationId: activeConversation ? activeConversation.id : null,
+                aiMessages: activeConversation ? (activeConversation.messages || []) : [],
+                aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES
+            }, () => {
+                this.persistAiChatState();
+                this.scrollAiMessagesToBottomSoon(true);
+                this.setInfo('聊天记录已删除。');
+            });
+        };
+
+        exportAiConversation = id => {
+            const conversation = (this.state.aiConversations || []).find(item => item && item.id === id);
+            if (!conversation) {
+                this.setError('没有找到要导出的聊天记录。');
+                return;
+            }
+            const filename = `${sanitizeAiExportFileName(conversation.title)}-${formatAiExportTime(Date.now()).replace(/[: ]/g, '-')}.txt`;
+            downloadTextFile(filename, formatAiConversationAsTxt(conversation));
+            this.setInfo('聊天记录已导出为 TXT。');
+        };
+
+        loadOlderAiMessages = () => {
+            if (this.aiLoadingOlderMessages) return;
+            const el = this.aiMessagesRef.current;
+            if (!el) return;
+            const total = getRenderableAiChatMessages(this.state.aiMessages, this.state.aiShowProcessLog).length;
+            const currentLimit = Number(this.state.aiVisibleMessageLimit) || AI_CHAT_RENDER_INITIAL_MESSAGES;
+            if (currentLimit >= total) return;
+            const previousScrollHeight = el.scrollHeight;
+            const previousScrollTop = el.scrollTop;
+            this.aiLoadingOlderMessages = true;
+            this.setState({
+                aiVisibleMessageLimit: Math.min(total, currentLimit + AI_CHAT_RENDER_BATCH_MESSAGES)
+            }, () => {
+                this.aiLoadingOlderMessages = false;
+                const nextEl = this.aiMessagesRef.current;
+                if (!nextEl) return;
+                this.aiProgrammaticScrollUntil = Date.now() + 180;
+                nextEl.scrollTop = Math.max(0, nextEl.scrollHeight - previousScrollHeight + previousScrollTop);
+            });
+        };
+
+        getAiMessagesDistanceToBottom = () => {
+            const el = this.aiMessagesRef.current;
+            if (!el) return 0;
+            return el.scrollHeight - el.scrollTop - el.clientHeight;
+        };
+
+        isAiMessagesNearBottom = () => this.getAiMessagesDistanceToBottom() <= 48;
+
         shouldScrollAiMessagesToBottom = force => {
             if (force) {
                 this.aiShouldAutoScrollMessages = true;
                 return true;
             }
-            const el = this.aiMessagesRef.current;
-            if (!el) return true;
-            const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-            const nearBottom = distanceToBottom <= 48;
+            if (!this.aiMessagesRef.current) return true;
+            const nearBottom = this.isAiMessagesNearBottom();
             if (nearBottom) this.aiShouldAutoScrollMessages = true;
             return nearBottom && this.aiShouldAutoScrollMessages !== false;
         };
@@ -4140,6 +5277,7 @@ export default async ({addon, console, msg}) => {
         scrollAiMessagesToBottom = shouldScroll => {
             if (!shouldScroll || this.aiShouldAutoScrollMessages === false) return;
             const scrollOnce = () => {
+                if (this.aiShouldAutoScrollMessages === false) return;
                 const el = this.aiMessagesRef.current;
                 if (!el) return;
                 this.aiProgrammaticScrollUntil = Date.now() + 180;
@@ -4171,12 +5309,31 @@ export default async ({addon, console, msg}) => {
         handleAiMessagesScroll = () => {
             const el = this.aiMessagesRef.current;
             if (!el) return;
-            if (Date.now() < this.aiProgrammaticScrollUntil) {
+            const userScrolling = Date.now() < this.aiUserMessageScrollUntil;
+            if (userScrolling && el.scrollTop <= 80) {
+                this.loadOlderAiMessages();
+                return;
+            }
+            if (!userScrolling && Date.now() < this.aiProgrammaticScrollUntil) {
                 this.aiShouldAutoScrollMessages = true;
                 return;
             }
-            const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-            this.aiShouldAutoScrollMessages = distanceToBottom <= 48;
+            this.aiShouldAutoScrollMessages = this.isAiMessagesNearBottom();
+        };
+
+        handleAiMessagesUserScrollIntent = event => {
+            this.aiUserMessageScrollUntil = Date.now() + 1000;
+            if (this.aiMessagesScrollRAF) {
+                cancelAnimationFrame(this.aiMessagesScrollRAF);
+                this.aiMessagesScrollRAF = null;
+            }
+            if (this.aiMessagesScrollTimer) {
+                clearTimeout(this.aiMessagesScrollTimer);
+                this.aiMessagesScrollTimer = null;
+            }
+            if (event && typeof event.deltaY === 'number' && event.deltaY < 0) {
+                this.aiShouldAutoScrollMessages = false;
+            }
         };
 
         addAiChatMessage = (role, text, extra) => {
@@ -4314,6 +5471,32 @@ export default async ({addon, console, msg}) => {
             }));
         };
 
+        addAiToolTraceDetail = (id, title, payload, extra) => {
+            this.addAiMessageDetail(id, title, formatAiToolTraceJson(payload), {
+                key: extra && extra.key ? extra.key : '',
+                kind: extra && extra.kind ? extra.kind : 'tool-trace'
+            });
+        };
+
+        addAiToolCallDetail = (id, tool, index, total) => {
+            const name = formatAiToolTraceName(tool);
+            const suffix = total > 1 ? ` ${index + 1}/${total}` : '';
+            this.addAiToolTraceDetail(id, `调用工具${suffix}：${name}`, tool || {}, {
+                key: `tool-call-${Date.now()}-${index}`,
+                kind: 'tool-call'
+            });
+        };
+
+        addAiToolResultDetail = (id, tool, result, index, total) => {
+            const name = formatAiToolTraceName(tool || result);
+            const suffix = total > 1 ? ` ${index + 1}/${total}` : '';
+            const status = result && result.ok ? '成功' : '失败';
+            this.addAiToolTraceDetail(id, `调用结果${suffix}：${name} ${status}`, result || {}, {
+                key: `tool-result-${Date.now()}-${index}`,
+                kind: result && result.ok ? 'tool-result' : 'tool-error'
+            });
+        };
+
         appendAiReasoningDelta = (id, delta) => {
             if (!id || !delta) return;
             this.updateAiChatMessage(id, message => {
@@ -4424,7 +5607,8 @@ export default async ({addon, console, msg}) => {
             declaredLists: parsed.declaredLists,
             declaredBroadcasts: parsed.declaredBroadcasts,
             declaredLocalVars: parsed.declaredLocalVars || new Set(),
-            declaredLocalLists: parsed.declaredLocalLists || new Set()
+            declaredLocalLists: parsed.declaredLocalLists || new Set(),
+            comments: parsed.comments || {}
         });
 
         getPseudoMetaSummary = meta => meta ? JSON.stringify({
@@ -4435,7 +5619,8 @@ export default async ({addon, console, msg}) => {
             dL: [...meta.declaredLists],
             dB: [...meta.declaredBroadcasts],
             dLV: [...meta.declaredLocalVars],
-            dLL: [...meta.declaredLocalLists]
+            dLL: [...meta.declaredLocalLists],
+            c: meta.comments || {}
         }) : '';
 
         getKnownPseudocodeEntries = knownTargetTexts => {
@@ -4443,9 +5628,16 @@ export default async ({addon, console, msg}) => {
             for (const [targetId, pseudocode] of knownTargetTexts.entries()) {
                 const resolved = this.resolveAiTarget(targetId);
                 if (!resolved.target) continue;
+                const text = String(pseudocode || '');
+                const lines = splitAiLines(text);
                 entries.push({
                     ...this.getAiTargetSummary(resolved.target, {includeCostumes: false}),
-                    pseudocode
+                    pseudocode: text,
+                    totalLines: lines.length,
+                    numberedLines: lines.map((line, index) => ({
+                        lineNumber: index + 1,
+                        text: line
+                    }))
                 });
             }
             return entries;
@@ -4646,6 +5838,167 @@ export default async ({addon, console, msg}) => {
             };
         };
 
+        listAiExtensions = async options => {
+            const opts = options || {};
+            let remoteItems = [];
+            let remoteError = null;
+            if (opts.includeRemote !== false) {
+                try {
+                    remoteItems = await getAiRemoteExtensionCatalog();
+                    remoteError = aiRemoteExtensionCatalogError || null;
+                } catch (err) {
+                    remoteError = err && err.message ? err.message : String(err);
+                }
+            }
+            let extensions = getAiExtensionSummaries(vm, remoteItems);
+            const query = String(opts.query || '').trim().toLowerCase();
+            const source = String(opts.source || '').trim().toLowerCase();
+            if (query) {
+                extensions = extensions.filter(item => [item.id, item.name, item.slug, item.description, item.url]
+                    .join(' ')
+                    .toLowerCase()
+                    .includes(query));
+            }
+            if (source) {
+                extensions = extensions.filter(item => String(item.source || (item.remote ? 'remote' : 'builtin'))
+                    .toLowerCase()
+                    .includes(source));
+            }
+            const total = extensions.length;
+            const limit = Math.min(200, Math.max(1, Number(opts.limit) || 80));
+            extensions = extensions.slice(0, limit);
+            return {
+                ok: true,
+                type: 'list_extensions',
+                loaded: getAiLoadedExtensionIds(vm),
+                extensions,
+                total,
+                truncated: total > extensions.length,
+                remoteError
+            };
+        };
+
+        refreshAiExtensionUi = () => {
+            try {
+                if (typeof vm.emitTargetsUpdate === 'function') vm.emitTargetsUpdate(false);
+            } catch (_) { /* ignore */ }
+        };
+
+        loadAiExtension = async tool => {
+            const manager = vm && vm.extensionManager;
+            if (!manager) return {ok: false, type: 'load_extension', error: '当前 VM 没有 extensionManager'};
+            const rawUrl = String(tool && (tool.url || tool.extensionUrl || tool.extensionURL) || '').trim();
+            const rawSlug = String(tool && (tool.slug || tool.turbowarpSlug || tool.twSlug) || '').trim();
+            const rawId = String(tool && (tool.extensionId || tool.id || tool.name || tool.extension) || '').trim();
+            const rawValue = rawUrl || rawId || rawSlug;
+            if (!rawValue) return {ok: false, type: 'load_extension', error: '缺少 extensionId 或 url'};
+            const isUrl = isAiExtensionUrl(rawValue);
+            const normalizedId = isUrl ? '' : normalizeAiExtensionId(rawValue);
+            let record = normalizedId ? getAiExtensionRecord(normalizedId) : null;
+            if (!record && !isUrl) {
+                try {
+                    record = await findAiRemoteExtensionRecord(rawSlug || rawId || rawValue);
+                } catch (_) { /* fall back below */ }
+            }
+            const directTurboWarpUrl = !record && rawSlug ? makeAiTurboWarpExtensionUrl(rawSlug) : '';
+            const extensionId = record ? record.id : normalizedId;
+            const displayId = extensionId || rawValue;
+            const beforeLoadedIds = new Set(getAiLoadedExtensionIds(vm));
+            if (extensionId && isAiExtensionLoaded(vm, extensionId)) {
+                return {
+                    ok: true,
+                    type: 'load_extension',
+                    extension: summarizeAiExtension(vm, record || extensionId),
+                    loaded: getAiLoadedExtensionIds(vm),
+                    newLoadedIds: [],
+                    alreadyLoaded: true,
+                    summary: `扩展已加载：${displayId}`,
+                    nextSuggestedAction: {type: 'get_extension_blocks', extensionId}
+                };
+            }
+            try {
+                if (record && (typeof manager.isBuiltinExtension !== 'function' || manager.isBuiltinExtension(record.id)) &&
+                    typeof manager.loadExtensionIdSync === 'function') {
+                    manager.loadExtensionIdSync(record.id);
+                } else if (record && record.url && typeof manager.loadExtensionURL === 'function') {
+                    await manager.loadExtensionURL(record.url);
+                } else if (extensionId && typeof manager.isBuiltinExtension === 'function' &&
+                    manager.isBuiltinExtension(extensionId) && typeof manager.loadExtensionIdSync === 'function') {
+                    manager.loadExtensionIdSync(extensionId);
+                } else if (directTurboWarpUrl && typeof manager.loadExtensionURL === 'function') {
+                    await manager.loadExtensionURL(directTurboWarpUrl);
+                } else if (!isUrl && typeof vm._loadExtensions === 'function') {
+                    await vm._loadExtensions([extensionId]);
+                } else if (typeof manager.loadExtensionURL === 'function') {
+                    await manager.loadExtensionURL(rawValue);
+                } else {
+                    return {ok: false, type: 'load_extension', error: '当前 VM 不支持加载扩展'};
+                }
+                this.refreshAiExtensionUi();
+                const afterLoadedIds = getAiLoadedExtensionIds(vm);
+                const newLoadedIds = afterLoadedIds.filter(id => !beforeLoadedIds.has(id));
+                const loadedId = record && record.id ? record.id : (extensionId || newLoadedIds[0] || '');
+                return {
+                    ok: true,
+                    type: 'load_extension',
+                    extension: loadedId ? summarizeAiExtension(vm, record || {
+                        id: loadedId,
+                        name: loadedId,
+                        url: directTurboWarpUrl || rawUrl,
+                        remote: !!(directTurboWarpUrl || rawUrl),
+                        source: directTurboWarpUrl ? 'tw' : undefined,
+                        slug: rawSlug
+                    }) : {id: rawValue, name: rawValue, loaded: true, url: directTurboWarpUrl || rawUrl},
+                    loaded: afterLoadedIds,
+                    newLoadedIds,
+                    summary: `已加载扩展：${loadedId || rawSlug || rawValue}`,
+                    nextSuggestedAction: loadedId ? {type: 'get_extension_blocks', extensionId: loadedId} : null
+                };
+            } catch (err) {
+                return {
+                    ok: false,
+                    type: 'load_extension',
+                    extensionId: displayId,
+                    error: err && err.message ? err.message : String(err)
+                };
+            }
+        };
+
+        ensureAiExtensionsForBlocks = blocks => {
+            const manager = vm && vm.extensionManager;
+            const requiredIds = getAiRequiredExtensionsFromBlocks(blocks);
+            if (!requiredIds.length) return {ok: true, requiredExtensions: [], loadedExtensions: []};
+            if (!manager) return {ok: false, error: '当前 VM 没有 extensionManager', requiredExtensions: requiredIds};
+            const loadedExtensions = [];
+            const errors = [];
+            for (const extensionId of requiredIds) {
+                if (isAiExtensionLoaded(vm, extensionId)) continue;
+                const record = AI_EXTENSION_ID_MAP.get(extensionId) || {id: extensionId, name: extensionId};
+                try {
+                    if (typeof manager.isBuiltinExtension === 'function' &&
+                        manager.isBuiltinExtension(extensionId) &&
+                        typeof manager.loadExtensionIdSync === 'function') {
+                        manager.loadExtensionIdSync(extensionId);
+                        loadedExtensions.push(summarizeAiExtension(vm, record));
+                    } else {
+                        errors.push(`${extensionId} 需要先调用 load_extension 加载`);
+                    }
+                } catch (err) {
+                    errors.push(`${extensionId}: ${err && err.message ? err.message : String(err)}`);
+                }
+            }
+            if (loadedExtensions.length) this.refreshAiExtensionUi();
+            if (errors.length) {
+                return {
+                    ok: false,
+                    error: `缺少扩展：${errors.join('；')}`,
+                    requiredExtensions: requiredIds,
+                    loadedExtensions
+                };
+            }
+            return {ok: true, requiredExtensions: requiredIds, loadedExtensions};
+        };
+
         executeAiProjectTool = async tool => {
             const type = tool && tool.type;
             if (type === 'create_sprite') {
@@ -4686,13 +6039,23 @@ export default async ({addon, console, msg}) => {
                 await vm.addCostume(costume.md5 || AI_DEFAULT_EMPTY_ASSET_MD5, costume, resolved.target.id);
                 const fullTargetSummary = this.getAiTargetSummary(resolved.target);
                 const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
+                const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
+                const costumeNumber = createdCostume.index != null ? createdCostume.index + 1 : existing.length + 1;
+                const costumeSummary = {
+                    ...createdCostume,
+                    name,
+                    number: costumeNumber,
+                    costumeNumber
+                };
                 this.prepareForExternalWorkspaceReset();
                 return {
                     ok: true,
                     type,
                     target: targetSummary,
-                    costume: (fullTargetSummary.costumes || []).find(item => item.name === name) || {name},
-                    summary: resolved.target.isStage ? `已创建背景：${name}` : `已创建造型：${name}`
+                    costume: costumeSummary,
+                    summary: resolved.target.isStage ?
+                        `已创建背景：${name}（第 ${costumeNumber} 个背景）` :
+                        `已创建造型：${name}（第 ${costumeNumber} 个造型）`
                 };
             }
             if (type === 'create_svg_costume') {
@@ -4709,14 +6072,24 @@ export default async ({addon, console, msg}) => {
                 await vm.addCostume(prepared.costume.md5, prepared.costume, resolved.target.id);
                 const fullTargetSummary = this.getAiTargetSummary(resolved.target);
                 const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
+                const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
+                const costumeNumber = createdCostume.index != null ? createdCostume.index + 1 : existing.length + 1;
+                const costumeSummary = {
+                    ...createdCostume,
+                    name,
+                    number: costumeNumber,
+                    costumeNumber
+                };
                 this.prepareForExternalWorkspaceReset();
                 return {
                     ok: true,
                     type,
                     target: targetSummary,
-                    costume: (fullTargetSummary.costumes || []).find(item => item.name === name) || {name},
+                    costume: costumeSummary,
                     svg: prepared.svg,
-                    summary: resolved.target.isStage ? `已创建 SVG 背景：${name}` : `已创建 SVG 造型：${name}`
+                    summary: resolved.target.isStage ?
+                        `已创建 SVG 背景：${name}（第 ${costumeNumber} 个背景）` :
+                        `已创建 SVG 造型：${name}（第 ${costumeNumber} 个造型）`
                 };
             }
             if (type === 'replace_svg_costume') {
@@ -4800,6 +6173,9 @@ export default async ({addon, console, msg}) => {
                 tool.type !== 'get_costume_info' &&
                 tool.type !== 'inspect_costume' &&
                 tool.type !== 'get_stage_snapshot' &&
+                tool.type !== 'list_extensions' &&
+                tool.type !== 'load_extension' &&
+                tool.type !== 'get_extension_blocks' &&
                 tool.type !== 'search_text' &&
                 tool.type !== 'create_sprite' &&
                 tool.type !== 'delete_sprite' &&
@@ -4843,6 +6219,21 @@ export default async ({addon, console, msg}) => {
                 }
                 return {targets, errors};
             };
+            if (tool.type === 'list_extensions') {
+                const result = await this.listAiExtensions(tool);
+                if (messageId) this.addAiMessageDetail(messageId, '扩展列表', formatAiExtensionsDetail(result));
+                return result;
+            }
+            if (tool.type === 'load_extension') {
+                const result = await this.loadAiExtension(tool);
+                if (messageId) this.addAiMessageDetail(messageId, '加载扩展结果', JSON.stringify(result, null, 2));
+                return result;
+            }
+            if (tool.type === 'get_extension_blocks') {
+                const result = getAiExtensionBlocks(vm, tool);
+                if (messageId) this.addAiMessageDetail(messageId, '扩展 opcode 表', formatAiExtensionBlocksDetail(result));
+                return result;
+            }
             if (tool.type === 'get_stage_snapshot') {
                 return this.getAiStageSnapshot();
             }
@@ -5216,9 +6607,13 @@ export default async ({addon, console, msg}) => {
         applyAiApplications = applications => {
             const currentTargetId = vm.editingTarget && vm.editingTarget.id;
             let currentApplication = null;
+            const loadedExtensions = [];
             for (const app of applications) {
                 const result = this.applyBlocksToWorkspace(app.parsed.blocks, app.meta, app.target, {forcePseudo: true});
                 if (!result.ok) return {ok: false, error: `${app.targetName}: ${result.error}`};
+                for (const extension of result.loadedExtensions || []) {
+                    if (!loadedExtensions.some(item => item && item.id === extension.id)) loadedExtensions.push(extension);
+                }
                 if (app.targetId === currentTargetId) currentApplication = app;
             }
             if (currentApplication) {
@@ -5232,7 +6627,7 @@ export default async ({addon, console, msg}) => {
                         '|' + this.getPseudoMetaSummary(currentApplication.meta);
                 }
             }
-            return {ok: true};
+            return {ok: true, loadedExtensions};
         };
 
         submitAiChat = async () => {
@@ -5291,6 +6686,7 @@ export default async ({addon, console, msg}) => {
                 const knownTargetTexts = new Map([[target.id, currentText]]);
                 let feedback = null;
                 let repairAttempts = 0;
+                let hiddenParseAttempts = 0;
                 let toolRounds = 0;
                 const projectOperationHistory = [];
                 const editOperationHistory = [];
@@ -5299,6 +6695,22 @@ export default async ({addon, console, msg}) => {
                     currentAssistantMessageId = messageId;
                     this.aiActiveMessageId = messageId;
                     let visibleStarted = false;
+                    let hiddenStatusId = null;
+                    const getHiddenStatusText = type => {
+                        if (type === 'edit') return 'AI 正在生成修改动作...';
+                        if (type === 'tool' || type === 'provider_tool') return 'AI 正在生成工具请求...';
+                        return 'AI 正在生成动作...';
+                    };
+                    const getHiddenDoneText = (type, completed) => {
+                        if (!completed) {
+                            if (type === 'edit') return 'AI 修改动作没有完整生成，准备重试。';
+                            if (type === 'tool' || type === 'provider_tool') return 'AI 工具请求没有完整生成，准备重试。';
+                            return 'AI 动作没有完整生成，准备重试。';
+                        }
+                        if (type === 'edit') return 'AI 已生成修改动作，准备校验。';
+                        if (type === 'tool' || type === 'provider_tool') return 'AI 已生成工具请求，准备执行。';
+                        return 'AI 已生成动作，准备执行。';
+                    };
                     this.addAiProcessStep(messageId, this.aiProcessLines.length
                         ? '继续发送请求，等待 AI 回复。'
                         : '收到请求，准备发送给 AI。');
@@ -5317,12 +6729,37 @@ export default async ({addon, console, msg}) => {
                             }
                             this.appendAiVisibleDelta(messageId, delta);
                         },
-                        type => this.addAiProcessStep(
-                            messageId,
-                            type === 'tool' ? '开始接收隐藏工具请求。' : '开始接收隐藏修改块。'
-                        ),
-                        delta => this.appendAiReasoningDelta(messageId, delta)
+                        type => {
+                            this.addAiProcessStep(
+                                messageId,
+                                type === 'edit'
+                                    ? '开始接收隐藏修改块。'
+                                    : (type === 'tool' || type === 'provider_tool'
+                                        ? '开始接收隐藏工具请求。'
+                                        : '开始接收隐藏动作块。')
+                            );
+                            hiddenStatusId = this.addAiStatusMessage(getHiddenStatusText(type));
+                        },
+                        delta => this.appendAiReasoningDelta(messageId, delta),
+                        (type, completed) => {
+                            this.addAiProcessStep(
+                                messageId,
+                                completed
+                                    ? '隐藏动作块接收完成。'
+                                    : '隐藏动作块未完整接收。'
+                            );
+                            if (hiddenStatusId) {
+                                this.updateAiChatMessage(hiddenStatusId, {
+                                    text: getHiddenDoneText(type, completed)
+                                });
+                            }
+                        }
                     );
+                    if (hiddenStatusId && response.action && response.action.missingCloseAccepted) {
+                        this.updateAiChatMessage(hiddenStatusId, {
+                            text: 'AI 动作 JSON 已完整，缺少结束标签，已按完整动作处理。'
+                        });
+                    }
                     this.updateAiChatMessage(messageId, {pending: false});
                     return {response, messageId};
                 };
@@ -5341,6 +6778,9 @@ export default async ({addon, console, msg}) => {
                     if (tool && tool.type === 'get_costume_info') return `${prefix}查看造型/背景信息`;
                     if (tool && tool.type === 'inspect_costume') return `${prefix}查看造型/背景图片`;
                     if (tool && tool.type === 'get_stage_snapshot') return `${prefix}获取舞台截图`;
+                    if (tool && tool.type === 'list_extensions') return `${prefix}查看扩展列表`;
+                    if (tool && tool.type === 'load_extension') return `${prefix}加载扩展${tool.extensionId ? `：${tool.extensionId}` : ''}`;
+                    if (tool && tool.type === 'get_extension_blocks') return `${prefix}查看扩展 opcode 表${tool.extensionId ? `：${tool.extensionId}` : ''}`;
                     if (tool && tool.type === 'get_pseudocode') return `${prefix}查看伪代码`;
                     if (tool && tool.type === 'create_sprite') return `${prefix}创建角色${tool.name ? `：${tool.name}` : ''}`;
                     if (tool && tool.type === 'delete_sprite') return `${prefix}删除角色`;
@@ -5356,9 +6796,16 @@ export default async ({addon, console, msg}) => {
                     const isTargetInfoTool = tool && tool.type === 'get_target_info';
                     const isCostumeInfoTool = tool && tool.type === 'get_costume_info';
                     const isVisionTool = tool && (tool.type === 'inspect_costume' || tool.type === 'get_stage_snapshot');
+                    const isExtensionTool = tool && (
+                        tool.type === 'list_extensions' ||
+                        tool.type === 'load_extension' ||
+                        tool.type === 'get_extension_blocks'
+                    );
                     const statusId = this.addAiStatusMessage(getAiToolStatusText(tool, index, total));
+                    this.addAiToolCallDetail(statusId, tool, index, total);
                     const toolResult = await this.executeAiTool(tool, knownTargetTexts, currentText, statusId);
                     throwIfAborted();
+                    this.addAiToolResultDetail(statusId, tool, toolResult, index, total);
                     if (toolResult.ok) {
                         if (toolResult.type === 'search_text') {
                             const hitText = toolResult.totalMatches
@@ -5391,7 +6838,7 @@ export default async ({addon, console, msg}) => {
                             this.addAiProcessStep(messageId, `已读取造型/背景信息：${labels.join('、') || '无'}`);
                             this.updateAiChatMessage(statusId, {
                                 text: labels.length
-                                    ? `AI 正在查看造型/背景信息：${labels.join('、')}`
+                                    ? `AI 已查看造型/背景信息：${labels.join('、')}`
                                     : 'AI 请求的造型/背景信息为空。'
                             });
                             return {
@@ -5410,7 +6857,7 @@ export default async ({addon, console, msg}) => {
                                 : (toolResult.imageAttachment && toolResult.imageAttachment.label) || '造型图片';
                             this.addAiProcessStep(messageId, `已获取图片：${label}`);
                             this.updateAiChatMessage(statusId, {
-                                text: `AI 正在查看图片：${label}`
+                                text: `AI 已获取图片：${label}`
                             });
                             return {
                                 ok: true,
@@ -5422,6 +6869,36 @@ export default async ({addon, console, msg}) => {
                                     costume: toolResult.costume || null,
                                     stage: toolResult.stage || null,
                                     imageAttachment: toolResult.imageAttachment || null
+                                }
+                            };
+                        }
+                        if (isExtensionTool) {
+                            const summary = toolResult.type === 'list_extensions'
+                                ? `AI 已查看扩展列表：${(toolResult.loaded || []).length} 个已加载`
+                                : (toolResult.type === 'get_extension_blocks'
+                                    ? `AI 已查看扩展 opcode 表：${toolResult.returnedBlocks || 0} 个积木`
+                                    : (toolResult.summary || `已加载扩展：${toolResult.extension && toolResult.extension.id || tool.extensionId || ''}`));
+                            this.addAiProcessStep(messageId, summary);
+                            this.updateAiChatMessage(statusId, {text: summary});
+                            return {
+                                ok: true,
+                                feedbackItem: {
+                                    kind: 'tool_result',
+                                    toolType: toolResult.type || tool.type,
+                                    ok: true,
+                                    loaded: toolResult.loaded || null,
+                                    extensions: toolResult.extensions || null,
+                                    total: toolResult.total || null,
+                                    totalBlocks: toolResult.totalBlocks || null,
+                                    matchedBlocks: toolResult.matchedBlocks || null,
+                                    returnedBlocks: toolResult.returnedBlocks || null,
+                                    truncated: !!toolResult.truncated,
+                                    remoteError: toolResult.remoteError || null,
+                                    extension: toolResult.extension || null,
+                                    newLoadedIds: toolResult.newLoadedIds || null,
+                                    nextSuggestedAction: toolResult.nextSuggestedAction || null,
+                                    alreadyLoaded: !!toolResult.alreadyLoaded,
+                                    summary
                                 }
                             };
                         }
@@ -5454,7 +6931,7 @@ export default async ({addon, console, msg}) => {
                                         completed: projectOperationHistory.slice()
                                     },
                                     completed: true,
-                                    guidance: 'This project structure operation has already been executed in the live project. Use projectOperationProgress.completed and current context.targets to decide whether the user requested more separate items. If more items remain, call one next AI_TOOL and batch independent remaining tools when practical. If nothing remains, answer normally with no hidden action.'
+                                    guidance: 'This project structure operation has already been executed in the live project. Use projectOperationProgress.completed and current context.targets to decide whether the user requested more separate items. If more items remain, output one next ACTION and batch independent remaining actions when practical. If nothing remains, answer normally with no hidden action.'
                                 }
                             };
                         }
@@ -5465,7 +6942,7 @@ export default async ({addon, console, msg}) => {
                             this.addAiProcessStep(messageId, `已读取目标信息：${names.join('、') || '无'}`);
                             this.updateAiChatMessage(statusId, {
                                 text: names.length
-                                    ? `AI 正在查看目标信息：${names.join('、')}`
+                                    ? `AI 已查看目标信息：${names.join('、')}`
                                     : 'AI 请求的目标信息为空。'
                             });
                             return {
@@ -5486,7 +6963,7 @@ export default async ({addon, console, msg}) => {
                             this.addAiProcessStep(messageId, `已读取伪代码片段：${labels.join('、') || '无新增'}`);
                             this.updateAiChatMessage(statusId, {
                                 text: labels.length
-                                    ? `AI 正在查看：${labels.join('、')}`
+                                    ? `AI 已查看：${labels.join('、')}`
                                     : 'AI 请求的伪代码片段为空。'
                             });
                             return {
@@ -5506,7 +6983,7 @@ export default async ({addon, console, msg}) => {
                         this.addAiProcessStep(messageId, `已读取角色伪代码：${names.join('、') || '无新增'}`);
                         this.updateAiChatMessage(statusId, {
                             text: names.length
-                                ? `AI 正在查看：${names.join('、')}`
+                                ? `AI 已查看：${names.join('、')}`
                                 : 'AI 请求的角色伪代码已经在上下文里。'
                         });
                         return {
@@ -5529,7 +7006,8 @@ export default async ({addon, console, msg}) => {
                                 : (isProjectTool ? `项目结构操作未完成：${toolResult.error}` :
                                     (isTargetInfoTool ? `读取目标信息失败：${toolResult.error}` :
                                         (isCostumeInfoTool ? `读取造型/背景信息失败：${toolResult.error}` :
-                                            (isVisionTool ? `读取图片失败：${toolResult.error}` : `读取角色失败：${toolResult.error}`)))))
+                                            (isVisionTool ? `读取图片失败：${toolResult.error}` :
+                                                (isExtensionTool ? `扩展工具失败：${toolResult.error}` : `读取角色失败：${toolResult.error}`))))))
                     });
                     return {
                         ok: false,
@@ -5540,7 +7018,8 @@ export default async ({addon, console, msg}) => {
                                 (isProjectTool ? tool.type :
                                     (isTargetInfoTool ? 'get_target_info' :
                                         (isCostumeInfoTool ? 'get_costume_info' :
-                                            (isVisionTool ? tool.type : 'get_pseudocode')))),
+                                            (isVisionTool ? tool.type :
+                                                (isExtensionTool ? tool.type : 'get_pseudocode'))))),
                             ok: false,
                             error: toolResult.error,
                             targets: toolResult.targets || [],
@@ -5551,17 +7030,164 @@ export default async ({addon, console, msg}) => {
                         }
                     };
                 };
+                const executeOneAiEditAction = async (editPayload, messageId) => {
+                    const editTraceTool = {
+                        type: 'edit_pseudocode',
+                        payload: editPayload || {}
+                    };
+                    const statusId = this.addAiStatusMessage(
+                        repairAttempts
+                            ? 'AI 正在校验修复后的伪代码...'
+                            : 'AI 正在校验伪代码修改...'
+                    );
+                    this.addAiToolCallDetail(statusId, editTraceTool, 0, 1);
+                    this.addAiProcessStep(messageId, '检测到伪代码修改动作，开始合成和校验伪代码。');
+                    const prepared = this.prepareAiEditPayload(editPayload, knownTargetTexts);
+                    if (!prepared.ok) {
+                        this.addAiProcessStep(messageId, `草稿未通过校验：${prepared.error}`);
+                        const draftTitle = repairAttempts
+                            ? `第 ${repairAttempts + 1} 次修复草稿（仍未通过解析）`
+                            : '未通过解析的草稿伪代码';
+                        const shownDrafts = this.addAiApplicationDetails(statusId, draftTitle, prepared.applications);
+                        if (!shownDrafts) {
+                            this.addAiApplicationDetails(
+                                statusId,
+                                `${draftTitle}（原始修改内容）`,
+                                this.extractAiRawDraftApplications(editPayload, knownTargetTexts)
+                            );
+                        }
+                        repairAttempts++;
+                        this.addAiToolResultDetail(statusId, editTraceTool, {
+                            ok: false,
+                            error: prepared.error,
+                            parseErrors: prepared.errors || null,
+                            repairAttempt: repairAttempts
+                        }, 0, 1);
+                        this.updateAiChatMessage(statusId, {
+                            text: repairAttempts === 1
+                                ? '草稿没有通过解析，我正在把错误信息发回 AI 修复。'
+                                : `第 ${repairAttempts} 次草稿仍未通过解析，我会继续把错误信息发回 AI 修复。`
+                        });
+                        return {
+                            ok: false,
+                            repair: true,
+                            feedbackItem: {
+                                kind: 'repair',
+                                previousPayload: editPayload,
+                                error: prepared.error,
+                                parseErrors: prepared.errors || null,
+                                repairAttempt: repairAttempts
+                            }
+                        };
+                    }
+                    throwIfAborted();
+                    this.addAiProcessStep(messageId, '所有角色伪代码校验通过，准备应用。');
+                    const applyResult = this.applyAiApplications(prepared.applications);
+                    if (!applyResult.ok) {
+                        repairAttempts++;
+                        this.addAiApplicationDetails(
+                            statusId,
+                            repairAttempts === 1
+                                ? '应用前校验失败的草稿伪代码'
+                                : `第 ${repairAttempts} 次应用前校验失败草稿`,
+                            prepared.applications
+                        );
+                        this.addAiToolResultDetail(statusId, editTraceTool, {
+                            ok: false,
+                            error: applyResult.error,
+                            repairAttempt: repairAttempts
+                        }, 0, 1);
+                        this.updateAiChatMessage(statusId, {
+                            text: repairAttempts === 1
+                                ? '应用前校验失败，我正在把错误信息发回 AI 修复。'
+                                : `第 ${repairAttempts} 次应用前校验失败，我会继续把错误信息发回 AI 修复。`
+                        });
+                        return {
+                            ok: false,
+                            repair: true,
+                            feedbackItem: {
+                                kind: 'repair',
+                                previousPayload: editPayload,
+                                error: applyResult.error,
+                                repairAttempt: repairAttempts
+                            }
+                        };
+                    }
+                    if (applyResult.loadedExtensions && applyResult.loadedExtensions.length) {
+                        const loadedText = formatAiLoadedExtensions(applyResult.loadedExtensions);
+                        this.addAiProcessStep(messageId, `已自动加载扩展：${loadedText}`);
+                        this.addAiMessageDetail(statusId, '自动加载的扩展', loadedText);
+                    }
+                    const summary = (editPayload && editPayload.summary) || '';
+                    const appliedText = formatAiAppliedMultiResult(summary, prepared.applications);
+                    this.addAiApplicationDetails(statusId, '已应用的伪代码', prepared.applications);
+                    this.updateAiChatMessage(statusId, {text: appliedText});
+                    this.addAiProcessStep(messageId, '已应用跨角色修改。');
+                    const editRecord = {
+                        summary,
+                        applications: prepared.applications.map(app => ({
+                            targetRef: app.targetRef,
+                            targetId: app.targetId,
+                            targetName: app.targetName,
+                            mode: app.mode,
+                            summary: app.summary || '',
+                            patchSummaries: (app.patches || [])
+                                .map(patch => patch && patch.summary)
+                                .filter(Boolean)
+                        }))
+                    };
+                    this.addAiToolResultDetail(statusId, editTraceTool, {
+                        ok: true,
+                        summary,
+                        applications: editRecord.applications
+                    }, 0, 1);
+                    editOperationHistory.push(editRecord);
+                    for (const app of prepared.applications) {
+                        knownTargetTexts.set(app.targetId, app.pseudocode);
+                    }
+                    repairAttempts = 0;
+                    this.setSuccess('AI 已应用伪代码修改。');
+                    return {
+                        ok: true,
+                        feedbackItem: {
+                            kind: 'edit_result',
+                            ok: true,
+                            summary,
+                            applications: editRecord.applications,
+                            completed: true,
+                            editOperationProgress: {
+                                completed: editOperationHistory.slice()
+                            },
+                            guidance: 'This edit_pseudocode action has already been applied in the live project. Use editOperationProgress.completed and current availablePseudocode/context to decide whether more requested edits remain. If more work remains, output one next ACTION. If everything requested is complete, answer normally with no hidden action.'
+                        }
+                    };
+                };
                 for (let turn = 0; turn < AI_MAX_TOTAL_ROUNDS; turn++) {
                     const {response, messageId} = await requestOnce();
                     this.addAiProcessStep(messageId, 'AI 回复完成，开始检查隐藏 action。');
                     throwIfAborted();
                     const hidden = response.action || parseHiddenAction(response.raw);
                     if (hidden.error) {
+                        hiddenParseAttempts++;
                         this.addAiProcessStep(messageId, `隐藏块解析失败：${hidden.error}`);
-                        this.addAiStatusMessage(`隐藏块解析失败：${hidden.error}`);
+                        const canRetry = turn < AI_MAX_TOTAL_ROUNDS - 1;
+                        if (canRetry) {
+                            this.addAiStatusMessage('AI 动作块没有完整生成，我正在让 AI 重新生成完整动作。');
+                            feedback = {
+                                kind: 'action_parse_error',
+                                ok: false,
+                                error: hidden.error,
+                                attempt: hiddenParseAttempts,
+                                guidance: 'Your previous hidden ACTION was invalid or incomplete. Do not continue the partial JSON. Regenerate the whole action as exactly one complete <ACTION>...</ACTION> block at the end, or answer normally with no hidden action if no action is needed.'
+                            };
+                            this.setInfo('AI 动作块不完整，正在重试。');
+                            continue;
+                        }
+                        this.addAiStatusMessage(`AI 动作块一直没有完整生成，我先停止了：${hidden.error}`);
                         this.setError(`AI 隐藏块解析失败: ${hidden.error}`);
                         return;
                     }
+                    hiddenParseAttempts = 0;
                     if (!hidden.action) {
                         const hasCompletedActions = projectOperationHistory.length || editOperationHistory.length;
                         this.updateAiChatMessage(messageId, message => ({
@@ -5578,7 +7204,27 @@ export default async ({addon, console, msg}) => {
                         this.setInfo(hasCompletedActions ? 'AI 已完成。' : 'AI 已回复，未修改伪代码。');
                         return;
                     }
-                    if (hidden.action.type === 'tool') {
+                    const hiddenActions = (hidden.action && hidden.action.actions) || hidden.actions || (
+                        hidden.action.type === 'tool'
+                            ? (hidden.action.tools || hidden.tools || (hidden.tool ? [hidden.tool] : []))
+                                .filter(Boolean)
+                                .map(tool => ({kind: 'tool', type: tool.type, tool}))
+                            : (hidden.action.type === 'edit' && hidden.edit
+                                ? [{kind: 'edit', type: 'edit_pseudocode', edit: hidden.edit}]
+                                : [])
+                    );
+                    if (!hiddenActions.length) {
+                        this.addAiStatusMessage('AI 动作块里没有可执行的动作。');
+                        this.setError('AI 动作块里没有可执行的动作。');
+                        return;
+                    }
+                    if (hiddenActions.length > AI_MAX_TOOL_CALLS_PER_BATCH) {
+                        this.addAiStatusMessage(`AI 一次请求了 ${hiddenActions.length} 个动作，超过上限 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。`);
+                        this.setError(`AI 批量动作数超过上限（${AI_MAX_TOOL_CALLS_PER_BATCH} 个）。`);
+                        return;
+                    }
+                    const hasToolActions = hiddenActions.some(action => action && action.kind === 'tool');
+                    if (hasToolActions) {
                         toolRounds++;
                         if (toolRounds > AI_MAX_TOOL_ROUNDS) {
                             this.addAiProcessStep(messageId, `工具请求超过上限：${AI_MAX_TOOL_ROUNDS} 轮。`);
@@ -5589,141 +7235,62 @@ export default async ({addon, console, msg}) => {
                             this.setError(`AI 工具请求次数超过上限（${AI_MAX_TOOL_ROUNDS} 轮）。`);
                             return;
                         }
-                        const tools = (hidden.action.tools || hidden.tools || (hidden.tool ? [hidden.tool] : []))
-                            .filter(Boolean);
-                        if (!tools.length) {
-                            this.addAiStatusMessage('AI 工具块里没有可执行的工具。');
-                            this.setError('AI 工具块里没有可执行的工具。');
-                            return;
-                        }
-                        if (tools.length > AI_MAX_TOOL_CALLS_PER_BATCH) {
-                            this.addAiStatusMessage(`AI 一次请求了 ${tools.length} 个工具，超过上限 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。`);
-                            this.setError(`AI 批量工具数超过上限（${AI_MAX_TOOL_CALLS_PER_BATCH} 个）。`);
-                            return;
-                        }
-                        this.addAiProcessStep(messageId, tools.length > 1
-                            ? `检测到批量工具请求：${tools.length} 个工具。`
-                            : '检测到工具请求。');
-                        const resultItems = [];
-                        let failedItem = null;
-                        for (let i = 0; i < tools.length; i++) {
-                            const item = await executeOneAiToolAction(tools[i], i, tools.length, messageId);
-                            resultItems.push(item.feedbackItem);
-                            if (!item.ok) {
-                                failedItem = item;
-                                break;
-                            }
-                        }
-                        if (failedItem && failedItem.cancelled) {
-                            this.setInfo('用户已取消 AI 删除操作。');
-                            return;
-                        }
-                        feedback = resultItems.length === 1
-                            ? resultItems[0]
-                            : {
-                                kind: 'tool_result',
-                                batch: true,
-                                ok: !failedItem,
-                                toolCount: tools.length,
-                                completedToolCount: resultItems.length,
-                                results: resultItems,
-                                projectOperationProgress: {
-                                    completed: projectOperationHistory.slice()
-                                },
-                                guidance: failedItem
-                                    ? 'One tool in the batch failed, and later tools were not executed. Use the results array to recover or ask for the missing information before continuing.'
-                                    : 'All tools in this AI_TOOL batch have been executed in order. Use the results array, projectOperationProgress.completed, and current context to decide the next action. If more work remains, output one next AI_TOOL or AI_EDIT; otherwise answer normally with no hidden action.'
-                            };
-                        continue;
                     }
-                    if (hidden.action.type !== 'edit') {
-                        this.addAiStatusMessage('AI 返回了未知隐藏 action。');
-                        this.setError('AI 返回了未知隐藏 action。');
+                    this.addAiProcessStep(messageId, hiddenActions.length > 1
+                        ? `检测到批量动作请求：${hiddenActions.length} 个动作。`
+                        : (hiddenActions[0].kind === 'edit' ? '检测到伪代码修改动作。' : '检测到工具动作。'));
+                    const resultItems = [];
+                    let failedItem = null;
+                    for (let i = 0; i < hiddenActions.length; i++) {
+                        const action = hiddenActions[i];
+                        let item;
+                        if (action.kind === 'tool') {
+                            item = await executeOneAiToolAction(action.tool, i, hiddenActions.length, messageId);
+                        } else if (action.kind === 'edit') {
+                            item = await executeOneAiEditAction(action.edit, messageId);
+                        } else {
+                            item = {
+                                ok: false,
+                                feedbackItem: {
+                                    kind: 'action_result',
+                                    ok: false,
+                                    error: `不支持的动作类型: ${action.kind || action.type || ''}`
+                                }
+                            };
+                        }
+                        resultItems.push(item.feedbackItem);
+                        if (!item.ok) {
+                            failedItem = item;
+                            break;
+                        }
+                    }
+                    if (failedItem && failedItem.cancelled) {
+                        this.setInfo('用户已取消 AI 删除操作。');
                         return;
                     }
-                    this.addAiProcessStep(messageId, '检测到隐藏修改块，开始合成和校验伪代码。');
-                    const prepared = this.prepareAiEditPayload(hidden.edit, knownTargetTexts);
-                    if (!prepared.ok) {
-                        this.addAiProcessStep(messageId, `草稿未通过校验：${prepared.error}`);
-                        const draftTitle = repairAttempts
-                            ? `第 ${repairAttempts + 1} 次修复草稿（仍未通过解析）`
-                            : '未通过解析的草稿伪代码';
-                        const shownDrafts = this.addAiApplicationDetails(messageId, draftTitle, prepared.applications);
-                        if (!shownDrafts) {
-                            this.addAiApplicationDetails(
-                                messageId,
-                                `${draftTitle}（原始修改内容）`,
-                                this.extractAiRawDraftApplications(hidden.edit, knownTargetTexts)
-                            );
-                        }
-                        repairAttempts++;
-                        this.addAiStatusMessage(
-                            repairAttempts === 1
-                                ? '草稿没有通过解析，我正在把错误信息发回 AI 修复。'
-                                : `第 ${repairAttempts} 次草稿仍未通过解析，我会继续把错误信息发回 AI 修复。`
-                        );
-                        feedback = {
-                            kind: 'repair',
-                            previousPayload: hidden.edit,
-                            error: prepared.error,
-                            parseErrors: prepared.errors || null,
-                            repairAttempt: repairAttempts
-                        };
+                    if (failedItem && failedItem.repair) {
+                        feedback = failedItem.feedbackItem;
                         continue;
                     }
-                    throwIfAborted();
-                    this.addAiProcessStep(messageId, '所有角色伪代码校验通过，准备应用。');
-                    const applyResult = this.applyAiApplications(prepared.applications);
-                    if (!applyResult.ok) {
-                        repairAttempts++;
-                        this.addAiStatusMessage(
-                            repairAttempts === 1
-                                ? '应用前校验失败，我正在把错误信息发回 AI 修复。'
-                                : `第 ${repairAttempts} 次应用前校验失败，我会继续把错误信息发回 AI 修复。`
-                        );
-                        feedback = {
-                            kind: 'repair',
-                            previousPayload: hidden.edit,
-                            error: applyResult.error,
-                            repairAttempt: repairAttempts
+                    feedback = resultItems.length === 1
+                        ? resultItems[0]
+                        : {
+                            kind: 'action_result',
+                            batch: true,
+                            ok: !failedItem,
+                            actionCount: hiddenActions.length,
+                            completedActionCount: resultItems.length,
+                            results: resultItems,
+                            projectOperationProgress: {
+                                completed: projectOperationHistory.slice()
+                            },
+                            editOperationProgress: {
+                                completed: editOperationHistory.slice()
+                            },
+                            guidance: failedItem
+                                ? 'One action in the batch failed, and later actions were not executed. Use the results array to recover or ask for the missing information before continuing.'
+                                : 'All ACTION calls in this batch have been executed in order. Use the results array, projectOperationProgress.completed, editOperationProgress.completed, and current context to decide the next action. If more work remains, output one next ACTION; otherwise answer normally with no hidden action.'
                         };
-                        continue;
-                    }
-                    const summary = (hidden.edit && hidden.edit.summary) || '';
-                    const appliedText = formatAiAppliedMultiResult(summary, prepared.applications);
-                    this.addAiApplicationDetails(messageId, '已应用的伪代码', prepared.applications);
-                    this.addAiStatusMessage(appliedText);
-                    this.addAiProcessStep(messageId, '已应用跨角色修改。');
-                    const editRecord = {
-                        summary,
-                        applications: prepared.applications.map(app => ({
-                            targetRef: app.targetRef,
-                            targetId: app.targetId,
-                            targetName: app.targetName,
-                            mode: app.mode,
-                            summary: app.summary || '',
-                            patchSummaries: (app.patches || [])
-                                .map(patch => patch && patch.summary)
-                                .filter(Boolean)
-                        }))
-                    };
-                    editOperationHistory.push(editRecord);
-                    for (const app of prepared.applications) {
-                        knownTargetTexts.set(app.targetId, app.pseudocode);
-                    }
-                    feedback = {
-                        kind: 'edit_result',
-                        ok: true,
-                        summary,
-                        applications: editRecord.applications,
-                        completed: true,
-                        editOperationProgress: {
-                            completed: editOperationHistory.slice()
-                        },
-                        guidance: 'This AI_EDIT has already been applied in the live project. Use editOperationProgress.completed and current availablePseudocode/context to decide whether more requested edits remain. If more edits remain, output exactly one next AI_EDIT or AI_TOOL. If everything requested is complete, answer normally with no hidden action.'
-                    };
-                    repairAttempts = 0;
-                    this.setSuccess('AI 已应用伪代码修改。');
                     continue;
                 }
                 this.addAiStatusMessage(
@@ -5766,7 +7333,7 @@ export default async ({addon, console, msg}) => {
             if (r.errors && r.errors.length) {
                 return {ok: false, errors: r.errors};
             }
-            if (!r.blocks || !Object.keys(r.blocks).length) {
+            if ((!r.blocks || !Object.keys(r.blocks).length) && (!r.comments || !Object.keys(r.comments).length)) {
                 return {ok: false, errors: [{line: 1, col: 1, message: 'No blocks parsed from pseudocode'}]};
             }
             return {ok: true, result: r};
@@ -5818,53 +7385,60 @@ export default async ({addon, console, msg}) => {
                 {
                     role: 'system',
                     content: [
-                        'You are a helpful Scratch block script assistant for a pseudocode DSL.',
-                        'Reply naturally to the user first. This visible explanation is streamed to the user.',
-                        'Only include an edit when the user clearly asks to create, change, fix, or rewrite Scratch blocks/pseudocode.',
-                        'For greetings, questions, explanations, planning, or capability discussion, do not include an edit block.',
-                        'At most one hidden action block is allowed in each assistant response. It must be exactly one AI_TOOL or exactly one AI_EDIT at the very end.',
-                        `An AI_TOOL block may contain either one tool object or a batch object with "tools": [toolObject, ...]. Use this exact batch format only when every tool argument is already known before the batch runs: ${AI_TOOL_OPEN}{"tools":[{"type":"create_sprite","name":"A"},{"type":"create_sprite","name":"B"}]}${AI_TOOL_CLOSE}`,
-                        `A single AI_TOOL batch may contain at most ${AI_MAX_TOOL_CALLS_PER_BATCH} tool objects. The plugin executes them in order and returns one batched tool_result with a results array.`,
-                        'Do not put dependent tools in the same batch when a later tool needs data returned by an earlier tool. Example: to create a sprite using the longest costume name of target a, first call get_target_info for targetRef "a"; after the tool_result reveals costume names, call create_sprite with the chosen name.',
-                        'For multi-item project structure requests, decompose the request into a finite checklist of separate items. Keep that checklist concise and internal; do not show a long planning monologue.',
-                        'Use projectOperationProgress.completed plus the current context to track finished project structure steps. After each successful create/delete tool_result, mark those items done. If another requested item remains, call one next AI_TOOL and batch independent remaining tools when practical. If all requested items are done and no code edit remains, answer normally with no hidden action.',
-                        'AI_EDIT is an action result, not the final answer. After a successful edit_result, mark that edit done. If more requested tools or edits remain, output one next hidden action. If everything requested is done, answer normally with no hidden action.',
-                        'Use targetRef as the preferred target identifier. targetRef values are short stable refs such as "a", "b", "c". targetId is accepted only for compatibility; targetName is display text.',
-                        'context.targets is intentionally lightweight and omits full costume/backdrop lists. If you need exact costume/backdrop names, request get_target_info for the relevant targetRef first.',
-                        `If you need exact target/costume/backdrop details, append a hidden info tool block at the very end: ${AI_TOOL_OPEN}{"type":"get_target_info","targetRefs":["a"]}${AI_TOOL_CLOSE}`,
-                        `Costume/backdrop tools are available without image vision: ${AI_TOOL_OPEN}{"type":"get_costume_info","targetRef":"a","costumeName":"costume1"}${AI_TOOL_CLOSE}, ${AI_TOOL_OPEN}{"type":"create_svg_costume","targetRef":"a","name":"CostumeName","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 100\\">...</svg>"}${AI_TOOL_CLOSE}, ${AI_TOOL_OPEN}{"type":"replace_svg_costume","targetRef":"a","costumeName":"costume1","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 100\\">...</svg>"}${AI_TOOL_CLOSE}.`,
-                        'get_costume_info returns costume/backdrop metadata. If a specific SVG costume/backdrop is requested, it also returns SVG source text when available. Bitmap costumes return metadata only unless image vision tools are enabled.',
-                        'When creating or replacing an SVG costume/backdrop, provide safe self-contained SVG only: no script, no event attributes, no external links/resources, and no embedded data URI images. replace_svg_costume keeps the existing name unless newName is provided.',
+                        '你是一个 Scratch / TurboWarp 伪代码助手。你的任务是根据用户要求，解释、读取、创建或修改项目中的角色、舞台、造型和伪代码。',
+                        '你的可见回复要简洁、自然、按实际进度说话。不要提前宣布已经完成。需要执行动作时，可见回复最多先说一句正在做什么，然后在末尾追加一个隐藏动作块。',
+                        '每轮 assistant 回复只能选择一种结果：普通回答、执行一个隐藏动作块、或总结完成。确认所有用户要求都已完成后，才用普通回答总结，不输出隐藏动作块。',
+                        `隐藏动作块必须放在整段回复的最后。隐藏动作块外不要输出 JSON、伪代码或工具参数。通用格式：${AI_ACTION_OPEN}{"type":"工具名","参数名":"参数值"}${AI_ACTION_CLOSE}`,
+                        `批量动作格式：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"工具名","参数名":"参数值"},{"type":"工具名","参数名":"参数值"}]}${AI_ACTION_CLOSE}`,
+                        `不要使用模型供应商自己的工具调用格式。不要输出类似 <|tool_calls_section_begin|>、functions.AI_TOOL、tool_call_argument、${AI_TOOL_OPEN}、${AI_EDIT_OPEN} 这样的内容。只使用 ${AI_ACTION_OPEN}。`,
+                        '每次最多输出一个 <ACTION> 块。所有读取、创建、删除、修改伪代码都属于动作。修改伪代码使用 edit_pseudocode 动作。',
+                        '执行决策顺序：先理解用户原始目标；再查看 projectOperationProgress.completed 和 editOperationProgress.completed；还有未完成的结构操作就继续执行；需要更多上下文就先读取或查找；已有足够上下文且需要改代码就调用 edit_pseudocode；所有要求完成后才普通总结。',
+                        '一次动作成功不代表任务结束；必须检查是否还有剩余角色、造型或脚本要处理。edit_pseudocode 成功也不是最终回答，成功后仍要根据 edit_result 检查是否还有剩余要求。',
+                        `批量规则：多个互不依赖的动作应放在同一个 batch.calls 中，最多 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。后一个动作依赖前一个动作返回结果时，必须分轮执行。`,
+                        '例如“创建三个角色”应使用一个 batch，包含三个 create_sprite。例如“读取 a 中名称最长的造型，再用这个名称创建角色”必须先 get_target_info，等 tool_result 返回后再 create_sprite。例如“创建两个角色，一个写加法，一个写乘法”：先 batch 创建两个角色，拿到新 targetRef 后再 edit_pseudocode。',
+                        '工具执行后，插件会返回 tool_result 或 edit_result。你必须根据 result 判断下一步，不要猜测执行结果。',
+                        '可用动作：get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、edit_pseudocode。',
                         ...(visionSupported ? [
-                            `The user enabled image vision for this AI configuration. To let the AI see a costume/backdrop image, use: ${AI_TOOL_OPEN}{"type":"inspect_costume","targetRef":"a","costumeName":"costume1"}${AI_TOOL_CLOSE}.`,
-                            `To inspect the live player/stage screenshot, use: ${AI_TOOL_OPEN}{"type":"get_stage_snapshot"}${AI_TOOL_CLOSE}.`,
-                            'inspect_costume and get_stage_snapshot return image attachments in the next tool_result. Use them only when visual appearance matters or SVG source is insufficient. If the API rejects image input, explain that this endpoint/model may not actually support vision.'
+                            '用户已为此 AI 配置启用图像理解。额外可用动作：inspect_costume、get_stage_snapshot。',
+                            `查看造型图片：${AI_ACTION_OPEN}{"type":"inspect_costume","targetRef":"a","costumeName":"costume1"}${AI_ACTION_CLOSE}`,
+                            `查看舞台截图：${AI_ACTION_OPEN}{"type":"get_stage_snapshot"}${AI_ACTION_CLOSE}`,
+                            'inspect_costume 和 get_stage_snapshot 会在下一轮 tool_result 中返回图片。只有视觉外观确实重要，或 SVG 源码不足以判断时才使用。'
                         ] : [
-                            'The user has not enabled image vision for this AI configuration. Do not use inspect_costume or get_stage_snapshot. For bitmap costumes, rely on metadata or ask the user to enable image understanding with a model/API that supports image input.'
+                            '用户未启用图像理解。不要调用 inspect_costume 或 get_stage_snapshot。位图造型只能读取元信息；SVG 造型可通过 get_costume_info 读取源码。'
                         ]),
-                        `If you need to locate text before editing, append a hidden search tool block at the very end: ${AI_TOOL_OPEN}{"type":"search_text","query":"text to find","targetRefs":["a"],"caseSensitive":false,"regex":false}${AI_TOOL_CLOSE}`,
-                        `If you need full pseudocode for targets that are not in availablePseudocode, append a hidden read tool block at the very end: ${AI_TOOL_OPEN}{"type":"get_pseudocode","targetRefs":["a"]}${AI_TOOL_CLOSE}`,
-                        `If you only need specific lines, get_pseudocode may read snippets: ${AI_TOOL_OPEN}{"type":"get_pseudocode","targetRefs":["a"],"startLine":3,"endLine":8}${AI_TOOL_CLOSE}. You can also use "lines":[3,4] or "ranges":[{"targetRef":"a","startLine":3,"endLine":8}].`,
-                        `Project structure tools are also available: ${AI_TOOL_OPEN}{"type":"create_sprite","name":"SpriteName"}${AI_TOOL_CLOSE}, ${AI_TOOL_OPEN}{"type":"delete_sprite","targetRef":"a"}${AI_TOOL_CLOSE}, ${AI_TOOL_OPEN}{"type":"create_costume","targetRef":"a","name":"CostumeName"}${AI_TOOL_CLOSE}, ${AI_TOOL_OPEN}{"type":"delete_costume","targetRef":"a","costumeName":"CostumeName"}${AI_TOOL_CLOSE}.`,
-                        'Each project structure tool object creates/deletes exactly one item, but one AI_TOOL batch can include multiple project structure tool objects. For example, "create three sprites" should normally use one AI_TOOL with three create_sprite tools, then observe the batched tool_result.',
-                        'Deletion tools will pause for user confirmation in the plugin UI. Do not add confirm:true; the user, not the model, confirms destructive project structure changes.',
-                        'After a project structure tool succeeds, treat that operation as already completed. Do not call the same create/delete tool again unless the user explicitly requested multiple items. If no remaining script/code edit is needed, give a normal final answer with no hidden action.',
-                        'When you use AI_TOOL, do not include AI_EDIT in the same response. Wait for the tool result.',
-                        'search_text returns targetRef, targetId, targetName, lineNumber, column, and lineText. If targetRefs/targetIds is omitted, it searches all targets. Prefer search_text before get_pseudocode when you only need line numbers or a small local edit.',
-                        'get_pseudocode snippets return targetRef, targetId, targetName, startLine, endLine, totalLines, lines, and pseudocode. Use the returned real line numbers and exact line text as patch oldText.',
-                        `When an edit is needed and you have enough context, append exactly one hidden edit block at the very end: ${AI_EDIT_OPEN}{"edits":[{"targetRef":"a","mode":"patch","patches":[{"op":"replace","startLine":1,"endLine":1,"oldText":"old line","newText":"new line"}]}]}${AI_EDIT_CLOSE}`,
-                        'AI_EDIT summary and patch summary fields are optional. Omit them by default; provide a short summary only when it materially helps disambiguate a complex edit. The final normal reply should summarize completed work.',
-                        'If multiple targets need code changes and you have enough context, prefer one AI_EDIT containing multiple edits. If context is missing or edits must be staged, use one AI_TOOL/AI_EDIT per turn and continue from the returned tool_result/edit_result.',
-                        'For small changes, prefer mode:"patch". Use mode:"replace" with pseudocode only for new scripts, large rewrites, or repair attempts.',
-                        'Patch line numbers are 1-based and must refer to the exact available pseudocode text. replace/delete must include exact oldText.',
-                        'The Stage/background is included in context.targets with targetType:"stage", isStage:true, and aliases such as Stage/舞台/背景/backdrop. Its scripts can be read and edited like any other target.',
-                        'Each lightweight target summary includes costumeCount/currentCostumeName; get_target_info returns full costumes/backdrops only when needed.',
-                        'Do not show pseudocode outside hidden AI_TOOL or AI_EDIT blocks.',
-                        'Never output Scratch JSON. The hidden pseudocode must parse with the project parser.',
-                        'Preserve unrelated scripts, headers, variables, broadcasts, lists, procedures, and comments unless the user asks to change them.',
-                        'If currentPseudocode is empty, create a complete first version from the user instruction.',
-                        'Prefer existing names from the provided context. Use only supported keywords/opcodes from the keyword list.',
-                        'If parserFeedback is present, briefly say you are fixing the draft, then provide a corrected hidden edit block. A full replace is allowed for repair.',
+                        '删除角色或造型时，直接调用对应删除动作。插件会在对话中请求用户确认，只有用户确认后才会执行删除。你不要替用户确认。',
+                        '优先使用 targetRef，例如 "a"、"b"、"c"。targetName 只用于展示，targetId 只用于兼容旧格式。舞台/背景也是一个目标，isStage 为 true，可以读取和编辑脚本。',
+                        'context.targets 是轻量列表，可能不包含完整造型信息。需要准确造型名、背景名、尺寸、格式、SVG 源码时，先调用 get_target_info 或 get_costume_info。',
+                        'context.extensions.core 是 Scratch 打开就自带的核心分类；context.extensions.loaded 是当前已加载扩展；context.extensions.localAvailable 是本地已存在、可加载的扩展薄列表，只包含 id/name/loaded/hardware，不包含未加载扩展的 opcode 表。伪代码里使用扩展 opcode 时，插件会在应用前自动加载可识别的本地扩展，例如 pen/music/microbit。远程扩展不会靠 opcode 自动猜测 URL；使用远程扩展前必须先调用 list_extensions 搜索或 load_extension 传入 url/slug。找不到或不能自动加载的扩展会让伪代码应用失败。',
+                        '加载扩展只表示项目可以使用该扩展，不表示你已经知道它的 opcode 和参数。需要编写某个已加载扩展的积木时，先调用 get_extension_blocks 获取 opcode 表、参数槽和 @op 示例；未列入 context.keywords 的扩展积木必须使用 @op("完整opcode", inputs={...}, fields={...})。',
+                        '如果 load_extension 的 tool_result 带有 nextSuggestedAction，请优先按这个 extensionId 调用 get_extension_blocks；URL 加载的远程扩展尤其需要这样获取真实 id。',
+                        'availablePseudocode 中已有的伪代码可以直接使用，且带有 totalLines/numberedLines 行号；没有的目标需要用 get_pseudocode 读取。currentPseudocode 是当前选中目标的原始伪代码，行号以 availablePseudocode 为准。',
+                        `查看扩展列表或搜索远程扩展：${AI_ACTION_OPEN}{"type":"list_extensions","query":"clones","includeRemote":true}${AI_ACTION_CLOSE}`,
+                        `加载扩展：${AI_ACTION_OPEN}{"type":"load_extension","extensionId":"pen"}${AI_ACTION_CLOSE}`,
+                        `查看已加载扩展 opcode 表：${AI_ACTION_OPEN}{"type":"get_extension_blocks","extensionId":"pen"}${AI_ACTION_CLOSE}`,
+                        `加载 TurboWarp 远程扩展：${AI_ACTION_OPEN}{"type":"load_extension","slug":"clones"}${AI_ACTION_CLOSE} 或 ${AI_ACTION_OPEN}{"type":"load_extension","url":"https://extensions.turbowarp.org/xxx.js"}${AI_ACTION_CLOSE}`,
+                        `读取伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"]}${AI_ACTION_CLOSE}`,
+                        `读取指定行：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"],"startLine":3,"endLine":8}${AI_ACTION_CLOSE}`,
+                        `查找文本：${AI_ACTION_OPEN}{"type":"search_text","query":"当前关卡","targetRefs":["a"],"caseSensitive":false,"regex":false}${AI_ACTION_CLOSE}`,
+                        `创建角色：${AI_ACTION_OPEN}{"type":"create_sprite","name":"角色名"}${AI_ACTION_CLOSE}`,
+                        `批量创建角色：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"create_sprite","name":"加法"},{"type":"create_sprite","name":"乘法"}]}${AI_ACTION_CLOSE}`,
+                        `创建 SVG 造型：${AI_ACTION_OPEN}{"type":"create_svg_costume","targetRef":"a","name":"按钮1","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 60\\">...</svg>"}${AI_ACTION_CLOSE}`,
+                        'get_costume_info 返回造型/背景元信息；请求具体 SVG 造型/背景时，也会返回 SVG 源码。创建或替换 SVG 必须提供安全、独立的 SVG：不包含 script、事件属性、外链资源或 data URI 图片。',
+                        'create_costume/create_svg_costume 成功后，tool_result.costume.number / costumeNumber 是 Scratch 菜单里可用的 1-based 序号，可直接用于 switch_costume(number) 或 switch_backdrop(number)。',
+                        `修改伪代码 patch：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"patch","patches":[{"op":"replace","startLine":1,"endLine":1,"oldText":"原来的连续行","newText":"新的连续行"}]}]}${AI_ACTION_CLOSE}`,
+                        `修改伪代码 replace：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"replace","pseudocode":"完整伪代码"}]}${AI_ACTION_CLOSE}`,
+                        '有明确行号且只改少量连续行时优先使用 mode:"patch"。新脚本、空伪代码、新增大段脚本、大范围重写、或修复解析错误时可以使用 mode:"replace" 和 pseudocode。不要为了使用 patch 而拆得很碎。',
+                        'patch 规则：行号从 1 开始；replace/delete 必须提供完全匹配的 oldText；insertAfter 在指定行后插入 newText；所有 patch 都基于修改前的原文；不要修改无关脚本、变量、列表、广播、注释或自定义块。',
+                        'edit_pseudocode 的 summary 和 patch summary 默认省略。只有复杂修改确实需要说明时才写短 summary。最终总结应在 edit_result 成功后用普通回答完成。',
+                        '不要输出 Scratch JSON。不要在可见回复里展示伪代码；伪代码只能放在 edit_pseudocode 动作中。隐藏伪代码必须能被项目 parser 解析。',
+                        '保留无关脚本、头部声明、变量、列表、广播、自定义块和注释，除非用户要求修改。',
+                        '如果 currentPseudocode 为空，根据用户要求创建完整第一版。优先使用上下文中的已有名称，只使用 context.keywords 中支持的积木名/opcode。',
+                        '选关界面、按钮、菜单等视觉 UI，优先使用 SVG 造型表达按钮外观和文字。不要用 say/think 气泡当按钮文字。多个编号按钮可以创建多个 SVG 造型，克隆根据局部变量切换造型。',
+                        '生成选关按钮、敌人、菜单项等带编号克隆时，必须使用“全局创建标记 + 克隆局部身份变量 + create_clone 后 wait(0)”模式：循环里递增全局标记并创建克隆，wait(0) 让克隆启动脚本先复制标记；on_clone_start 第一句把标记存入 #localvars；点击、位置和造型都使用这个 #localvars。',
+                        '如果 feedback 中包含 repair/parser 错误，说明上一次草稿没有通过解析。先简短说明正在修复，然后调用 edit_pseudocode 给出修正版。修复时可以使用全文 replace。不要重复同一个错误动作。',
+                        '如果 feedback.kind 是 action_parse_error，说明上一轮隐藏动作块没有闭合或 JSON 无效。不要接着半截 JSON 续写；必须重新生成完整的一个 <ACTION>...</ACTION>，或在确实不需要动作时普通回答。',
+                        '每次 tool_result 或 edit_result 返回后，都要重新检查用户原始目标。如果用户要求多个角色、多个造型、多个脚本或多个功能，必须确认全部完成后才能最终总结。',
+                        '回复风格：简洁；不展示长篇计划；不反复讨论工具规则；不要说“我可能需要尝试”这类犹豫内容；按规则直接行动。',
                         'Use context.runtime.framerate/effectiveFramerate/stepTimeMs when reasoning about timing. framerate 0 means matching the device screen refresh rate; effectiveFramerate is the fallback estimate.',
                         AI_PSEUDOCODE_SYNTAX_GUIDE
                     ].join('\n')
@@ -5890,13 +7464,13 @@ export default async ({addon, console, msg}) => {
             }
             const editor = this.jsonEditorComponent.current;
             if (!editor) {
-                this.setState({mode: newMode});
+                this.setState({mode: newMode}, this.persistUiState);
                 return;
             }
             const cur = editor.getText();
             if (!cur || !cur.trim()) {
                 // 编辑器空 → 直接切模式
-                this.setState({mode: newMode});
+                this.setState({mode: newMode}, this.persistUiState);
                 this.clearError();
                 return;
             }
@@ -5931,7 +7505,7 @@ export default async ({addon, console, msg}) => {
                 }
                 editor.setText(text);
                 if (typeof editor.closeAutocomplete === 'function') editor.closeAutocomplete();
-                this.setState({mode: newMode});
+                this.setState({mode: newMode}, this.persistUiState);
                 this.dirty = false;
                 // 滚动跟随只在伪代码模式下有意义：切到 JSON 时停 rAF，切回伪代码（若开启）再启
                 if (newMode === 'pseudo' && this.syncScroll) this.startWsScrollPoll();
@@ -5968,6 +7542,137 @@ export default async ({addon, console, msg}) => {
             return [...names];
         };
 
+        getContextualCompletions = context => {
+            if (this.state.mode !== 'pseudo' || !context) return [];
+            const defs = Array.isArray(pseudoConverter.opcodeDefs) ? pseudoConverter.opcodeDefs : [];
+            if (context.isDefineParams) return [{value: 'bool', priority: 0}];
+            const callName = String(context.callName || '').toLowerCase();
+            const def = defs.find(item => [item.name, item.cname, item.opcode]
+                .filter(Boolean)
+                .some(name => String(name).toLowerCase() === callName));
+            const arg = def && Array.isArray(def.args) ? def.args[context.argIndex] : null;
+
+            const target = vm && vm.editingTarget;
+            const stage = (vm.runtime && vm.runtime.getTargetForStage) ? vm.runtime.getTargetForStage() : null;
+            const targets = getAiTargets(vm);
+            const spriteNames = targets.filter(item => !item.isStage).map(item => getAiTargetName(item)).filter(Boolean);
+            const costumesOf = item => item && item.sprite && Array.isArray(item.sprite.costumes)
+                ? item.sprite.costumes.map(costume => costume && costume.name).filter(Boolean)
+                : [];
+            const soundsOf = item => item && item.sprite && Array.isArray(item.sprite.sounds)
+                ? item.sprite.sounds.map(sound => sound && sound.name).filter(Boolean)
+                : [];
+            const targetCostumes = costumesOf(target);
+            const stageCostumes = costumesOf(stage);
+            const targetSounds = soundsOf(target);
+            const broadcasts = getTargetNamesByType(stage, 'broadcast_msg');
+            const keys = [
+                'space', 'up arrow', 'down arrow', 'left arrow', 'right arrow', 'any',
+                ...'abcdefghijklmnopqrstuvwxyz'.split(''),
+                ...'0123456789'.split('')
+            ];
+            const items = [];
+            const push = (value, priority) => {
+                if (value == null || value === '') return;
+                items.push({value: String(value), priority});
+            };
+            const quote = value => {
+                const text = escapePseudoString(value);
+                return context.inString ? text.slice(1, -1) : text;
+            };
+            const addQuoted = (values, priority = 0) => {
+                for (const value of values || []) {
+                    if (value == null || value === '') continue;
+                    push(quote(value), priority);
+                }
+            };
+            const addRaw = (values, priority = 0) => {
+                for (const value of values || []) {
+                    if (value == null || value === '') continue;
+                    push(value, priority);
+                }
+            };
+            const addReporterNames = () => {
+                if (context.inString) return;
+                const reporterNames = new Set();
+                for (const item of defs) {
+                    if (!item || (item.kind !== 'reporter' && item.kind !== 'boolean')) continue;
+                    for (const name of [item.name, item.cname, item.opcode]) {
+                        if (name) reporterNames.add(name);
+                    }
+                }
+                [
+                    'abs', 'floor', 'ceiling', 'ceil', 'sqrt', 'sin', 'cos', 'tan',
+                    'asin', 'acos', 'atan', 'ln', 'log', 'exp', 'e_pow', 'pow_e',
+                    'pow10', 'ten_pow', 'true', 'false', 'null', 'arg', 'arg_bool',
+                    'callret', 'broadcast_ref'
+                ].forEach(name => reporterNames.add(name));
+                for (const name of this.getDynamicKeywords()) reporterNames.add(name);
+                for (const name of reporterNames) push(name, 10);
+            };
+            const costumeIndexes = names => names.map((_, index) => String(index + 1));
+            if (!arg) {
+                addReporterNames();
+                return items;
+            }
+            const fieldName = arg.name || '';
+            const menuOpcode = arg.menu && arg.menu.opcode;
+
+            if (arg.type === 'field') {
+                if (arg.kind === 'broadcast' || fieldName === 'BROADCAST_OPTION') addQuoted(broadcasts);
+                else if (fieldName === 'KEY_OPTION') addQuoted(keys);
+                else if (fieldName === 'BACKDROP') addQuoted(stageCostumes);
+                else if (fieldName === 'WHENGREATERTHANMENU') addQuoted(['LOUDNESS', 'TIMER']);
+                else if (fieldName === 'STOP_OPTION') addQuoted(['all', 'this script', 'other scripts in sprite']);
+                else if (fieldName === 'STYLE') addQuoted(['left-right', "don't rotate", 'all around']);
+                else if (fieldName === 'EFFECT') addQuoted(['color', 'fisheye', 'whirl', 'pixelate', 'mosaic', 'brightness', 'ghost']);
+                else if (fieldName === 'FRONT_BACK') addQuoted(['front', 'back']);
+                else if (fieldName === 'FORWARD_BACKWARD') addQuoted(['forward', 'backward']);
+                else if (fieldName === 'NUMBER_NAME') addQuoted(['number', 'name']);
+                else if (fieldName === 'CURRENTMENU') addQuoted(['YEAR', 'MONTH', 'DATE', 'DAYOFWEEK', 'HOUR', 'MINUTE', 'SECOND']);
+                else if (fieldName === 'PROPERTY') {
+                    addQuoted([
+                        'x position', 'y position', 'direction', 'costume #', 'costume name',
+                        'size', 'volume', 'backdrop #', 'backdrop name'
+                    ]);
+                }
+                return Array.from(new Set(items));
+            }
+
+            if (arg.primType === 11) {
+                addQuoted(broadcasts);
+                addReporterNames();
+                return items;
+            }
+            if (!menuOpcode) {
+                addReporterNames();
+                return items;
+            }
+
+            if (menuOpcode === 'control_create_clone_of_menu') addQuoted(['_myself_', ...spriteNames]);
+            else if (menuOpcode === 'motion_goto_menu' || menuOpcode === 'motion_glideto_menu') {
+                addQuoted(['_random_', '_mouse_', ...spriteNames]);
+            } else if (menuOpcode === 'motion_pointtowards_menu' || menuOpcode === 'sensing_distancetomenu') {
+                addQuoted(['_mouse_', ...spriteNames]);
+            } else if (menuOpcode === 'sensing_touchingobjectmenu') {
+                addQuoted(['_mouse_', '_edge_', ...spriteNames]);
+            } else if (menuOpcode === 'sensing_of_object_menu') {
+                addQuoted(['_stage_', ...spriteNames]);
+            } else if (menuOpcode === 'looks_costume') {
+                addQuoted(targetCostumes);
+                if (!context.inString) addRaw(costumeIndexes(targetCostumes));
+            } else if (menuOpcode === 'looks_backdrops') {
+                addQuoted(stageCostumes);
+                if (!context.inString) addRaw(costumeIndexes(stageCostumes));
+            } else if (menuOpcode === 'sound_sounds_menu') {
+                addQuoted(targetSounds);
+            } else if (menuOpcode === 'sensing_keyoptions') {
+                addQuoted(keys);
+            }
+            addReporterNames();
+            return items;
+        };
+
         // 把当前伪代码文本里的标识符整体换成中文 cname 或原版 opcode。
         // 字符串字面量 / 注释不受影响。只在伪代码模式下有意义。
         translateLanguage = target => {
@@ -5996,7 +7701,7 @@ export default async ({addon, console, msg}) => {
         };
 
         // 把 blocks 对象（SB3 压缩形态，含短 ID）应用到当前角色的积木区。
-        // 返回 {ok, error?, count?}。不抛错，错误走返回值。
+        // 返回 {ok, error?, count?, loadedExtensions?}。不抛错，错误走返回值。
         applyBlocksToWorkspace = (raw, meta, targetOverride, options) => {
             const target = targetOverride || vm.editingTarget;
             if (!target) return {ok: false, error: '没有选中的角色或舞台'};
@@ -6008,6 +7713,8 @@ export default async ({addon, console, msg}) => {
             } catch (err) {
                 return {ok: false, error: `反序列化失败: ${err.message}`};
             }
+            const extensionCheck = this.ensureAiExtensionsForBlocks(cloned);
+            if (!extensionCheck.ok) return {ok: false, error: extensionCheck.error};
 
             // —— 自动对齐：按 parser 的 pending + declared 在目标上建新变量/列表/广播 —— //
             // meta 由 parsePseudocode 的返回值传入；JSON 模式下 meta 为空对象，所有集合都当空。
@@ -6110,7 +7817,41 @@ export default async ({addon, console, msg}) => {
             const blockArray = Object.values(cloned);
             if (!isVisibleTarget && autoAlign) ensureHeadlessTopLevelCoords(cloned);
             newBlockIds(blockArray);
-            for (const b of blockArray) b.comment = null;
+            const parsedComments = meta && meta.comments && typeof meta.comments === 'object'
+                ? meta.comments
+                : null;
+            const commentsToCreate = [];
+            const attachedCommentIds = new Set();
+            const queueCommentForCreate = (commentId, comment, blockId) => {
+                if (!comment || typeof comment.text !== 'string') return;
+                commentsToCreate.push({
+                    id: commentId,
+                    blockId: blockId || null,
+                    text: comment.text,
+                    x: Number.isFinite(Number(comment.x)) ? Number(comment.x) : 0,
+                    y: Number.isFinite(Number(comment.y)) ? Number(comment.y) : 0,
+                    width: Number(comment.width) || 200,
+                    height: Number(comment.height) || 120,
+                    minimized: !!comment.minimized
+                });
+            };
+            for (const b of blockArray) {
+                if (!b || typeof b !== 'object') continue;
+                const commentId = b.comment;
+                const comment = parsedComments && commentId ? parsedComments[commentId] : null;
+                if (comment && typeof comment.text === 'string') {
+                    attachedCommentIds.add(commentId);
+                    queueCommentForCreate(commentId, comment, b.id);
+                } else {
+                    b.comment = null;
+                }
+            }
+            if (parsedComments) {
+                for (const commentId of Object.keys(parsedComments)) {
+                    if (attachedCommentIds.has(commentId)) continue;
+                    queueCommentForCreate(commentId, parsedComments[commentId], null);
+                }
+            }
 
             // 自己 apply 回写 workspace 会立刻引起 VM emit workspaceUpdate/PROJECT_CHANGED；
             // 把抑制窗口拉到 apply 之后一段时间，避免回声把编辑器里刚输入的内容覆盖掉
@@ -6132,7 +7873,22 @@ export default async ({addon, console, msg}) => {
             } : null;
 
             target.blocks.deleteAllBlocks();
+            if (parsedComments) target.comments = {};
             for (const b of blockArray) target.blocks.createBlock(b);
+            if (parsedComments && typeof target.createComment === 'function') {
+                for (const comment of commentsToCreate) {
+                    target.createComment(
+                        comment.id,
+                        comment.blockId,
+                        comment.text,
+                        comment.x,
+                        comment.y,
+                        comment.width,
+                        comment.height,
+                        comment.minimized
+                    );
+                }
+            }
             target.blocks.updateTargetSpecificBlocks(target.isStage);
             target.blocks.resetCache();
 
@@ -6235,7 +7991,7 @@ export default async ({addon, console, msg}) => {
                 } catch (_) { /* ignore */ }
             }
 
-            return {ok: true, count: blockArray.length};
+            return {ok: true, count: blockArray.length, loadedExtensions: extensionCheck.loadedExtensions || []};
         };
 
         // 实时 apply：解析当前编辑器文本，若有效则静默写回积木区；无效则在状态栏显示错误
@@ -6268,29 +8024,16 @@ export default async ({addon, console, msg}) => {
                     return;
                 }
                 raw = r.blocks;
-                if (!Object.keys(raw).length) { this.setError('伪代码里没有积木'); return; }
-                meta = {
-                    pendingVars: r.pendingVars, pendingLists: r.pendingLists, pendingBroadcasts: r.pendingBroadcasts,
-                    declaredVars: r.declaredVars, declaredLists: r.declaredLists, declaredBroadcasts: r.declaredBroadcasts,
-                    declaredLocalVars: r.declaredLocalVars || new Set(),
-                    declaredLocalLists: r.declaredLocalLists || new Set()
-                };
+                if (!Object.keys(raw).length && (!r.comments || !Object.keys(r.comments).length)) {
+                    this.setError('伪代码里没有积木或注释');
+                    return;
+                }
+                meta = this.createPseudoMeta(r);
             }
             // 解析结果和上次 apply 完全一致 → 纯空白/换行变化，没必要再动 workspace
             // meta 里的 pending/declared 可能随变量名字增减而变，哪怕 blocks JSON 没变也要进 apply 一次
             //   （比如用户在 #vars 里加了一个新声明），所以把 meta 摘要也纳入对比。
-            const metaSummary = meta
-                ? JSON.stringify({
-                    pV: [...meta.pendingVars.keys()],
-                    pL: [...meta.pendingLists.keys()],
-                    pB: [...meta.pendingBroadcasts.keys()],
-                    dV: [...meta.declaredVars],
-                    dL: [...meta.declaredLists],
-                    dB: [...meta.declaredBroadcasts],
-                    dLV: [...meta.declaredLocalVars],
-                    dLL: [...meta.declaredLocalLists]
-                })
-                : '';
+            const metaSummary = this.getPseudoMetaSummary(meta);
             const currentJson = JSON.stringify(raw) + '|' + metaSummary;
             if (currentJson === this.lastAppliedBlocksJson) {
                 this.dirty = false;
@@ -6300,14 +8043,14 @@ export default async ({addon, console, msg}) => {
             const result = this.applyBlocksToWorkspace(raw, meta);
             if (!result.ok) { this.setError(result.error); return; }
             this.dirty = false;
-            // 伪代码模式下把头部同步到 "声明 ∪ 引用"，并按当前 target 的作用域把变量分到 #vars / #localvars。
+            // 伪代码模式下把头部同步到 "声明 ∪ 引用"，并按当前 target 的作用域把变量/列表分到全局/局部。
+            // 广播会根据 broadcast/on_broadcast 引用自动创建，不再回写 #broadcasts 头部。
             if (this.state.mode === 'pseudo' && meta) {
                 const refs = collectReferencedNames(raw);
                 const unionSet = (a, b) => { const s = new Set(a); for (const x of b) s.add(x); return s; };
                 // 所有要在头部出现的名字 = 声明 ∪ 引用
                 const allVarNames = unionSet(unionSet(meta.declaredVars, meta.declaredLocalVars), refs.vars);
                 const allListNames = unionSet(unionSet(meta.declaredLists, meta.declaredLocalLists), refs.lists);
-                const allBroadcastNames = unionSet(meta.declaredBroadcasts, refs.broadcasts);
 
                 // 按当前 target 实际作用域分类：局部 = 挂在当前非-stage target 的 variables 里
                 const targetNow = vm.editingTarget;
@@ -6329,7 +8072,7 @@ export default async ({addon, console, msg}) => {
                 const updatedText = this.syncEditorHeader({
                     vars: varSplit.g, localVars: varSplit.l,
                     lists: listSplit.g, localLists: listSplit.l,
-                    broadcasts: allBroadcastNames
+                    broadcasts: new Set()
                 });
                 if (updatedText != null) {
                     const newMeta = JSON.stringify({
@@ -6338,9 +8081,10 @@ export default async ({addon, console, msg}) => {
                         pB: [...meta.pendingBroadcasts.keys()],
                         dV: [...varSplit.g],
                         dL: [...listSplit.g],
-                        dB: [...allBroadcastNames],
+                        dB: [],
                         dLV: [...varSplit.l],
-                        dLL: [...listSplit.l]
+                        dLL: [...listSplit.l],
+                        c: meta.comments || {}
                     });
                     this.lastAppliedBlocksJson = JSON.stringify(raw) + '|' + newMeta;
                 } else {
@@ -6349,10 +8093,14 @@ export default async ({addon, console, msg}) => {
             } else {
                 this.lastAppliedBlocksJson = currentJson;
             }
-            this.setSuccess(`✓ 已同步 ${result.count} 个积木`);
+            const loadedExtensionText = result.loadedExtensions && result.loadedExtensions.length
+                ? `，已自动加载扩展：${formatAiLoadedExtensions(result.loadedExtensions)}`
+                : '';
+            this.setSuccess(`✓ 已同步 ${result.count} 个积木${loadedExtensionText}`);
         };
 
-        // 把编辑器顶部的 #vars/#localvars/#broadcasts/#lists/#locallists 替换成 desired 集合（按名字排序）。
+        // 把编辑器顶部的 #vars/#localvars/#lists/#locallists 替换成 desired 集合（按名字排序）。
+        // 旧的 #broadcasts/#广播 会在这里被移除；广播由引用自动创建，不再写头部。
         // 原文无头部时从头插入；有头部时整段覆盖。如果结果没变化返回 null，否则返回新文本。
         // 保留光标位置：光标在原头部内 → 挪到新头部末尾；在头部后 → 按 delta 平移。
         syncEditorHeader = desired => {
@@ -6367,8 +8115,8 @@ export default async ({addon, console, msg}) => {
             const useZh = hasEn ? false
                 : (hasZhHeader || (!existingHeader && /#(?:变量|广播|列表|局部变量|局部列表)/.test(oldText)));
             const kw = useZh
-                ? {vars: '变量', localVars: '局部变量', broadcasts: '广播', lists: '列表', localLists: '局部列表'}
-                : {vars: 'vars', localVars: 'localvars', broadcasts: 'broadcasts', lists: 'lists', localLists: 'locallists'};
+                ? {vars: '变量', localVars: '局部变量', lists: '列表', localLists: '局部列表'}
+                : {vars: 'vars', localVars: 'localvars', lists: 'lists', localLists: 'locallists'};
             const lines = [];
             const fmt = (key, set) => {
                 if (!set || !set.size) return;
@@ -6377,7 +8125,6 @@ export default async ({addon, console, msg}) => {
             };
             fmt('vars', desired.vars);
             fmt('localVars', desired.localVars);
-            fmt('broadcasts', desired.broadcasts);
             fmt('lists', desired.lists);
             fmt('localLists', desired.localLists);
             const newHeader = lines.length ? lines.join('\n\n') + '\n\n' : '';
@@ -6578,16 +8325,7 @@ export default async ({addon, console, msg}) => {
                     } else {
                         const r = pseudoConverter.parsePseudocode(text, {target, vm});
                         if (!r.errors || !r.errors.length) {
-                            const metaSummary = JSON.stringify({
-                                pV: [...r.pendingVars.keys()],
-                                pL: [...r.pendingLists.keys()],
-                                pB: [...r.pendingBroadcasts.keys()],
-                                dV: [...r.declaredVars],
-                                dL: [...r.declaredLists],
-                                dB: [...r.declaredBroadcasts],
-                                dLV: [...(r.declaredLocalVars || new Set())],
-                                dLL: [...(r.declaredLocalLists || new Set())]
-                            });
+                            const metaSummary = this.getPseudoMetaSummary(this.createPseudoMeta(r));
                             this.lastAppliedBlocksJson = JSON.stringify(r.blocks) + '|' + metaSummary;
                         }
                     }
@@ -6633,6 +8371,11 @@ export default async ({addon, console, msg}) => {
             const modelInputValue = this.state.aiModelInputValue || (this.aiModelRef.current && this.aiModelRef.current.value) || config.model || '';
             const visionEnabled = !!config.visionEnabled;
             const modelOptions = this.state.aiModels.slice();
+            const getVisibleAiDetails = message => getAiVisibleDetailsForRender(message, this.state.aiShowProcessLog);
+            const visibleMessages = getRenderableAiChatMessages(messages, this.state.aiShowProcessLog);
+            const messageLimit = Number(this.state.aiVisibleMessageLimit) || AI_CHAT_RENDER_INITIAL_MESSAGES;
+            const renderedMessages = visibleMessages.slice(-messageLimit);
+            const hiddenOlderMessageCount = Math.max(0, visibleMessages.length - renderedMessages.length);
             if (config.model && !findAiModelRecord(modelOptions, config.model)) {
                 modelOptions.unshift({
                     id: config.model,
@@ -6653,10 +8396,7 @@ export default async ({addon, console, msg}) => {
                 return {text: '未知', color: '#64748b', background: '#f8fafc', title};
             };
             const renderAiMessageContent = message => {
-                const rawDetails = Array.isArray(message.details) ? message.details : [];
-                const details = this.state.aiShowProcessLog
-                    ? rawDetails
-                    : rawDetails.filter(detail => !detail || detail.key !== 'process');
+                const details = getVisibleAiDetails(message);
                 const isLiveConfirmation = message.kind === 'confirm' &&
                     !message.confirmationResolved &&
                     message.confirmationId &&
@@ -6839,6 +8579,37 @@ export default async ({addon, console, msg}) => {
                         </details>
                     );
                 };
+                const renderDetailGroup = groupDetails => (
+                    <details
+                        key="detail-group"
+                        style={{
+                            marginTop: parts.length ? 8 : 0,
+                            border: '1px solid #dbe3ee',
+                            borderRadius: 6,
+                            background: '#f8fafc',
+                            overflow: 'hidden'
+                        }}
+                    >
+                        <summary
+                            style={{
+                                cursor: 'pointer',
+                                padding: '7px 10px',
+                                color: '#334155',
+                                fontSize: 12,
+                                fontWeight: 700,
+                                userSelect: 'none',
+                                background: '#eef2f7'
+                            }}
+                        >
+                            处理详情（{groupDetails.length}）
+                        </summary>
+                        <div style={{padding: '0 8px 8px'}}>
+                            {groupDetails.map((detail, detailIndex) =>
+                                renderDetail(detail, detailIndex, 'group-detail')
+                            )}
+                        </div>
+                    </details>
+                );
                 const text = String(message.text || '');
                 const parts = [];
                 const reasoningDetails = details.filter(detail => detail && detail.key === 'reasoning');
@@ -6947,9 +8718,13 @@ export default async ({addon, console, msg}) => {
                         </div>
                     );
                 }
-                otherDetails.forEach((detail, detailIndex) => {
-                    parts.push(renderDetail(detail, detailIndex, 'detail'));
-                });
+                if ((message.kind === 'status' || message.kind === 'confirm') && otherDetails.length) {
+                    parts.push(renderDetailGroup(otherDetails));
+                } else {
+                    otherDetails.forEach((detail, detailIndex) => {
+                        parts.push(renderDetail(detail, detailIndex, 'detail'));
+                    });
+                }
                 return parts.length ? parts : text;
             };
             const renderAiSidebar = () => {
@@ -7026,45 +8801,101 @@ export default async ({addon, console, msg}) => {
                             {conversations.length ? conversations.map(conversation => {
                                 const active = conversation.id === this.state.aiActiveConversationId;
                                 return (
-                                    <button
+                                    <div
                                         key={conversation.id}
-                                        type="button"
-                                        disabled={this.state.aiBusy}
-                                        onClick={() => this.selectAiConversation(conversation.id)}
                                         style={{
                                             width: '100%',
                                             minHeight: 48,
+                                            display: 'grid',
+                                            gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                            alignItems: 'center',
+                                            gap: 6,
                                             border: `1px solid ${active ? '#93c5fd' : 'transparent'}`,
                                             borderRadius: 7,
                                             background: active ? '#eff6ff' : '#ffffff',
-                                            color: '#172033',
-                                            padding: '7px 8px',
-                                            textAlign: 'left',
-                                            cursor: this.state.aiBusy ? 'default' : 'pointer',
+                                            padding: '6px 6px 6px 8px',
                                             opacity: this.state.aiBusy && !active ? 0.65 : 1
                                         }}
                                     >
-                                        <span style={{
-                                            display: 'block',
-                                            overflow: 'hidden',
-                                            textOverflow: 'ellipsis',
-                                            whiteSpace: 'nowrap',
-                                            fontSize: 13,
-                                            fontWeight: active ? 700 : 600,
-                                            lineHeight: 1.35
-                                        }}>
-                                            {conversation.title || '新的聊天'}
-                                        </span>
-                                        <span style={{
-                                            display: 'block',
-                                            marginTop: 3,
-                                            color: '#94a3b8',
-                                            fontSize: 11,
-                                            lineHeight: 1.25
-                                        }}>
-                                            {formatAiConversationTime(conversation.updatedAt)}
-                                        </span>
-                                    </button>
+                                        <button
+                                            type="button"
+                                            disabled={this.state.aiBusy}
+                                            onClick={() => this.selectAiConversation(conversation.id)}
+                                            style={{
+                                                minWidth: 0,
+                                                border: 0,
+                                                background: 'transparent',
+                                                color: '#172033',
+                                                padding: 0,
+                                                textAlign: 'left',
+                                                cursor: this.state.aiBusy ? 'default' : 'pointer'
+                                            }}
+                                        >
+                                            <span style={{
+                                                display: 'block',
+                                                overflow: 'hidden',
+                                                textOverflow: 'ellipsis',
+                                                whiteSpace: 'nowrap',
+                                                fontSize: 13,
+                                                fontWeight: active ? 700 : 600,
+                                                lineHeight: 1.35
+                                            }}>
+                                                {conversation.title || '新的聊天'}
+                                            </span>
+                                            <span style={{
+                                                display: 'block',
+                                                marginTop: 3,
+                                                color: '#94a3b8',
+                                                fontSize: 11,
+                                                lineHeight: 1.25
+                                            }}>
+                                                {formatAiConversationTime(conversation.updatedAt)}
+                                            </span>
+                                        </button>
+                                        <div style={{display: 'flex', gap: 4}}>
+                                            <button
+                                                type="button"
+                                                onClick={() => this.exportAiConversation(conversation.id)}
+                                                style={{
+                                                    width: 30,
+                                                    height: 28,
+                                                    border: '1px solid #cbd5e1',
+                                                    borderRadius: 6,
+                                                    background: '#ffffff',
+                                                    color: '#475569',
+                                                    fontSize: 11,
+                                                    fontWeight: 700,
+                                                    cursor: 'pointer',
+                                                    padding: 0
+                                                }}
+                                                title="导出此聊天为 TXT"
+                                            >
+                                                TXT
+                                            </button>
+                                            <button
+                                                type="button"
+                                                disabled={this.state.aiBusy}
+                                                onClick={() => this.deleteAiConversation(conversation.id)}
+                                                style={{
+                                                    width: 28,
+                                                    height: 28,
+                                                    border: '1px solid #fecaca',
+                                                    borderRadius: 6,
+                                                    background: '#fff1f2',
+                                                    color: '#be123c',
+                                                    fontSize: 16,
+                                                    fontWeight: 700,
+                                                    lineHeight: 1,
+                                                    cursor: this.state.aiBusy ? 'default' : 'pointer',
+                                                    opacity: this.state.aiBusy ? 0.55 : 1,
+                                                    padding: 0
+                                                }}
+                                                title="删除此聊天记录"
+                                            >
+                                                ×
+                                            </button>
+                                        </div>
+                                    </div>
                                 );
                             }) : (
                                 <div style={{
@@ -7306,6 +9137,9 @@ export default async ({addon, console, msg}) => {
                                 <div
                                     ref={this.aiMessagesRef}
                                     onScroll={this.handleAiMessagesScroll}
+                                    onWheel={this.handleAiMessagesUserScrollIntent}
+                                    onPointerDown={this.handleAiMessagesUserScrollIntent}
+                                    onTouchStart={this.handleAiMessagesUserScrollIntent}
                                     style={{
                                         flex: '1 1 auto',
                                         minHeight: 0,
@@ -7317,7 +9151,26 @@ export default async ({addon, console, msg}) => {
                                         gap: 10
                                     }}
                                 >
-                                    {messages.length ? messages.map((message, index) => {
+                                    {hiddenOlderMessageCount ? (
+                                        <button
+                                            type="button"
+                                            onClick={this.loadOlderAiMessages}
+                                            style={{
+                                                alignSelf: 'center',
+                                                border: '1px solid #cbd5e1',
+                                                borderRadius: 999,
+                                                background: '#ffffff',
+                                                color: '#64748b',
+                                                fontSize: 12,
+                                                fontWeight: 700,
+                                                cursor: 'pointer',
+                                                padding: '6px 12px'
+                                            }}
+                                        >
+                                            加载更早的聊天（还有 {hiddenOlderMessageCount} 条）
+                                        </button>
+                                    ) : null}
+                                    {visibleMessages.length ? renderedMessages.map((message, index) => {
                                         const isStatus = message.kind === 'status' || message.kind === 'confirm';
                                         return (
                                             <div
@@ -7410,6 +9263,7 @@ export default async ({addon, console, msg}) => {
                             onScroll={this.handleEditorScroll}
                             completionKeywords={this.state.mode === 'pseudo' ? PSEUDO_KEYWORDS : []}
                             getDynamicKeywords={this.state.mode === 'pseudo' ? this.getDynamicKeywords : null}
+                            getContextualCompletions={this.state.mode === 'pseudo' ? this.getContextualCompletions : null}
                         />
                     </div>
                     {this.state.aiChatOpen ? this.renderAiChat() : null}
@@ -7516,8 +9370,6 @@ export default async ({addon, console, msg}) => {
         const cur = reactModalInstance.getMode();
         const next = cur === 'json' ? 'pseudo' : 'json';
         reactModalInstance.switchMode(next);
-        modeToggleButton.textContent = next === 'json' ? '当前: JSON' : '当前: 伪代码';
-        updateSyncCheckboxVisibility(next);
     };
 
     // 实时双向同步的核心：监听 VM 事件 → 在安全时机从工作区重新生成编辑器文本。

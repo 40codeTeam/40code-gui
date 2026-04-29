@@ -1,9 +1,11 @@
 import VM from 'scratch-vm';
 import storage from '../lib/storage';
 import {MAXIMUM_CLOUD_VARIABLES} from '../lib/tw-cloud-limits';
+import {installExtensionURLPolicy} from '../lib/tw-extension-url-policy';
 
 const SET_VM = 'scratch-gui/vm/SET_VM';
 const defaultVM = new VM();
+installExtensionURLPolicy(defaultVM);
 defaultVM.setCompatibilityMode(true);
 defaultVM.runtime.cloudOptions.limit = MAXIMUM_CLOUD_VARIABLES;
 defaultVM.attachStorage(storage);
