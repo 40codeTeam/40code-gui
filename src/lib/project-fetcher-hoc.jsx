@@ -65,6 +65,19 @@ const shouldLoadDefaultProjectLocally = projectId => (
     `${projectId}` === defaultProjectId
 );
 
+const DEFAULT_API_HOST = 'https://api.abc.520gxx.com/';
+
+const normalizeApiHost = apiHost => {
+    let host = `${apiHost || DEFAULT_API_HOST}`.trim();
+    host = host
+        .replace(/^(https?)\/\//i, '$1://')
+        .replace(/^(https?):\/(?!\/)/i, '$1://');
+    if (!/^https?:\/\//i.test(host)) {
+        host = `https://${host}`;
+    }
+    return host.endsWith('/') ? host : `${host}/`;
+};
+
 /* Higher Order Component to provide behavior for loading projects by id. If
  * there's no id, the default project is loaded.
  * @param {React.Component} WrappedComponent component to receive projectData prop
@@ -201,7 +214,7 @@ const ProjectFetcherHOC = function (WrappedComponent) {
                         }
                         toLogin()
                         window.onhashchange = toLogin
-                        fetch(`https://${window.apihost}work/work?id=` + id + '&token=' + getCookie('token')
+                        fetch(`${normalizeApiHost(window.apihost)}work/work?id=` + id + '&token=' + getCookie('token')
                             + '&sha=' + getQueryString('sha')
                             + '&etime=' + getQueryString('etime')
                             + (v ? '&v=' + v : '')
@@ -380,5 +393,6 @@ const ProjectFetcherHOC = function (WrappedComponent) {
 };
 
 export {
+    normalizeApiHost,
     ProjectFetcherHOC as default
 };

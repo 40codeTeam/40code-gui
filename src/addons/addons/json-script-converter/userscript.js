@@ -291,6 +291,10 @@ const normalizeControlStopMutations = blocks => {
 
 const findMissingReferences = (blocks, target) => {
     const missing = {variable: new Set(), list: new Set(), broadcast: new Set()};
+    const stage = target && target.runtime && typeof target.runtime.getTargetForStage === 'function'
+        ? target.runtime.getTargetForStage()
+        : null;
+    const broadcastTarget = stage || target;
     for (const blockId in blocks) {
         const block = blocks[blockId];
         if (!block || !block.fields) continue;
@@ -303,7 +307,7 @@ const findMissingReferences = (blocks, target) => {
             const field = block.fields[fieldName];
             if (!field || !field.id) continue;
             if (kind === 'broadcast') {
-                if (!target.lookupBroadcastMsg(field.id, field.value)) {
+                if (!broadcastTarget || !broadcastTarget.lookupBroadcastMsg(field.id, field.value)) {
                     missing.broadcast.add(`${field.id} (${field.value || ''})`);
                 }
             } else if (!target.lookupVariableById(field.id)) {
@@ -316,6 +320,39 @@ const findMissingReferences = (blocks, target) => {
         list: [...missing.list],
         broadcast: [...missing.broadcast]
     };
+};
+
+const remapBlockReferenceIds = (blocks, remaps) => {
+    const getReplacement = (kind, oldId) => {
+        const map = remaps && remaps[kind];
+        if (!map || oldId == null) return null;
+        return map.get(String(oldId)) || null;
+    };
+    const applyReplacement = (field, replacement) => {
+        if (!field || !replacement) return;
+        if (Array.isArray(field)) {
+            if (replacement.name != null) field[0] = replacement.name;
+            if (replacement.id != null) field[1] = replacement.id;
+            return;
+        }
+        if (typeof field !== 'object') return;
+        if (replacement.name != null) field.value = replacement.name;
+        if (replacement.id != null) field.id = replacement.id;
+    };
+    for (const blockId in blocks) {
+        const block = blocks[blockId];
+        if (!block || !block.fields) continue;
+        const refs = [
+            ['VARIABLE', 'variable'],
+            ['LIST', 'list'],
+            ['BROADCAST_OPTION', 'broadcast']
+        ];
+        for (const [fieldName, kind] of refs) {
+            const field = block.fields[fieldName];
+            const oldId = Array.isArray(field) ? field[1] : field && field.id;
+            applyReplacement(field, getReplacement(kind, oldId));
+        }
+    }
 };
 
 export default async ({addon, console, msg}) => {
@@ -1941,7 +1978,9 @@ export default async ({addon, console, msg}) => {
         else if (!path.endsWith('/chat/completions')) {
             path = `${path}/v1/chat/completions`;
         }
-        url.pathname = path.replace(/\/{2,}/g, '/');
+        // Preserve repeated slashes inside the user-provided path. Some proxy endpoints
+        // embed another URL in the path, for example /https://example.com/.
+        url.pathname = path;
         url.search = '';
         url.hash = '';
         return url.toString();
@@ -4347,6 +4386,7 @@ export default async ({addon, console, msg}) => {
         componentWillUnmount () {
             this.cancelAiPendingConfirmations('组件已关闭，删除操作已取消。', false);
             this.abortAiRequest(false);
+            syncLauncherAiState(false);
             if (this.aiModelsAutoFetchTimer) {
                 clearTimeout(this.aiModelsAutoFetchTimer);
                 this.aiModelsAutoFetchTimer = null;
@@ -4390,6 +4430,12 @@ export default async ({addon, console, msg}) => {
             if (modeToggleButton) {
                 modeToggleButton.textContent = this.state.mode === 'json' ? '当前: JSON' : '当前: 伪代码';
             }
+            if (aiModifyButton) {
+                aiModifyButton.textContent = this.state.aiBusy ? 'AI运行中...' : 'AI修改';
+                aiModifyButton.title = this.state.aiBusy ? 'AI 正在后台继续运行，点击查看进度' : '打开 AI 聊天面板';
+                aiModifyButton.classList.toggle('is-running', !!this.state.aiBusy);
+            }
+            syncLauncherAiState(this.state.aiBusy);
             if (typeof updateSyncCheckboxVisibility === 'function') {
                 updateSyncCheckboxVisibility(this.state.mode);
             }
@@ -4415,6 +4461,8 @@ export default async ({addon, console, msg}) => {
                 }
             }
             titleAiCloseButton.style.display = 'flex';
+            titleAiCloseButton.textContent = this.state.aiBusy ? '收起 AI' : '关闭 AI';
+            titleAiCloseButton.title = this.state.aiBusy ? '收起 AI 面板，AI 会继续运行' : '关闭 AI';
         };
         handleAiTitleConfigAction = () => {
             const showConfig = this.state.aiConfigPanelOpen || !this.state.aiConfigReady;
@@ -4793,7 +4841,7 @@ export default async ({addon, console, msg}) => {
         clearError = () => setStatus(null);
 
         openAiChat = () => {
-            if (this.state.mode !== 'pseudo') {
+            if (this.state.mode !== 'pseudo' && !this.state.aiBusy) {
                 this.setError('AI 聊天只在伪代码模式下工作。');
                 return;
             }
@@ -4814,7 +4862,6 @@ export default async ({addon, console, msg}) => {
         };
 
         closeAiChat = () => {
-            this.abortAiRequest();
             this.setState({aiChatOpen: false}, this.persistUiState);
         };
 
@@ -7424,6 +7471,11 @@ export default async ({addon, console, msg}) => {
                         `批量创建角色：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"create_sprite","name":"加法"},{"type":"create_sprite","name":"乘法"}]}${AI_ACTION_CLOSE}`,
                         `创建 SVG 造型：${AI_ACTION_OPEN}{"type":"create_svg_costume","targetRef":"a","name":"按钮1","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 60\\">...</svg>"}${AI_ACTION_CLOSE}`,
                         'get_costume_info 返回造型/背景元信息；请求具体 SVG 造型/背景时，也会返回 SVG 源码。创建或替换 SVG 必须提供安全、独立的 SVG：不包含 script、事件属性、外链资源或 data URI 图片。',
+                        '创建或替换 SVG 时，只生成 Scratch/Paper.js 易识别的简单 SVG 子集。允许的元素只有：svg、g、path、rect、circle、ellipse、line、polyline、polygon、text、tspan。需要复杂图形时，用这些基础元素直接组合。',
+                        'SVG 根元素必须包含 xmlns="http://www.w3.org/2000/svg" 和简单 viewBox，例如 viewBox="0 0 100 60"。优先用 viewBox 坐标定位，不依赖百分比 width/height。',
+                        '允许的 SVG 属性只使用：viewBox、xmlns、x、y、x1、y1、x2、y2、cx、cy、r、rx、ry、width、height、points、d、fill、stroke、stroke-width、stroke-linecap、stroke-linejoin、opacity、transform、font-size、font-family、font-weight、text-anchor、dominant-baseline、xml:space。',
+                        '文字必须保留为真实 <text> 或 <text><tspan>，不要把按钮文字、标签、数字转成 path。文本要写明确 x/y、font-size、text-anchor 和 dominant-baseline；多行文字用多个 text 或 tspan。',
+                        '不要使用未列入允许清单的 SVG 元素或属性；尤其不要使用 style、class、defs、use、symbol、filter、mask、clipPath、marker、pattern、linearGradient、radialGradient、textPath、image、foreignObject、animate、外部字体、外链资源或 data URI。',
                         'create_costume/create_svg_costume 成功后，tool_result.costume.number / costumeNumber 是 Scratch 菜单里可用的 1-based 序号，可直接用于 switch_costume(number) 或 switch_backdrop(number)。',
                         `修改伪代码 patch：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"patch","patches":[{"op":"replace","startLine":1,"endLine":1,"oldText":"原来的连续行","newText":"新的连续行"}]}]}${AI_ACTION_CLOSE}`,
                         `修改伪代码 replace：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"replace","pseudocode":"完整伪代码"}]}${AI_ACTION_CLOSE}`,
@@ -7433,7 +7485,7 @@ export default async ({addon, console, msg}) => {
                         '不要输出 Scratch JSON。不要在可见回复里展示伪代码；伪代码只能放在 edit_pseudocode 动作中。隐藏伪代码必须能被项目 parser 解析。',
                         '保留无关脚本、头部声明、变量、列表、广播、自定义块和注释，除非用户要求修改。',
                         '如果 currentPseudocode 为空，根据用户要求创建完整第一版。优先使用上下文中的已有名称，只使用 context.keywords 中支持的积木名/opcode。',
-                        '选关界面、按钮、菜单等视觉 UI，优先使用 SVG 造型表达按钮外观和文字。不要用 say/think 气泡当按钮文字。多个编号按钮可以创建多个 SVG 造型，克隆根据局部变量切换造型。',
+                        '选关界面、按钮、菜单等视觉 UI，优先使用 Scratch/Paper.js 兼容的简单 SVG 造型表达按钮外观和真实文字。不要用 say/think 气泡当按钮文字。多个编号按钮可以创建多个 SVG 造型，克隆根据局部变量切换造型。',
                         '生成选关按钮、敌人、菜单项等带编号克隆时，必须使用“全局创建标记 + 克隆局部身份变量 + create_clone 后 wait(0)”模式：循环里递增全局标记并创建克隆，wait(0) 让克隆启动脚本先复制标记；on_clone_start 第一句把标记存入 #localvars；点击、位置和造型都使用这个 #localvars。',
                         '如果 feedback 中包含 repair/parser 错误，说明上一次草稿没有通过解析。先简短说明正在修复，然后调用 edit_pseudocode 给出修正版。修复时可以使用全文 replace。不要重复同一个错误动作。',
                         '如果 feedback.kind 是 action_parse_error，说明上一轮隐藏动作块没有闭合或 JSON 无效。不要接着半截 JSON 续写；必须重新生成完整的一个 <ACTION>...</ACTION>，或在确实不需要动作时普通回答。',
@@ -7729,6 +7781,7 @@ export default async ({addon, console, msg}) => {
             const declaredBroadcasts = (meta && meta.declaredBroadcasts) || new Set();
             const declaredLocalVars = (meta && meta.declaredLocalVars) || new Set();
             const declaredLocalLists = (meta && meta.declaredLocalLists) || new Set();
+            const referenceIdRemaps = {variable: new Map(), list: new Map(), broadcast: new Map()};
 
             if (autoAlign) {
                 const stage = vm.runtime.getTargetForStage && vm.runtime.getTargetForStage();
@@ -7748,6 +7801,13 @@ export default async ({addon, console, msg}) => {
                         if (v && v.name === name && (v.type || '') === type) return v;
                     }
                     return null;
+                };
+                const rememberReferenceId = (kind, requestedId, resolved) => {
+                    if (!resolved || requestedId == null || resolved.id == null) return;
+                    referenceIdRemaps[kind].set(String(requestedId), {
+                        id: resolved.id,
+                        name: resolved.name
+                    });
                 };
 
                 // declared 里目标上没有的名字，也补进 pending 去建（独立的本地随机 id 前缀，避免撞已有 id）
@@ -7785,19 +7845,30 @@ export default async ({addon, console, msg}) => {
                 // 实际创建
                 for (const [name, id] of pendingVars) {
                     const scope = chooseScope(name, declaredLocalVars.has(name));
-                    if (lookupInOwnScope(scope, name, '')) continue;
-                    if (scope) scope.createVariable(id, name, '', false);
+                    let variable = lookupInOwnScope(scope, name, '');
+                    if (!variable && scope) {
+                        scope.createVariable(id, name, '', false);
+                        variable = lookupInOwnScope(scope, name, '');
+                    }
+                    rememberReferenceId('variable', id, variable);
                 }
                 for (const [name, id] of pendingLists) {
                     const scope = chooseScope(name, declaredLocalLists.has(name));
-                    if (lookupInOwnScope(scope, name, 'list')) continue;
-                    if (scope) scope.createVariable(id, name, 'list', false);
+                    let list = lookupInOwnScope(scope, name, 'list');
+                    if (!list && scope) {
+                        scope.createVariable(id, name, 'list', false);
+                        list = lookupInOwnScope(scope, name, 'list');
+                    }
+                    rememberReferenceId('list', id, list);
                 }
                 if (stage) {
                     for (const [name, id] of pendingBroadcasts) {
-                        if (!stage.lookupBroadcastByInputValue(name)) {
+                        let broadcast = stage.lookupBroadcastByInputValue(name);
+                        if (!broadcast) {
                             stage.createVariable(id, name, 'broadcast_msg', false);
+                            broadcast = stage.lookupBroadcastByInputValue(name);
                         }
+                        rememberReferenceId('broadcast', id, broadcast);
                     }
                 }
 
@@ -7806,6 +7877,7 @@ export default async ({addon, console, msg}) => {
                 // blocks.jsx 重新 getToolboxXML 并 requestToolboxUpdate。
                 if (typeof vm.emitTargetsUpdate === 'function') vm.emitTargetsUpdate(false);
             }
+            remapBlockReferenceIds(cloned, referenceIdRemaps);
 
             const missing = findMissingReferences(cloned, target);
             const parts = [];
@@ -9273,6 +9345,23 @@ export default async ({addon, console, msg}) => {
     }
 
     let reactModalInstance = null;
+    let initButton = null;
+
+    const syncLauncherAiState = aiBusy => {
+        if (initButton) {
+            initButton.textContent = aiBusy ? 'AI运行中...' : '脚本助手';
+            initButton.title = aiBusy
+                ? 'AI 正在后台继续运行，点击查看进度（可拖动）'
+                : '打开伪代码与 AI 积木编辑助手（可拖动）';
+            initButton.classList.toggle('is-running', !!aiBusy);
+            initButton.setAttribute('aria-busy', aiBusy ? 'true' : 'false');
+        }
+        if (closeButton) {
+            closeButton.title = aiBusy
+                ? '关闭窗口，AI 会继续运行'
+                : (msg ? (msg('close') || 'Close') : 'Close');
+        }
+    };
 
     const renderModal = () => {
         if (!document.body.contains(container)) document.body.appendChild(container);
@@ -9497,7 +9586,10 @@ export default async ({addon, console, msg}) => {
         addon.tab.displayNoneWhileDisabled(container);
         container.style.display = 'flex';
         setStatus(null);
-        if (!reactModalInstance || !reactModalInstance.state || !reactModalInstance.state.aiChatOpen) {
+        if (reactModalInstance && reactModalInstance.state && reactModalInstance.state.aiBusy &&
+                !reactModalInstance.state.aiChatOpen) {
+            reactModalInstance.openAiChat();
+        } else if (!reactModalInstance || !reactModalInstance.state || !reactModalInstance.state.aiChatOpen) {
             buttonContainer.style.display = 'flex';
         }
         if (isReduxProjectLoading()) {
@@ -9526,7 +9618,7 @@ export default async ({addon, console, msg}) => {
         return items;
     }, {workspace: true});
 
-    const initButton = document.createElement('button');
+    initButton = document.createElement('button');
     initButton.className = 'jsonConverterLauncher';
     initButton.textContent = '脚本助手';
     initButton.title = '打开伪代码与 AI 积木编辑助手（可拖动）';
@@ -9543,6 +9635,11 @@ export default async ({addon, console, msg}) => {
         color: #ffffff;
         font-size: 13px;
         font-weight: 700;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        white-space: nowrap;
         box-shadow: 0 8px 18px rgba(37,99,235,0.24), 0 2px 4px rgba(15,23,42,0.12);
         cursor: grab;
         user-select: none;

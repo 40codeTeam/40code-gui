@@ -72,6 +72,29 @@
   box-shadow: 0 10px 22px rgba(37, 99, 235, 0.28), 0 2px 6px rgba(15, 23, 42, 0.14) !important;
 }
 
+.jsonConverterLauncher.is-running {
+  background: #0f766e !important;
+  border-color: #0f766e !important;
+  box-shadow: 0 10px 22px rgba(15, 118, 110, 0.28), 0 2px 6px rgba(15, 23, 42, 0.14) !important;
+}
+
+.jsonConverterLauncher.is-running::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: jsonConverterAiSpin 700ms linear infinite;
+  flex: 0 0 auto;
+}
+
+.jsonConverterAiButton.is-running {
+  background: #ecfdf5 !important;
+  border-color: #5eead4 !important;
+  color: #0f766e !important;
+}
+
 .jsonConverterSyncLabel:hover {
   color: #174ea6 !important;
 }
