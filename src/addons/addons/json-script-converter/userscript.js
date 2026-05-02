@@ -4,6 +4,7 @@ import sb3 from 'scratch-vm/src/serialization/sb3';
 import newBlockIds from 'scratch-vm/src/util/new-block-ids';
 import {sanitizeSvg, fixForVanilla} from '@turbowarp/scratch-svg-renderer';
 import {emptyCostume, emptySprite} from '../../../lib/empty-assets';
+import {isPaused, setPaused, setup as setupPauseControls} from '../debugger/module.js';
 import pseudoConverter from './pseudocode';
 
 // 保险丝：给 Blockly workspace 装一个变量事件监听器，任何 var_create / var_delete /
@@ -361,6 +362,7 @@ export default async ({addon, console, msg}) => {
         console.error('无法获取 Scratch VM 实例');
         return;
     }
+    setupPauseControls(addon);
 
     const container = document.createElement('div');
     container.className = 'jsonConverterContainer';
@@ -1522,6 +1524,10 @@ export default async ({addon, console, msg}) => {
     const AI_SVG_SOURCE_LIMIT = 24000;
     const AI_SVG_WRITE_LIMIT = 200000;
     const AI_IMAGE_DATA_URL_LIMIT = 3500000;
+    const AI_REQUEST_RETRY_DEFAULT_COUNT = 2;
+    const AI_REQUEST_RETRY_MAX_COUNT = 5;
+    const AI_REQUEST_RETRY_BASE_DELAY = 800;
+    const AI_REQUEST_RETRY_MAX_DELAY = 6000;
 
     const loadAiConfig = () => {
         try {
@@ -1557,6 +1563,13 @@ export default async ({addon, console, msg}) => {
         } catch (_) { /* ignore */ }
     };
     const hasAiConfig = config => !!(config && config.endpoint && config.model);
+    const normalizeAiRequestRetryCount = value => {
+        const count = Number(value);
+        if (!Number.isFinite(count)) return AI_REQUEST_RETRY_DEFAULT_COUNT;
+        return Math.max(0, Math.min(AI_REQUEST_RETRY_MAX_COUNT, Math.floor(count)));
+    };
+    const isAiRequestRetryEnabled = config => !!config && config.requestRetryEnabled !== false &&
+        normalizeAiRequestRetryCount(config.requestRetryCount) > 0;
     const getAiVisionSupport = config => {
         const value = config && config.visionSupport;
         return value === AI_VISION_SUPPORTED || value === AI_VISION_UNSUPPORTED || value === AI_VISION_FAILED
@@ -1972,7 +1985,7 @@ export default async ({addon, console, msg}) => {
         }
         let path = url.pathname.replace(/\/+$/, '');
         if (!path || path === '/') path = '/v1/chat/completions';
-        else if (path === '/v1') path = '/v1/chat/completions';
+        else if (path.endsWith('/v1')) path = `${path}/chat/completions`;
         else if (path === '/v1/chat') path = '/v1/chat/completions';
         else if (path.endsWith('/chat')) path = `${path}/completions`;
         else if (!path.endsWith('/chat/completions')) {
@@ -1984,6 +1997,15 @@ export default async ({addon, console, msg}) => {
         url.search = '';
         url.hash = '';
         return url.toString();
+    };
+    const getAiEndpointPreview = value => {
+        const raw = String(value || '').trim();
+        if (!raw) return {endpoint: '', error: ''};
+        try {
+            return {endpoint: normalizeAiEndpoint(raw), error: ''};
+        } catch (err) {
+            return {endpoint: '', error: err && err.message ? err.message : String(err)};
+        }
     };
     const getModelsEndpoint = endpoint => {
         const url = new URL(normalizeAiEndpoint(endpoint));
@@ -2669,6 +2691,17 @@ export default async ({addon, console, msg}) => {
             if (extensionId && !loaded.has(extensionId)) continue;
             names.push(def.name, def.cname, def.opcode);
         }
+        const runtime = vm && vm.runtime;
+        const blockInfo = Array.isArray(runtime && runtime._blockInfo) ? runtime._blockInfo : [];
+        for (const category of blockInfo) {
+            if (!category || !category.id || !loaded.has(category.id) || !Array.isArray(category.blocks)) continue;
+            for (const convertedBlock of category.blocks) {
+                const info = convertedBlock && convertedBlock.info;
+                if (!info || !info.opcode) continue;
+                const json = convertedBlock && convertedBlock.json;
+                names.push(json && json.type ? String(json.type) : `${category.id}_${info.opcode}`);
+            }
+        }
         return names.filter(Boolean).slice(0, 260);
     };
     const formatAiExtensionsDetail = result => {
@@ -2730,7 +2763,8 @@ export default async ({addon, console, msg}) => {
     const normalizeAiExtensionArgument = (category, name, argInfo) => {
         const arg = argInfo && typeof argInfo === 'object' ? argInfo : {};
         const menuInfo = arg.menu && category && category.menuInfo ? category.menuInfo[arg.menu] : null;
-        const isDropdownField = !!(arg.menu && menuInfo && menuInfo.acceptReporters === false);
+        const menuAcceptsReporters = !!(arg.menu && menuInfo && menuInfo.acceptReporters);
+        const isDropdownField = !!(arg.menu && !menuAcceptsReporters);
         const defaultValue = getAiMaybeMessageText(
             arg.defaultValue !== undefined ? arg.defaultValue : (arg.default !== undefined ? arg.default : '')
         );
@@ -2739,7 +2773,7 @@ export default async ({addon, console, msg}) => {
             kind: isDropdownField ? 'field' : 'input',
             type: arg.type || '',
             menu: arg.menu || undefined,
-            acceptReporters: !!(arg.menu && menuInfo && menuInfo.acceptReporters),
+            acceptReporters: menuAcceptsReporters,
             defaultValue,
             menuItems: normalizeAiExtensionMenuItems(menuInfo)
         };
@@ -2757,6 +2791,8 @@ export default async ({addon, console, msg}) => {
             }
         }
         const pieces = [JSON.stringify(block.opcode)];
+        const blockKind = String(block.blockType || '').toLowerCase();
+        if (blockKind === 'boolean' || blockKind === 'reporter') pieces.push(`kind=${JSON.stringify(blockKind)}`);
         if (fields.length) pieces.push(`fields={${fields.join(', ')}}`);
         if (inputs.length) pieces.push(`inputs={${inputs.join(', ')}}`);
         return `@op(${pieces.join(', ')})`;
@@ -2904,7 +2940,7 @@ export default async ({addon, console, msg}) => {
     };
     const formatPseudoErrors = errors => (errors || [])
         .slice(0, 8)
-        .map(e => `line ${e.line}, col ${e.col}: ${e.message}`)
+        .map(e => `line ${Number(e && e.line) > 0 ? e.line : 1}, col ${Number(e && e.col) > 0 ? e.col : 1}: ${e && e.message}`)
         .join('\n');
     const stripCodeFence = text => {
         const s = String(text || '').trim();
@@ -3502,6 +3538,31 @@ export default async ({addon, console, msg}) => {
         const type = String(parsed && (parsed.type || parsed.action || parsed.toolType) || '').trim();
         const targetIds = normalizeAiToolTargetIds(parsed);
         const lineRanges = normalizeAiToolLineRanges(parsed);
+        if (
+            type === 'click_green_flag' ||
+            type === 'green_flag' ||
+            type === 'start_project' ||
+            type === 'run_project' ||
+            type === 'start' ||
+            type === 'go'
+        ) {
+            return {ok: true, tool: {type: 'click_green_flag', raw: parsed}};
+        }
+        if (
+            type === 'click_pause' ||
+            type === 'pause_project' ||
+            type === 'pause'
+        ) {
+            return {ok: true, tool: {type: 'click_pause', raw: parsed}};
+        }
+        if (
+            type === 'click_stop' ||
+            type === 'stop_project' ||
+            type === 'stop_all' ||
+            type === 'stop'
+        ) {
+            return {ok: true, tool: {type: 'click_stop', raw: parsed}};
+        }
         if (type === 'get_target_info' || type === 'get_targets' || type === 'list_targets') {
             return {ok: true, tool: {type: 'get_target_info', targetIds}};
         }
@@ -3627,7 +3688,7 @@ export default async ({addon, console, msg}) => {
                 }
             };
         }
-        return {ok: false, error: 'AI 工具块必须是 get_pseudocode、get_target_info、get_costume_info、search_text、list_extensions、load_extension、get_extension_blocks、造型工具或项目结构工具。'};
+        return {ok: false, error: 'AI 工具块必须是 click_green_flag、click_pause、click_stop、get_pseudocode、get_target_info、get_costume_info、search_text、list_extensions、load_extension、get_extension_blocks、造型工具或项目结构工具。'};
     };
     const isAiEditActionType = type => [
         'edit_pseudocode',
@@ -4033,12 +4094,80 @@ export default async ({addon, console, msg}) => {
             return this.raw;
         }
     }
+    const isAiRetryableHttpStatus = status => (
+        status === 408 ||
+        status === 409 ||
+        status === 425 ||
+        status === 429 ||
+        status >= 500
+    );
+    const createAiHttpError = (response, message) => {
+        const err = new Error(message || `HTTP ${response.status}`);
+        err.status = response.status;
+        err.statusText = response.statusText || '';
+        err.retryable = isAiRetryableHttpStatus(response.status);
+        return err;
+    };
     const getAiHttpError = async response => {
         const text = await response.text();
         let data = null;
         try { data = text ? JSON.parse(text) : null; } catch (_) { /* use text */ }
         const message = data && data.error && data.error.message ? data.error.message : text;
-        return new Error(message || `HTTP ${response.status}`);
+        return createAiHttpError(response, message);
+    };
+    const isAiRetryableRequestError = err => {
+        if (!err || err.name === 'AbortError') return false;
+        if (err.partialContent && String(err.partialContent).length) return false;
+        if (typeof err.status === 'number') return err.retryable === true;
+        return true;
+    };
+    const getAiRetryDelay = retryIndex => {
+        const delay = AI_REQUEST_RETRY_BASE_DELAY * Math.pow(2, Math.max(0, retryIndex));
+        return Math.min(AI_REQUEST_RETRY_MAX_DELAY, delay) + Math.floor(Math.random() * 250);
+    };
+    const waitAiRetryDelay = (delay, signal) => new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+            const err = new Error('Aborted');
+            err.name = 'AbortError';
+            reject(err);
+            return;
+        }
+        let timer = null;
+        const onAbort = () => {
+            if (timer) clearTimeout(timer);
+            const err = new Error('Aborted');
+            err.name = 'AbortError';
+            reject(err);
+        };
+        timer = setTimeout(() => {
+            if (signal && signal.removeEventListener) signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, delay);
+        if (signal && signal.addEventListener) signal.addEventListener('abort', onAbort, {once: true});
+    });
+    const withAiRequestRetry = async (config, signal, request, onRetry) => {
+        const maxRetries = isAiRequestRetryEnabled(config)
+            ? normalizeAiRequestRetryCount(config.requestRetryCount)
+            : 0;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await request(attempt);
+            } catch (err) {
+                if (err && err.name === 'AbortError') throw err;
+                if (attempt >= maxRetries || !isAiRetryableRequestError(err)) throw err;
+                const delay = getAiRetryDelay(attempt);
+                if (typeof onRetry === 'function') {
+                    onRetry({
+                        attempt: attempt + 1,
+                        maxRetries,
+                        delay,
+                        error: err
+                    });
+                }
+                await waitAiRetryDelay(delay, signal);
+            }
+        }
+        throw new Error('AI request failed');
     };
     const requestAiTextNonStreaming = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
         const headers = {'Content-Type': 'application/json'};
@@ -4112,7 +4241,7 @@ export default async ({addon, console, msg}) => {
                 parsed = JSON.parse(payload);
             } catch (err) {
                 const e = new Error(`无法解析流式响应: ${err.message}`);
-                e.partialContent = sink.getRaw();
+                e.partialContent = processor.getRaw();
                 throw e;
             }
             const reasoningDelta = extractAiDeltaReasoning(parsed);
@@ -4165,17 +4294,26 @@ export default async ({addon, console, msg}) => {
         if (!result.raw) throw new Error('AI response is empty');
         return result;
     };
-    const requestAiText = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
+    const requestAiTextOnce = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd) => {
         try {
             return await requestAiTextStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         } catch (err) {
             if (err && err.name === 'AbortError') throw err;
+            if (err && err.retryable === true) throw err;
             if (err && err.partialContent) throw err;
             console.warn('[json-script-converter] AI stream failed; falling back to non-streaming', err);
             return requestAiTextNonStreaming(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd);
         }
     };
-    const testAiConfig = async (config, signal) => {
+    const requestAiText = async (config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd, onRetry) => (
+        withAiRequestRetry(
+            config,
+            signal,
+            () => requestAiTextOnce(config, messages, signal, onVisibleDelta, onHiddenStart, onReasoningDelta, onHiddenEnd),
+            onRetry
+        )
+    );
+    const testAiConfig = async (config, signal) => withAiRequestRetry(config, signal, async () => {
         const headers = {'Content-Type': 'application/json'};
         if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
         const response = await fetch(normalizeAiEndpoint(config.endpoint), {
@@ -4194,13 +4332,13 @@ export default async ({addon, console, msg}) => {
         try { data = text ? JSON.parse(text) : null; } catch (_) { /* use text */ }
         if (!response.ok) {
             const message = data && data.error && data.error.message ? data.error.message : text;
-            throw new Error(message || `HTTP ${response.status}`);
+            throw createAiHttpError(response, message);
         }
         const content = extractAiContent(data) || text;
         if (!content) throw new Error('AI response is empty');
         return true;
-    };
-    const testAiVisionSupport = async (config, signal) => {
+    });
+    const testAiVisionSupport = async (config, signal) => withAiRequestRetry(config, signal, async () => {
         const headers = {'Content-Type': 'application/json'};
         if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
         const r = 40 + Math.floor(Math.random() * 160);
@@ -4235,7 +4373,7 @@ export default async ({addon, console, msg}) => {
         try { data = text ? JSON.parse(text) : null; } catch (_) { /* use text */ }
         if (!response.ok) {
             const message = data && data.error && data.error.message ? data.error.message : text;
-            throw new Error(message || `HTTP ${response.status}`);
+            throw createAiHttpError(response, message);
         }
         const content = extractAiContent(data) || text;
         const match = content.match(/\{[\s\S]*\}/);
@@ -4255,8 +4393,8 @@ export default async ({addon, console, msg}) => {
             throw new Error('模型没有正确读取测试图片颜色');
         }
         return true;
-    };
-    const fetchAiModels = async (config, signal) => {
+    });
+    const fetchAiModels = async (config, signal) => withAiRequestRetry(config, signal, async () => {
         const headers = {};
         if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
         const response = await fetch(getModelsEndpoint(config.endpoint), {headers, signal});
@@ -4265,7 +4403,7 @@ export default async ({addon, console, msg}) => {
         try { data = text ? JSON.parse(text) : null; } catch (_) { /* use text */ }
         if (!response.ok) {
             const message = data && data.error && data.error.message ? data.error.message : text;
-            throw new Error(message || `HTTP ${response.status}`);
+            throw createAiHttpError(response, message);
         }
         const list = Array.isArray(data && data.data) ? data.data : [];
         const models = list
@@ -4274,7 +4412,7 @@ export default async ({addon, console, msg}) => {
             .sort((a, b) => a.id.localeCompare(b.id));
         if (!models.length) throw new Error('模型列表为空');
         return models;
-    };
+    });
 
     class JsonScriptConverterModal extends React.Component {
         constructor (props) {
@@ -4282,6 +4420,7 @@ export default async ({addon, console, msg}) => {
             const storedAiConfig = loadAiConfig();
             const storedAiChats = loadAiChatState();
             const storedUiState = loadUiState();
+            const storedEndpointPreview = getAiEndpointPreview(storedAiConfig.endpointInput || storedAiConfig.endpoint || '');
             const activeAiConversation = storedAiChats.conversations.find(
                 conversation => conversation.id === storedAiChats.activeConversationId
             );
@@ -4297,6 +4436,8 @@ export default async ({addon, console, msg}) => {
                 aiModels: [],
                 aiModelMenuOpen: false,
                 aiModelInputValue: storedAiConfig.model || '',
+                aiEndpointPreview: storedEndpointPreview.endpoint,
+                aiEndpointPreviewError: storedEndpointPreview.error,
                 aiConversations: storedAiChats.conversations,
                 aiActiveConversationId: storedAiChats.activeConversationId,
                 aiSidebarCollapsed: storedAiChats.sidebarCollapsed,
@@ -4313,6 +4454,9 @@ export default async ({addon, console, msg}) => {
             this.aiModelRef = React.createRef();
             this.aiApiKeyRef = React.createRef();
             this.aiVisionEnabledRef = React.createRef();
+            this.aiToolNoConfirmRef = React.createRef();
+            this.aiRequestRetryEnabledRef = React.createRef();
+            this.aiRequestRetryCountRef = React.createRef();
             this.aiInputRef = React.createRef();
             this.aiMessagesRef = React.createRef();
             this.aiShouldAutoScrollMessages = true;
@@ -4873,15 +5017,23 @@ export default async ({addon, console, msg}) => {
         };
 
         readAiConfigFromInputs = () => {
-            const endpoint = this.aiEndpointRef.current ? this.aiEndpointRef.current.value.trim() : '';
-            const normalized = endpoint ? normalizeAiEndpoint(endpoint) : '';
-            if (this.aiEndpointRef.current && normalized) this.aiEndpointRef.current.value = normalized;
+            const endpointInput = this.aiEndpointRef.current ? this.aiEndpointRef.current.value.trim() : '';
+            const normalized = endpointInput ? normalizeAiEndpoint(endpointInput) : '';
             const previous = this.state.aiConfig || {};
             const model = this.aiModelRef.current ? this.aiModelRef.current.value.trim() : '';
             const apiKey = this.aiApiKeyRef.current ? this.aiApiKeyRef.current.value.trim() : '';
             const visionEnabled = this.aiVisionEnabledRef.current
                 ? !!this.aiVisionEnabledRef.current.checked
                 : !!previous.visionEnabled;
+            const toolNoConfirm = this.aiToolNoConfirmRef.current
+                ? !!this.aiToolNoConfirmRef.current.checked
+                : !!previous.toolNoConfirm;
+            const requestRetryEnabled = this.aiRequestRetryEnabledRef.current
+                ? !!this.aiRequestRetryEnabledRef.current.checked
+                : previous.requestRetryEnabled !== false;
+            const requestRetryCount = this.aiRequestRetryCountRef.current
+                ? normalizeAiRequestRetryCount(this.aiRequestRetryCountRef.current.value)
+                : normalizeAiRequestRetryCount(previous.requestRetryCount);
             const matchedModel = findAiModelRecord(this.state.aiModels, model);
             const inferredModel = inferAiModelVisionSupportWithSource(model);
             const inferredModelRecord = {
@@ -4903,10 +5055,14 @@ export default async ({addon, console, msg}) => {
                     : (sameVisionTarget ? String(previous.visionSupportSource || AI_VISION_SOURCE_SAVED) : ''));
             return {
                 endpoint: normalized,
+                endpointInput,
                 model,
                 apiKey,
                 showProcessLog: false,
                 visionEnabled,
+                toolNoConfirm,
+                requestRetryEnabled,
+                requestRetryCount,
                 visionSupport: modelVisionSupport,
                 visionSupportSource: modelVisionSource,
                 visionSupportMessage: matchedModel
@@ -5085,20 +5241,37 @@ export default async ({addon, console, msg}) => {
         handleAiEndpointInputChange = () => {
             const input = this.aiEndpointRef.current;
             const value = input ? input.value.trim() : '';
-            if (!value) return;
-            let normalized;
-            try {
-                normalized = normalizeAiEndpoint(value);
-            } catch (_) {
+            const preview = getAiEndpointPreview(value);
+            if (!value || preview.error) {
+                this.aiLastEndpointInputKey = '';
+                this.aiLastModelsFetchKey = '';
+                this.setState({
+                    aiEndpointPreview: preview.endpoint,
+                    aiEndpointPreviewError: preview.error,
+                    aiModels: value ? this.state.aiModels : [],
+                    aiModelMenuOpen: value ? this.state.aiModelMenuOpen : false
+                });
                 return;
             }
-            if (input && input.value.trim() !== normalized) input.value = normalized;
             const apiKey = this.aiApiKeyRef.current ? this.aiApiKeyRef.current.value.trim() : '';
-            const endpointKey = `${normalized}|${apiKey}`;
-            if (endpointKey === this.aiLastEndpointInputKey) return;
+            const endpointKey = `${preview.endpoint}|${apiKey}`;
+            if (endpointKey === this.aiLastEndpointInputKey) {
+                if (
+                    this.state.aiEndpointPreview !== preview.endpoint ||
+                    this.state.aiEndpointPreviewError
+                ) {
+                    this.setState({
+                        aiEndpointPreview: preview.endpoint,
+                        aiEndpointPreviewError: ''
+                    });
+                }
+                return;
+            }
             this.aiLastEndpointInputKey = endpointKey;
             this.aiLastModelsFetchKey = '';
             this.setState({
+                aiEndpointPreview: preview.endpoint,
+                aiEndpointPreviewError: '',
                 aiModels: [],
                 aiModelMenuOpen: true
             });
@@ -5127,6 +5300,36 @@ export default async ({addon, console, msg}) => {
                 aiConfig: {
                     ...(prev.aiConfig || {}),
                     visionEnabled: checked
+                }
+            }));
+        };
+
+        handleAiToolNoConfirmChange = e => {
+            const checked = !!(e && e.target && e.target.checked);
+            this.setState(prev => ({
+                aiConfig: {
+                    ...(prev.aiConfig || {}),
+                    toolNoConfirm: checked
+                }
+            }));
+        };
+
+        handleAiRequestRetryEnabledChange = e => {
+            const checked = !!(e && e.target && e.target.checked);
+            this.setState(prev => ({
+                aiConfig: {
+                    ...(prev.aiConfig || {}),
+                    requestRetryEnabled: checked
+                }
+            }));
+        };
+
+        handleAiRequestRetryCountChange = e => {
+            const value = e && e.target ? e.target.value : '';
+            this.setState(prev => ({
+                aiConfig: {
+                    ...(prev.aiConfig || {}),
+                    requestRetryCount: normalizeAiRequestRetryCount(value)
                 }
             }));
         };
@@ -5420,14 +5623,23 @@ export default async ({addon, console, msg}) => {
             return base ? `${base}\n\n${resultText}` : resultText;
         };
 
+        shouldSkipAiToolConfirmation = () => !!(this.state.aiConfig && this.state.aiConfig.toolNoConfirm);
+
         requestAiUserConfirmation = text => new Promise(resolve => {
+            if (this.shouldSkipAiToolConfirmation()) {
+                this.addAiStatusMessage('已按设置跳过工具确认，继续执行。');
+                resolve(true);
+                return;
+            }
             const confirmationId = `ai-confirm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const pending = {resolve, messageId: ''};
+            this.aiPendingConfirmations.set(confirmationId, pending);
             const messageId = this.addAiChatMessage('assistant', text, {
                 kind: 'confirm',
                 confirmationId,
                 forceScroll: true
             });
-            this.aiPendingConfirmations.set(confirmationId, {resolve, messageId});
+            pending.messageId = messageId;
         });
 
         resolveAiUserConfirmation = (confirmationId, confirmed) => {
@@ -5436,7 +5648,10 @@ export default async ({addon, console, msg}) => {
             if (!pending) return;
             this.aiPendingConfirmations.delete(confirmationId);
             pending.resolve(!!confirmed);
-            this.updateAiChatMessage(pending.messageId, message => ({
+            const messageId = pending.messageId || (
+                (this.state.aiMessages || []).find(message => message && message.confirmationId === confirmationId) || {}
+            ).id;
+            this.updateAiChatMessage(messageId, message => ({
                 kind: 'status',
                 pending: false,
                 confirmationResolved: true,
@@ -6213,8 +6428,86 @@ export default async ({addon, console, msg}) => {
             return {ok: false, type, error: '不支持的项目结构工具请求'};
         };
 
+        getAiRuntimeStatus = () => {
+            const state = addon.tab.redux && addon.tab.redux.state;
+            const vmStatus = state && state.scratchGui && state.scratchGui.vmStatus;
+            const threads = vm.runtime && Array.isArray(vm.runtime.threads)
+                ? vm.runtime.threads
+                : [];
+            return {
+                started: !!(vmStatus && vmStatus.started),
+                running: vmStatus && typeof vmStatus.running === 'boolean'
+                    ? vmStatus.running || threads.length > 0
+                    : threads.length > 0,
+                threadCount: threads.length,
+                paused: isPaused()
+            };
+        };
+
+        executeAiRuntimeControlTool = async tool => {
+            const type = tool && tool.type;
+            if (type === 'click_green_flag') {
+                if (typeof vm.greenFlag !== 'function' && (!vm.runtime || typeof vm.runtime.greenFlag !== 'function')) {
+                    return {ok: false, type, error: '当前 VM 不支持点击绿旗'};
+                }
+                const before = this.getAiRuntimeStatus();
+                if (before.paused) setPaused(false);
+                const didStartVm = !before.started && typeof vm.start === 'function';
+                if (didStartVm) vm.start();
+                if (typeof vm.greenFlag === 'function') vm.greenFlag();
+                else vm.runtime.greenFlag();
+                const status = this.getAiRuntimeStatus();
+                return {
+                    ok: true,
+                    type,
+                    summary: '已点击绿旗。',
+                    started: status.started || before.started || didStartVm,
+                    running: status.running,
+                    paused: status.paused,
+                    threadCount: status.threadCount
+                };
+            }
+            if (type === 'click_pause') {
+                const before = this.getAiRuntimeStatus();
+                setPaused(true);
+                const status = this.getAiRuntimeStatus();
+                return {
+                    ok: true,
+                    type,
+                    summary: before.paused ? '项目已经处于暂停状态。' : '已点击暂停。',
+                    started: status.started,
+                    running: status.running,
+                    paused: status.paused,
+                    threadCount: status.threadCount,
+                    alreadyPaused: before.paused
+                };
+            }
+            if (type === 'click_stop') {
+                if (typeof vm.stopAll !== 'function' && (!vm.runtime || typeof vm.runtime.stopAll !== 'function')) {
+                    return {ok: false, type, error: '当前 VM 不支持点击停止'};
+                }
+                if (isPaused()) setPaused(false);
+                if (typeof vm.stopAll === 'function') vm.stopAll();
+                else vm.runtime.stopAll();
+                const status = this.getAiRuntimeStatus();
+                return {
+                    ok: true,
+                    type,
+                    summary: '已点击停止。',
+                    started: status.started,
+                    running: false,
+                    paused: status.paused,
+                    threadCount: status.threadCount
+                };
+            }
+            return {ok: false, type, error: '不支持的运行控制工具请求'};
+        };
+
         executeAiTool = async (tool, knownTargetTexts, currentText, messageId) => {
             if (!tool || (
+                tool.type !== 'click_green_flag' &&
+                tool.type !== 'click_pause' &&
+                tool.type !== 'click_stop' &&
                 tool.type !== 'get_pseudocode' &&
                 tool.type !== 'get_target_info' &&
                 tool.type !== 'get_costume_info' &&
@@ -6232,6 +6525,13 @@ export default async ({addon, console, msg}) => {
                 tool.type !== 'replace_svg_costume'
             )) {
                 return {ok: false, error: '不支持的 AI 工具请求'};
+            }
+            if (
+                tool.type === 'click_green_flag' ||
+                tool.type === 'click_pause' ||
+                tool.type === 'click_stop'
+            ) {
+                return this.executeAiRuntimeControlTool(tool);
             }
             if (
                 tool.type === 'create_sprite' ||
@@ -6800,6 +7100,14 @@ export default async ({addon, console, msg}) => {
                                     text: getHiddenDoneText(type, completed)
                                 });
                             }
+                        },
+                        retry => {
+                            const delaySeconds = Math.max(1, Math.ceil((retry.delay || 0) / 1000));
+                            const errorMessage = retry.error && retry.error.message ? retry.error.message : 'unknown error';
+                            const retryText = `AI 请求失败，${delaySeconds} 秒后自动重试（${retry.attempt}/${retry.maxRetries}）：${errorMessage}`;
+                            this.addAiProcessStep(messageId, retryText);
+                            this.addAiStatusMessage(retryText);
+                            this.setInfo(`AI 请求失败，正在自动重试 ${retry.attempt}/${retry.maxRetries}...`);
                         }
                     );
                     if (hiddenStatusId && response.action && response.action.missingCloseAccepted) {
@@ -6828,6 +7136,9 @@ export default async ({addon, console, msg}) => {
                     if (tool && tool.type === 'list_extensions') return `${prefix}查看扩展列表`;
                     if (tool && tool.type === 'load_extension') return `${prefix}加载扩展${tool.extensionId ? `：${tool.extensionId}` : ''}`;
                     if (tool && tool.type === 'get_extension_blocks') return `${prefix}查看扩展 opcode 表${tool.extensionId ? `：${tool.extensionId}` : ''}`;
+                    if (tool && tool.type === 'click_green_flag') return `${prefix}点击绿旗`;
+                    if (tool && tool.type === 'click_pause') return `${prefix}点击暂停`;
+                    if (tool && tool.type === 'click_stop') return `${prefix}点击停止`;
                     if (tool && tool.type === 'get_pseudocode') return `${prefix}查看伪代码`;
                     if (tool && tool.type === 'create_sprite') return `${prefix}创建角色${tool.name ? `：${tool.name}` : ''}`;
                     if (tool && tool.type === 'delete_sprite') return `${prefix}删除角色`;
@@ -6843,6 +7154,11 @@ export default async ({addon, console, msg}) => {
                     const isTargetInfoTool = tool && tool.type === 'get_target_info';
                     const isCostumeInfoTool = tool && tool.type === 'get_costume_info';
                     const isVisionTool = tool && (tool.type === 'inspect_costume' || tool.type === 'get_stage_snapshot');
+                    const isRuntimeControlTool = tool && (
+                        tool.type === 'click_green_flag' ||
+                        tool.type === 'click_pause' ||
+                        tool.type === 'click_stop'
+                    );
                     const isExtensionTool = tool && (
                         tool.type === 'list_extensions' ||
                         tool.type === 'load_extension' ||
@@ -6982,6 +7298,25 @@ export default async ({addon, console, msg}) => {
                                 }
                             };
                         }
+                        if (isRuntimeControlTool) {
+                            const summary = toolResult.summary || '已完成运行控制操作。';
+                            this.addAiProcessStep(messageId, summary);
+                            this.updateAiChatMessage(statusId, {text: summary});
+                            return {
+                                ok: true,
+                                feedbackItem: {
+                                    kind: 'tool_result',
+                                    toolType: toolResult.type || tool.type,
+                                    ok: true,
+                                    summary,
+                                    started: !!toolResult.started,
+                                    running: !!toolResult.running,
+                                    paused: !!toolResult.paused,
+                                    threadCount: toolResult.threadCount || 0,
+                                    alreadyPaused: !!toolResult.alreadyPaused
+                                }
+                            };
+                        }
                         if (isTargetInfoTool) {
                             const names = (toolResult.targets || [])
                                 .map(item => `${item.targetRef || ''} ${item.targetName || ''}`.trim())
@@ -7051,10 +7386,11 @@ export default async ({addon, console, msg}) => {
                             : (isSearchTool
                                 ? `查找失败：${toolResult.error}`
                                 : (isProjectTool ? `项目结构操作未完成：${toolResult.error}` :
-                                    (isTargetInfoTool ? `读取目标信息失败：${toolResult.error}` :
-                                        (isCostumeInfoTool ? `读取造型/背景信息失败：${toolResult.error}` :
-                                            (isVisionTool ? `读取图片失败：${toolResult.error}` :
-                                                (isExtensionTool ? `扩展工具失败：${toolResult.error}` : `读取角色失败：${toolResult.error}`))))))
+                                        (isTargetInfoTool ? `读取目标信息失败：${toolResult.error}` :
+                                            (isCostumeInfoTool ? `读取造型/背景信息失败：${toolResult.error}` :
+                                                (isVisionTool ? `读取图片失败：${toolResult.error}` :
+                                                    (isRuntimeControlTool ? `运行控制失败：${toolResult.error}` :
+                                                        (isExtensionTool ? `扩展工具失败：${toolResult.error}` : `读取角色失败：${toolResult.error}`)))))))
                     });
                     return {
                         ok: false,
@@ -7066,7 +7402,8 @@ export default async ({addon, console, msg}) => {
                                     (isTargetInfoTool ? 'get_target_info' :
                                         (isCostumeInfoTool ? 'get_costume_info' :
                                             (isVisionTool ? tool.type :
-                                                (isExtensionTool ? tool.type : 'get_pseudocode'))))),
+                                                (isRuntimeControlTool ? tool.type :
+                                                    (isExtensionTool ? tool.type : 'get_pseudocode')))))),
                             ok: false,
                             error: toolResult.error,
                             targets: toolResult.targets || [],
@@ -7392,6 +7729,7 @@ export default async ({addon, console, msg}) => {
                 ? knownTargetTexts.get(target.id)
                 : '';
             const visionSupported = hasAiVisionSupport(this.state.aiConfig);
+            const toolNoConfirm = !!(this.state.aiConfig && this.state.aiConfig.toolNoConfirm);
             const imageAttachments = visionSupported ? collectAiImageAttachments(extra || null) : [];
             const cleanExtra = stripAiImageAttachments(extra || null);
             const context = getAiProjectContext(
@@ -7438,13 +7776,14 @@ export default async ({addon, console, msg}) => {
                         `隐藏动作块必须放在整段回复的最后。隐藏动作块外不要输出 JSON、伪代码或工具参数。通用格式：${AI_ACTION_OPEN}{"type":"工具名","参数名":"参数值"}${AI_ACTION_CLOSE}`,
                         `批量动作格式：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"工具名","参数名":"参数值"},{"type":"工具名","参数名":"参数值"}]}${AI_ACTION_CLOSE}`,
                         `不要使用模型供应商自己的工具调用格式。不要输出类似 <|tool_calls_section_begin|>、functions.AI_TOOL、tool_call_argument、${AI_TOOL_OPEN}、${AI_EDIT_OPEN} 这样的内容。只使用 ${AI_ACTION_OPEN}。`,
-                        '每次最多输出一个 <ACTION> 块。所有读取、创建、删除、修改伪代码都属于动作。修改伪代码使用 edit_pseudocode 动作。',
+                        '每次最多输出一个 <ACTION> 块。所有读取、创建、删除、修改伪代码、运行控制都属于动作。修改伪代码使用 edit_pseudocode 动作。',
                         '执行决策顺序：先理解用户原始目标；再查看 projectOperationProgress.completed 和 editOperationProgress.completed；还有未完成的结构操作就继续执行；需要更多上下文就先读取或查找；已有足够上下文且需要改代码就调用 edit_pseudocode；所有要求完成后才普通总结。',
                         '一次动作成功不代表任务结束；必须检查是否还有剩余角色、造型或脚本要处理。edit_pseudocode 成功也不是最终回答，成功后仍要根据 edit_result 检查是否还有剩余要求。',
                         `批量规则：多个互不依赖的动作应放在同一个 batch.calls 中，最多 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。后一个动作依赖前一个动作返回结果时，必须分轮执行。`,
                         '例如“创建三个角色”应使用一个 batch，包含三个 create_sprite。例如“读取 a 中名称最长的造型，再用这个名称创建角色”必须先 get_target_info，等 tool_result 返回后再 create_sprite。例如“创建两个角色，一个写加法，一个写乘法”：先 batch 创建两个角色，拿到新 targetRef 后再 edit_pseudocode。',
                         '工具执行后，插件会返回 tool_result 或 edit_result。你必须根据 result 判断下一步，不要猜测执行结果。',
-                        '可用动作：get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、edit_pseudocode。',
+                        '可用动作：click_green_flag、click_pause、click_stop、get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、edit_pseudocode。',
+                        '运行控制动作只在用户明确要求运行、暂停、停止或需要试运行项目时使用。click_green_flag 点击绿旗并启动项目；click_pause 暂停当前项目（若已暂停则保持暂停）；click_stop 点击停止并清除暂停状态。',
                         ...(visionSupported ? [
                             '用户已为此 AI 配置启用图像理解。额外可用动作：inspect_costume、get_stage_snapshot。',
                             `查看造型图片：${AI_ACTION_OPEN}{"type":"inspect_costume","targetRef":"a","costumeName":"costume1"}${AI_ACTION_CLOSE}`,
@@ -7453,7 +7792,9 @@ export default async ({addon, console, msg}) => {
                         ] : [
                             '用户未启用图像理解。不要调用 inspect_costume 或 get_stage_snapshot。位图造型只能读取元信息；SVG 造型可通过 get_costume_info 读取源码。'
                         ]),
-                        '删除角色或造型时，直接调用对应删除动作。插件会在对话中请求用户确认，只有用户确认后才会执行删除。你不要替用户确认。',
+                        toolNoConfirm
+                            ? '删除角色或造型时，直接调用对应删除动作。当前配置已允许工具调用跳过确认，插件会直接执行。'
+                            : '删除角色或造型时，直接调用对应删除动作。插件会在对话中请求用户确认，只有用户确认后才会执行删除。你不要替用户确认。',
                         '优先使用 targetRef，例如 "a"、"b"、"c"。targetName 只用于展示，targetId 只用于兼容旧格式。舞台/背景也是一个目标，isStage 为 true，可以读取和编辑脚本。',
                         'context.targets 是轻量列表，可能不包含完整造型信息。需要准确造型名、背景名、尺寸、格式、SVG 源码时，先调用 get_target_info 或 get_costume_info。',
                         'context.extensions.core 是 Scratch 打开就自带的核心分类；context.extensions.loaded 是当前已加载扩展；context.extensions.localAvailable 是本地已存在、可加载的扩展薄列表，只包含 id/name/loaded/hardware，不包含未加载扩展的 opcode 表。伪代码里使用扩展 opcode 时，插件会在应用前自动加载可识别的本地扩展，例如 pen/music/microbit。远程扩展不会靠 opcode 自动猜测 URL；使用远程扩展前必须先调用 list_extensions 搜索或 load_extension 传入 url/slug。找不到或不能自动加载的扩展会让伪代码应用失败。',
@@ -7467,6 +7808,9 @@ export default async ({addon, console, msg}) => {
                         `读取伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"]}${AI_ACTION_CLOSE}`,
                         `读取指定行：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"],"startLine":3,"endLine":8}${AI_ACTION_CLOSE}`,
                         `查找文本：${AI_ACTION_OPEN}{"type":"search_text","query":"当前关卡","targetRefs":["a"],"caseSensitive":false,"regex":false}${AI_ACTION_CLOSE}`,
+                        `点击绿旗：${AI_ACTION_OPEN}{"type":"click_green_flag"}${AI_ACTION_CLOSE}`,
+                        `点击暂停：${AI_ACTION_OPEN}{"type":"click_pause"}${AI_ACTION_CLOSE}`,
+                        `点击停止：${AI_ACTION_OPEN}{"type":"click_stop"}${AI_ACTION_CLOSE}`,
                         `创建角色：${AI_ACTION_OPEN}{"type":"create_sprite","name":"角色名"}${AI_ACTION_CLOSE}`,
                         `批量创建角色：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"create_sprite","name":"加法"},{"type":"create_sprite","name":"乘法"}]}${AI_ACTION_CLOSE}`,
                         `创建 SVG 造型：${AI_ACTION_OPEN}{"type":"create_svg_costume","targetRef":"a","name":"按钮1","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 60\\">...</svg>"}${AI_ACTION_CLOSE}`,
@@ -7540,7 +7884,9 @@ export default async ({addon, console, msg}) => {
                 const target = vm.editingTarget;
                 const r = pseudoConverter.parsePseudocode(cur, {target, vm});
                 if (r.errors && r.errors.length) {
-                    const msgs = r.errors.slice(0, 5).map(e => `第${e.line}行: ${e.message}`).join('\n');
+                    const msgs = r.errors.slice(0, 5)
+                        .map(e => `第${Number(e && e.line) > 0 ? e.line : 1}行: ${e && e.message}`)
+                        .join('\n');
                     this.setError(`切换失败：伪代码有错\n${msgs}`);
                     return;
                 }
@@ -8091,7 +8437,9 @@ export default async ({addon, console, msg}) => {
             } else {
                 const r = pseudoConverter.parsePseudocode(text, {target, vm});
                 if (r.errors && r.errors.length) {
-                    const msgs = r.errors.slice(0, 5).map(e => `第${e.line}行: ${e.message}`).join(' | ');
+                    const msgs = r.errors.slice(0, 5)
+                        .map(e => `第${Number(e && e.line) > 0 ? e.line : 1}行: ${e && e.message}`)
+                        .join(' | ');
                     this.setError(`伪代码语法错误: ${msgs}`);
                     return;
                 }
@@ -8442,6 +8790,15 @@ export default async ({addon, console, msg}) => {
             const sidebarCollapsed = !!this.state.aiSidebarCollapsed;
             const modelInputValue = this.state.aiModelInputValue || (this.aiModelRef.current && this.aiModelRef.current.value) || config.model || '';
             const visionEnabled = !!config.visionEnabled;
+            const toolNoConfirm = !!config.toolNoConfirm;
+            const requestRetryEnabled = config.requestRetryEnabled !== false;
+            const requestRetryCount = normalizeAiRequestRetryCount(config.requestRetryCount);
+            const endpointInputValue = this.aiEndpointRef.current
+                ? this.aiEndpointRef.current.value
+                : (config.endpointInput || config.endpoint || '');
+            const endpointPreviewState = getAiEndpointPreview(endpointInputValue);
+            const endpointPreview = this.state.aiEndpointPreview || endpointPreviewState.endpoint;
+            const endpointPreviewError = this.state.aiEndpointPreviewError || endpointPreviewState.error;
             const modelOptions = this.state.aiModels.slice();
             const getVisibleAiDetails = message => getAiVisibleDetailsForRender(message, this.state.aiShowProcessLog);
             const visibleMessages = getRenderableAiChatMessages(messages, this.state.aiShowProcessLog);
@@ -8469,11 +8826,13 @@ export default async ({addon, console, msg}) => {
             };
             const renderAiMessageContent = message => {
                 const details = getVisibleAiDetails(message);
-                const isLiveConfirmation = message.kind === 'confirm' &&
+                const isPendingConfirmation = message.kind === 'confirm' &&
                     !message.confirmationResolved &&
-                    message.confirmationId &&
+                    message.confirmationId;
+                const isLiveConfirmation = isPendingConfirmation &&
                     this.aiPendingConfirmations &&
                     this.aiPendingConfirmations.has(message.confirmationId);
+                const isStaleConfirmation = isPendingConfirmation && !isLiveConfirmation;
                 if (message.pending && !message.text && !details.length) {
                     return (
                         <span style={{display: 'inline-flex', alignItems: 'center', gap: 8}}>
@@ -8750,22 +9109,26 @@ export default async ({addon, console, msg}) => {
                                 display: 'flex',
                                 gap: 8,
                                 flexWrap: 'wrap',
-                                marginTop: 10
+                                marginTop: 10,
+                                padding: 10,
+                                border: '1px solid #fdba74',
+                                borderRadius: 8,
+                                background: '#fff7ed'
                             }}
                         >
                             <button
                                 type="button"
                                 onClick={() => this.resolveAiUserConfirmation(message.confirmationId, true)}
                                 style={{
-                                    height: 30,
+                                    height: 34,
                                     border: '1px solid #dc2626',
                                     borderRadius: 6,
                                     background: '#dc2626',
                                     color: '#ffffff',
-                                    fontSize: 12,
+                                    fontSize: 13,
                                     fontWeight: 700,
                                     cursor: 'pointer',
-                                    padding: '0 11px'
+                                    padding: '0 14px'
                                 }}
                             >
                                 确认删除
@@ -8774,19 +9137,37 @@ export default async ({addon, console, msg}) => {
                                 type="button"
                                 onClick={() => this.resolveAiUserConfirmation(message.confirmationId, false)}
                                 style={{
-                                    height: 30,
+                                    height: 34,
                                     border: '1px solid #cbd5e1',
                                     borderRadius: 6,
                                     background: '#ffffff',
                                     color: '#334155',
-                                    fontSize: 12,
+                                    fontSize: 13,
                                     fontWeight: 700,
                                     cursor: 'pointer',
-                                    padding: '0 11px'
+                                    padding: '0 14px'
                                 }}
                             >
                                 取消
                             </button>
+                        </div>
+                    );
+                } else if (isStaleConfirmation) {
+                    parts.push(
+                        <div
+                            key="confirm-expired"
+                            style={{
+                                marginTop: 10,
+                                padding: '8px 10px',
+                                border: '1px solid #e2e8f0',
+                                borderRadius: 8,
+                                background: '#f8fafc',
+                                color: '#64748b',
+                                fontSize: 12,
+                                lineHeight: 1.45
+                            }}
+                        >
+                            这条确认已失效，请重新发起删除操作。
                         </div>
                     );
                 }
@@ -9010,13 +9391,24 @@ export default async ({addon, console, msg}) => {
                             }}>
                                 <input
                                     ref={this.aiEndpointRef}
-                                    defaultValue={config.endpoint || ''}
+                                    defaultValue={config.endpointInput || config.endpoint || ''}
                                     placeholder="https://api.example.com 或 https://api.example.com/v1"
                                     onChange={this.handleAiEndpointInputChange}
                                     onBlur={this.handleAiEndpointInputChange}
                                     style={fieldStyle}
                                 />
-                                <div style={{position: 'relative'}}>
+                                {(endpointPreview || endpointPreviewError) ? (
+                                    <div style={{
+                                        marginTop: -7,
+                                        color: endpointPreviewError ? '#b91c1c' : '#475569',
+                                        fontSize: 12,
+                                        lineHeight: 1.45,
+                                        wordBreak: 'break-all'
+                                    }}>
+                                        {endpointPreviewError ? `实际地址无法解析：${endpointPreviewError}` : `实际地址：${endpointPreview}`}
+                                    </div>
+                                ) : null}
+                                <div style={{position: 'relative', display: 'grid', gap: 6}}>
                                     <input
                                         ref={this.aiModelRef}
                                         value={modelInputValue}
@@ -9043,19 +9435,14 @@ export default async ({addon, console, msg}) => {
                                     </span>
                                     {this.state.aiModelMenuOpen && (filteredModelOptions.length || this.state.aiModelsLoading) ? (
                                         <div className="jsonConverterAiModelMenu" style={{
-                                            position: 'absolute',
-                                            zIndex: 20,
-                                            left: 0,
-                                            right: 0,
-                                            top: 38,
-                                            maxHeight: 236,
+                                            maxHeight: 176,
                                             overflowY: 'scroll',
                                             overflowX: 'hidden',
                                             scrollbarGutter: 'stable',
                                             border: '1px solid #cbd5e1',
                                             borderRadius: 8,
                                             background: '#ffffff',
-                                            boxShadow: '0 12px 28px rgba(15, 23, 42, 0.16)',
+                                            boxShadow: '0 4px 12px rgba(15, 23, 42, 0.08)',
                                             padding: 6
                                         }}>
                                             {this.state.aiModelsLoading ? (
@@ -9172,6 +9559,134 @@ export default async ({addon, console, msg}) => {
                                         </span>
                                     </span>
                                 </label>
+                                <label style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'auto minmax(0, 1fr)',
+                                    gap: 10,
+                                    alignItems: 'start',
+                                    padding: '10px 11px',
+                                    border: '1px solid #dbe3ee',
+                                    borderRadius: 8,
+                                    background: toolNoConfirm ? '#fff7ed' : '#ffffff',
+                                    cursor: 'pointer'
+                                }}>
+                                    <input
+                                        ref={this.aiToolNoConfirmRef}
+                                        className="jsonConverterCheckbox"
+                                        type="checkbox"
+                                        checked={toolNoConfirm}
+                                        onChange={this.handleAiToolNoConfirmChange}
+                                        style={{
+                                            width: 16,
+                                            height: 16,
+                                            margin: '2px 0 0',
+                                            accentColor: '#f97316',
+                                            cursor: 'pointer'
+                                        }}
+                                    />
+                                    <span style={{minWidth: 0}}>
+                                        <span style={{
+                                            display: 'block',
+                                            color: '#172033',
+                                            fontSize: 13,
+                                            fontWeight: 700,
+                                            lineHeight: 1.35
+                                        }}>
+                                            调用工具无需确认
+                                        </span>
+                                        <span style={{
+                                            display: 'block',
+                                            marginTop: 3,
+                                            color: '#64748b',
+                                            fontSize: 12,
+                                            lineHeight: 1.45
+                                        }}>
+                                            开启后，AI 执行删除角色、删除造型等需要确认的工具时会直接继续。
+                                        </span>
+                                    </span>
+                                </label>
+                                <div style={{
+                                    display: 'grid',
+                                    gap: 8,
+                                    padding: '10px 11px',
+                                    border: '1px solid #dbe3ee',
+                                    borderRadius: 8,
+                                    background: requestRetryEnabled ? '#eff6ff' : '#ffffff'
+                                }}>
+                                    <label style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: 'auto minmax(0, 1fr)',
+                                        gap: 10,
+                                        alignItems: 'start',
+                                        cursor: 'pointer'
+                                    }}>
+                                        <input
+                                            ref={this.aiRequestRetryEnabledRef}
+                                            className="jsonConverterCheckbox"
+                                            type="checkbox"
+                                            checked={requestRetryEnabled}
+                                            onChange={this.handleAiRequestRetryEnabledChange}
+                                            style={{
+                                                width: 16,
+                                                height: 16,
+                                                margin: '2px 0 0',
+                                                accentColor: '#2563eb',
+                                                cursor: 'pointer'
+                                            }}
+                                        />
+                                        <span style={{minWidth: 0}}>
+                                            <span style={{
+                                                display: 'block',
+                                                color: '#172033',
+                                                fontSize: 13,
+                                                fontWeight: 700,
+                                                lineHeight: 1.35
+                                            }}>
+                                                请求失败自动重试
+                                            </span>
+                                            <span style={{
+                                                display: 'block',
+                                                marginTop: 3,
+                                                color: '#64748b',
+                                                fontSize: 12,
+                                                lineHeight: 1.45
+                                            }}>
+                                                网络错误、限流或服务器临时错误会自动再次请求。
+                                            </span>
+                                        </span>
+                                    </label>
+                                    <div style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: 'minmax(0, 1fr) 88px',
+                                        gap: 8,
+                                        alignItems: 'center',
+                                        paddingLeft: 26
+                                    }}>
+                                        <span style={{
+                                            color: '#64748b',
+                                            fontSize: 12,
+                                            lineHeight: 1.35
+                                        }}>
+                                            最多重试次数
+                                        </span>
+                                        <input
+                                            ref={this.aiRequestRetryCountRef}
+                                            type="number"
+                                            min="0"
+                                            max={AI_REQUEST_RETRY_MAX_COUNT}
+                                            step="1"
+                                            value={requestRetryCount}
+                                            disabled={!requestRetryEnabled}
+                                            onChange={this.handleAiRequestRetryCountChange}
+                                            aria-label="最多重试次数"
+                                            style={{
+                                                ...fieldStyle,
+                                                height: 30,
+                                                opacity: requestRetryEnabled ? 1 : 0.6
+                                            }}
+                                        />
+                                    </div>
+                                </div>
                                 <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8}}>
                                     <button
                                         type="button"
@@ -9244,20 +9759,21 @@ export default async ({addon, console, msg}) => {
                                     ) : null}
                                     {visibleMessages.length ? renderedMessages.map((message, index) => {
                                         const isStatus = message.kind === 'status' || message.kind === 'confirm';
+                                        const isConfirm = message.kind === 'confirm' && !message.confirmationResolved;
                                         return (
                                             <div
                                                 key={message.id || `${message.time}-${index}`}
                                                 style={{
                                                     alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start',
-                                                    maxWidth: '78%',
-                                                    border: `1px solid ${message.role === 'user' ? '#bfdbfe' : '#e2e8f0'}`,
+                                                    maxWidth: isConfirm ? '88%' : '78%',
+                                                    border: `1px solid ${message.role === 'user' ? '#bfdbfe' : (isConfirm ? '#fdba74' : '#e2e8f0')}`,
                                                     borderRadius: 8,
                                                     padding: '9px 11px',
                                                     background: message.role === 'user'
                                                         ? '#eff6ff'
-                                                        : (isStatus ? '#f1f5f9' : '#ffffff'),
-                                                    color: isStatus ? '#64748b' : '#172033',
-                                                    fontSize: isStatus ? 12 : 13,
+                                                        : (isConfirm ? '#fffaf0' : (isStatus ? '#f1f5f9' : '#ffffff')),
+                                                    color: isConfirm ? '#172033' : (isStatus ? '#64748b' : '#172033'),
+                                                    fontSize: isConfirm ? 13 : (isStatus ? 12 : 13),
                                                     lineHeight: 1.45,
                                                     whiteSpace: 'pre-wrap'
                                                 }}

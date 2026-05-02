@@ -502,6 +502,144 @@ const MATH_OP_OPERATOR_TO_NAME = new Map([
     ['10 ^', 'pow10']
 ]);
 
+const normalizeRuntimeBlockKind = value => {
+    const text = String(value || '').toLowerCase();
+    if (text === 'boolean') return 'boolean';
+    if (text === 'reporter') return 'reporter';
+    if (text === 'command') return 'stmt';
+    if (text === 'hat' || text === 'event') return 'hat';
+    if (text === 'conditional' || text === 'loop') return 'c';
+    return '';
+};
+
+const runtimeArgPrimType = value => {
+    const text = String(value || '').toLowerCase();
+    if (text === 'boolean') return null;
+    if (text === 'angle') return 8;
+    if (text === 'color' || text === 'colour') return 9;
+    if (text === 'number' || text === 'note') return 4;
+    return 10;
+};
+
+const runtimeMaybeMessageText = value => {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (typeof value === 'object') {
+        return String(value.default || value.defaultMessage || value.message || value.id || '');
+    }
+    return '';
+};
+
+const runtimeBlockArgumentOrder = info => {
+    const args = info && info.arguments && typeof info.arguments === 'object' ? info.arguments : {};
+    const texts = Array.isArray(info && info.text) ? info.text : [info && info.text];
+    const ordered = [];
+    for (const value of texts) {
+        const text = runtimeMaybeMessageText(value);
+        const re = /\[([^\]]+)]/g;
+        let match;
+        while ((match = re.exec(text))) {
+            const name = match[1];
+            if (Object.prototype.hasOwnProperty.call(args, name) && ordered.indexOf(name) < 0) {
+                ordered.push(name);
+            }
+        }
+    }
+    for (const name of Object.keys(args)) {
+        if (ordered.indexOf(name) < 0) ordered.push(name);
+    }
+    return ordered;
+};
+
+const runtimeOpcodeCanUseCallSyntax = opcode =>
+    /^[a-zA-Z_$\u4e00-\u9fa5][a-zA-Z_0-9$\u4e00-\u9fa5]*$/.test(String(opcode || ''));
+
+const getRuntimeOpcodeMetadata = ctx => {
+    const runtime = ctx && ctx.vm && ctx.vm.runtime;
+    const blockInfo = Array.isArray(runtime && runtime._blockInfo) ? runtime._blockInfo : [];
+    const byOpcode = new Map();
+    for (const category of blockInfo) {
+        if (!category || !Array.isArray(category.blocks)) continue;
+        const categoryId = String(category.id || '');
+        const menuInfo = category.menuInfo || {};
+        for (const convertedBlock of category.blocks) {
+            const info = convertedBlock && convertedBlock.info;
+            if (!info || typeof info !== 'object') continue;
+            const rawOpcode = info.opcode == null ? '' : String(info.opcode);
+            const json = convertedBlock && convertedBlock.json;
+            const opcode = json && json.type ? String(json.type) :
+                (categoryId && rawOpcode ? `${categoryId}_${rawOpcode}` : rawOpcode);
+            if (!opcode) continue;
+            const args = {};
+            const argInfo = info.arguments && typeof info.arguments === 'object' ? info.arguments : {};
+            for (const name of Object.keys(argInfo)) {
+                const arg = argInfo[name] && typeof argInfo[name] === 'object' ? argInfo[name] : {};
+                const menu = arg.menu && menuInfo ? menuInfo[arg.menu] : null;
+                const menuAcceptsReporters = !!(arg.menu && menu && menu.acceptReporters);
+                args[name] = {
+                    name,
+                    kind: arg.menu && !menuAcceptsReporters ? 'field' : 'input',
+                    primType: runtimeArgPrimType(arg.type),
+                    type: String(arg.type || '')
+                };
+            }
+            const kind = normalizeRuntimeBlockKind(info.blockType);
+            const orderedNames = runtimeBlockArgumentOrder(info);
+            const orderedArgs = [];
+            for (const name of orderedNames) {
+                const arg = argInfo[name] && typeof argInfo[name] === 'object' ? argInfo[name] : {};
+                if (String(arg.type || '').toLowerCase() === 'image') continue;
+                const menu = arg.menu && menuInfo ? menuInfo[arg.menu] : null;
+                const menuAcceptsReporters = !!(arg.menu && menu && menu.acceptReporters);
+                if (arg.menu && !menuAcceptsReporters) {
+                    orderedArgs.push({type: 'field', name});
+                } else if (arg.menu) {
+                    orderedArgs.push({
+                        type: 'input',
+                        name,
+                        primType: null,
+                        menu: {opcode: `${categoryId}_menu_${arg.menu}`, field: arg.menu}
+                    });
+                } else {
+                    orderedArgs.push({type: 'input', name, primType: runtimeArgPrimType(arg.type)});
+                }
+            }
+            const branchCount = Math.max(0, Number(info.branchCount) || 0);
+            const substacks = [];
+            for (let i = 0; i < branchCount; i++) substacks.push(`SUBSTACK${i > 0 ? i + 1 : ''}`);
+            const def = runtimeOpcodeCanUseCallSyntax(opcode) && kind && !info.isDynamic ? {
+                opcode,
+                name: opcode,
+                kind: kind === 'stmt' && info.isTerminal ? 'cap' : kind,
+                args: orderedArgs,
+                substacks,
+                runtime: true
+            } : null;
+            byOpcode.set(opcode, {
+                opcode,
+                kind,
+                blockType: String(info.blockType || ''),
+                args,
+                def
+            });
+        }
+    }
+    return byOpcode;
+};
+
+const getRuntimeOpcodeDefinitions = metadata => {
+    const opcodeToRuntimeDef = new Map();
+    const nameToRuntimeDef = new Map();
+    for (const meta of metadata.values()) {
+        const def = meta && meta.def;
+        if (!def || opcodeToDef.has(def.opcode) || nameToDef.has(def.name)) continue;
+        opcodeToRuntimeDef.set(def.opcode, def);
+        nameToRuntimeDef.set(def.name, def);
+    }
+    return {opcodeToRuntimeDef, nameToRuntimeDef};
+};
+
 // ========================= UTIL =========================
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
 // 包含 CJK 的合法标识符（用于裸引用变量名）
@@ -566,6 +704,10 @@ const renderPseudocode = (blocks, ctx, options) => {
     // 1) 先把压缩 primitive 块展开——我们在渲染器内部操作时，反而更方便处理"规整"形态。
     //    不修改输入：深拷贝。
     const working = JSON.parse(JSON.stringify(blocks));
+    const runtimeOpcodeMeta = getRuntimeOpcodeMetadata(ctx);
+    const {opcodeToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeOpcodeMeta);
+    const getOpcodeDef = opcode => opcodeToDef.get(opcode) || opcodeToRuntimeDef.get(opcode);
+    const shouldRenderGeneric = (block, def) => !!(block && def && def.runtime && block.mutation);
     // 当前 define 作用域的参数名集合：renderBlockAsExpr 里遇到 argument_reporter_*
     // 且 VALUE 名字在这集合里时，裸标识符/字符串渲染（可读）；
     // 否则退回 arg("...") / arg_bool("...") 这种全限定形式（防御无 define 场景）。
@@ -824,7 +966,7 @@ const renderPseudocode = (blocks, ctx, options) => {
                 inner.opcode === 'operator_gt' ||
                 inner.opcode === 'operator_equals'
             )) {
-                const innerDef = opcodeToDef.get(inner.opcode);
+                const innerDef = getOpcodeDef(inner.opcode);
                 const leftInput = inner.inputs && inner.inputs[innerDef.args[0].name];
                 const rightInput = inner.inputs && inner.inputs[innerDef.args[1].name];
                 const left = leftInput ? renderInput(leftInput, innerDef.args[0], innerDef.infix.prec) : '""';
@@ -836,8 +978,9 @@ const renderPseudocode = (blocks, ctx, options) => {
                 return innerDef.infix.prec < parentPrec ? `(${s})` : s;
             }
         }
-        const def = opcodeToDef.get(b.opcode);
+        const def = getOpcodeDef(b.opcode);
         if (!def) return renderGenericCall(b);
+        if (shouldRenderGeneric(b, def)) return renderGenericCall(b);
         if (def.prefix) {
             // !OPERAND
             const operand = b.inputs && b.inputs[def.args[0].name];
@@ -932,6 +1075,10 @@ const renderPseudocode = (blocks, ctx, options) => {
     // fields/inputs 的 key 一律用字符串字面量包，兼容含 !@#$%{}[] 等任意字符的 proccode 参数 id。
     const renderGenericCall = (block) => {
         const bits = [escapeString(block.opcode)];
+        const meta = runtimeOpcodeMeta.get(block.opcode);
+        if (meta && (meta.kind === 'boolean' || meta.kind === 'reporter')) {
+            bits.push(`kind=${escapeString(meta.kind)}`);
+        }
         if (block.shadow) bits.push('shadow=true');
         if (block.fields && Object.keys(block.fields).length) {
             const fParts = [];
@@ -1013,7 +1160,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         if (!vf || !valueBlock || Array.isArray(valueBlock)) return null;
         const op = compoundOps[valueBlock.opcode];
         if (!op) return null;
-        const def = opcodeToDef.get(valueBlock.opcode);
+        const def = getOpcodeDef(valueBlock.opcode);
         if (!def || !def.infix || !def.args || def.args.length < 2) return null;
         const leftInput = valueBlock.inputs && valueBlock.inputs[def.args[0].name];
         const rightInput = valueBlock.inputs && valueBlock.inputs[def.args[1].name];
@@ -1042,8 +1189,8 @@ const renderPseudocode = (blocks, ctx, options) => {
                 cur = b.next;
                 continue;
             }
-            const def = opcodeToDef.get(b.opcode);
-            if (!def) {
+            const def = getOpcodeDef(b.opcode);
+            if (!def || shouldRenderGeneric(b, def)) {
                 out.push(indent(depth) + renderGenericCall(b));
             } else if (b.opcode === 'data_setvariableto') {
                 // 特殊渲染为 LHS = rhs 的形式。
@@ -1184,10 +1331,11 @@ const renderPseudocode = (blocks, ctx, options) => {
             lines.push('');
             continue;
         }
-        const def = opcodeToDef.get(b.opcode);
-        if (def && def.kind === 'hat') {
-            const argsStr = def.args.map(a => renderArg(b, a)).join(', ');
-            const head = `${atPrefix}${def.name}(${argsStr})`;
+        const def = getOpcodeDef(b.opcode);
+        const effectiveDef = shouldRenderGeneric(b, def) ? null : def;
+        if (effectiveDef && effectiveDef.kind === 'hat') {
+            const argsStr = effectiveDef.args.map(a => renderArg(b, a)).join(', ');
+            const head = `${atPrefix}${effectiveDef.name}(${argsStr})`;
             lines.push(...topCommentLines);
             if (b.next) {
                 lines.push(`${head} {`);
@@ -1196,12 +1344,12 @@ const renderPseudocode = (blocks, ctx, options) => {
             } else {
                 lines.push(head);
             }
-        } else if (def && (def.kind === 'stmt' || def.kind === 'cap' || def.kind === 'c' || def.kind === 'if-else')) {
+        } else if (effectiveDef && (effectiveDef.kind === 'stmt' || effectiveDef.kind === 'cap' || effectiveDef.kind === 'c' || effectiveDef.kind === 'if-else')) {
             // top-level 语句串
             lines.push(`${atPrefix}{`);
             lines.push(...renderStmtBlock(topId, 1));
             lines.push('}');
-        } else if (def && (def.kind === 'reporter' || def.kind === 'boolean')) {
+        } else if (effectiveDef && (effectiveDef.kind === 'reporter' || effectiveDef.kind === 'boolean')) {
             // 浮动 reporter（Scratch 里可以从积木栏拖出单独的 reporter）
             lines.push(...topCommentLines);
             lines.push(`${atPrefix}${renderBlockAsExpr(topId, 0)}`);
@@ -1396,6 +1544,10 @@ const parsePseudocode = (source, ctx) => {
     const {tokens, errors: tokenErrors} = tokenize(source);
     const errors = [...tokenErrors];
     const ctxTarget = ctx && ctx.target;
+    const runtimeOpcodeMeta = getRuntimeOpcodeMetadata(ctx);
+    const {opcodeToRuntimeDef, nameToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeOpcodeMeta);
+    const getOpcodeDef = opcode => opcodeToDef.get(opcode) || opcodeToRuntimeDef.get(opcode);
+    const getNameDef = name => nameToDef.get(name) || nameToRuntimeDef.get(name);
 
     // id 分配
     let idCounter = 0;
@@ -1407,6 +1559,7 @@ const parsePseudocode = (source, ctx) => {
 
     // 输出 blocks
     const outBlocks = {};
+    const genericOpKindById = new Map();
     // 头部声明的名字集合（新语法：纯名字列表；仅作"这个脚本声明用到了哪些 var/list/broadcast"的元信息）
     // #vars / #lists 声明为全局（stage 作用域）；#localvars / #locallists 声明为角色本地（sprite 作用域）
     const declaredVars = new Set();
@@ -1723,6 +1876,8 @@ const parsePseudocode = (source, ctx) => {
         return pendingBroadcasts.get(name);
     };
 
+    const blockLoc = new Map();
+
     // 建立一个块对象（非 primitive），返回 id
     const addBlock = (opcode, opts) => {
         const id = newId();
@@ -1738,6 +1893,12 @@ const parsePseudocode = (source, ctx) => {
         if (opts && opts.topLevel) {
             outBlocks[id].x = opts.x || 0;
             outBlocks[id].y = opts.y || 0;
+        }
+        if (opts && (opts.line || opts.col)) {
+            blockLoc.set(id, {
+                line: tokenLine(opts),
+                col: tokenCol(opts)
+            });
         }
         if (opts && opts.mutation) outBlocks[id].mutation = opts.mutation;
         return id;
@@ -1761,18 +1922,31 @@ const parsePseudocode = (source, ctx) => {
             if (t.value === '!') {
                 eat();
                 const inner = parseUnary();
-                return {kind: 'not', inner};
+                return {kind: 'not', inner, line: t.line, col: t.col};
             }
             if (t.value === '-' || t.value === '+') {
                 // 一元 +/- 作用于数值字面量：合并到字面量里，保持语义简单
                 eat();
                 const inner = parseUnary();
                 if (inner.kind === 'numlit') {
-                    return {kind: 'numlit', value: (t.value === '-' ? -inner.value : inner.value)};
+                    return {
+                        kind: 'numlit',
+                        value: (t.value === '-' ? -inner.value : inner.value),
+                        raw: `${t.value}${inner.raw !== undefined ? inner.raw : inner.value}`,
+                        line: t.line,
+                        col: t.col
+                    };
                 }
                 // 否则转成 operator_subtract(0, x) 或原值
                 if (t.value === '-') {
-                    return {kind: 'binop', op: '-', left: {kind: 'numlit', value: 0}, right: inner};
+                    return {
+                        kind: 'binop',
+                        op: '-',
+                        left: {kind: 'numlit', value: 0, raw: '0', line: t.line, col: t.col},
+                        right: inner,
+                        line: t.line,
+                        col: t.col
+                    };
                 }
                 return inner;
             }
@@ -1826,11 +2000,16 @@ const parsePseudocode = (source, ctx) => {
         return {args, kwargs};
     };
 
+    const astLine = ast => (ast && Number(ast.line) > 0 ? Number(ast.line) : 1);
+    const astCol = ast => (ast && Number(ast.col) > 0 ? Number(ast.col) : 1);
+    const tokenLine = token => (token && Number(token.line) > 0 ? Number(token.line) : 1);
+    const tokenCol = token => (token && Number(token.col) > 0 ? Number(token.col) : 1);
+
     const parsePrimary = () => {
         const t = peek();
         if (t.type === T.NUMBER) {
             eat();
-            return {kind: 'numlit', value: Number(t.value), raw: t.value};
+            return {kind: 'numlit', value: Number(t.value), raw: t.value, line: t.line, col: t.col};
         }
         if (t.type === T.STRING) {
             eat();
@@ -1838,9 +2017,9 @@ const parsePseudocode = (source, ctx) => {
             // 在 stmt 位置另有 parseStatement 的 STRING+LPAREN 分支单独处理成 stmt call。
             if (peek().type === T.LPAREN) {
                 const {args} = parseCallTail(false);
-                return {kind: 'strcall', proccode: t.value, args};
+                return {kind: 'strcall', proccode: t.value, args, line: t.line, col: t.col};
             }
-            return {kind: 'strlit', value: t.value};
+            return {kind: 'strlit', value: t.value, line: t.line, col: t.col};
         }
         if (t.type === T.LPAREN) {
             eat();
@@ -1877,7 +2056,7 @@ const parsePseudocode = (source, ctx) => {
             }
             skipNewlines();
             expect(T.RBRACE);
-            return {kind: 'objlit', entries};
+            return {kind: 'objlit', entries, line: t.line, col: t.col};
         }
         if (t.type === T.IDENT) {
             const name = t.value;
@@ -1885,18 +2064,18 @@ const parsePseudocode = (source, ctx) => {
             // 函数调用：IDENT ( args )
             if (peek().type === T.LPAREN) {
                 const {args, kwargs} = parseCallTail(name === '@op');
-                return {kind: 'call', name, args, kwargs};
+                return {kind: 'call', name, args, kwargs, line: t.line, col: t.col};
             }
             // 裸 IDENT：当 true/false/null 处理
-            if (name === 'true') return {kind: 'boollit', value: true};
-            if (name === 'false') return {kind: 'boollit', value: false};
-            if (name === 'null') return {kind: 'null'};
+            if (name === 'true') return {kind: 'boollit', value: true, line: t.line, col: t.col};
+            if (name === 'false') return {kind: 'boollit', value: false, line: t.line, col: t.col};
+            if (name === 'null') return {kind: 'null', line: t.line, col: t.col};
             // 其他裸 IDENT 视为 0 参函数调用（方便 `on_flag_clicked` 这种）
-            return {kind: 'call', name, args: [], kwargs: {}};
+            return {kind: 'call', name, args: [], kwargs: {}, line: t.line, col: t.col};
         }
         errors.push({line: t.line, col: t.col, message: `意外 token: ${JSON.stringify(t.value)}`});
         eat();
-        return {kind: 'strlit', value: ''};
+        return {kind: 'strlit', value: '', line: tokenLine(t), col: tokenCol(t)};
     };
 
     const isDefinitelyStringExpr = ast => {
@@ -1914,115 +2093,120 @@ const parsePseudocode = (source, ctx) => {
     // 返回："emitted": 'block' | 'prim', id (block id) 或 prim (Array)
     const compileExpr = (ast, parentId, expectedPrimType) => {
         if (!ast) return {prim: [10, '']};
+        const withLoc = result => {
+            if (result && result.line == null) result.line = astLine(ast);
+            if (result && result.col == null) result.col = astCol(ast);
+            return result;
+        };
         if (ast.kind === 'numlit') {
             const primType = (expectedPrimType === 10 || expectedPrimType == null) ? 10 : expectedPrimType;
-            return {prim: [primType, String(ast.value)]};
+            return withLoc({prim: [primType, String(ast.value)]});
         }
         if (ast.kind === 'strlit') {
             // 在 define body 里且命中当前 proc 参数名 → 作为 argument_reporter_* 引用（参数优先于普通字符串）。
             if (currentProcParams && currentProcParams.has(ast.value)) {
                 const t = currentProcParams.get(ast.value);
                 const opcode = t === 'b' ? 'argument_reporter_boolean' : 'argument_reporter_string_number';
-                const id = addBlock(opcode, {parent: parentId});
+                const id = addBlock(opcode, {parent: parentId, line: astLine(ast), col: astCol(ast)});
                 outBlocks[id].fields.VALUE = [ast.value, null];
-                return {blockId: id};
+                return withLoc({blockId: id});
             }
             const primType = (expectedPrimType == null) ? 10 : expectedPrimType;
-            if (primType === 9) return {prim: [9, String(ast.value)]};
+            if (primType === 9) return withLoc({prim: [9, String(ast.value)]});
             if (primType === 11) {
-                return {prim: [11, ast.value, resolveBroadcastId(ast.value)]};
+                return withLoc({prim: [11, ast.value, resolveBroadcastId(ast.value)]});
             }
-            return {prim: [primType, ast.value]};
+            return withLoc({prim: [primType, ast.value]});
         }
         if (ast.kind === 'strcall') {
             // expr 位置遇到 `"proccode"(args)` → reporter call（mutation.return="1"）
-            return buildProcedureCall(ast.proccode, ast.args, true, parentId);
+            return withLoc(buildProcedureCall(ast.proccode, ast.args, true, parentId, ast));
         }
         if (ast.kind === 'boollit') {
-            return {prim: [10, ast.value ? 'true' : 'false']};
+            return withLoc({prim: [10, ast.value ? 'true' : 'false']});
         }
-        if (ast.kind === 'null') return {prim: [10, '']};
+        if (ast.kind === 'null') return withLoc({prim: [10, '']});
         if (ast.kind === 'not') {
-            const id = addBlock('operator_not', {parent: parentId});
+            const id = addBlock('operator_not', {parent: parentId, line: astLine(ast), col: astCol(ast)});
             const r = compileExpr(ast.inner, id, null);
             setInputRef(id, 'OPERAND', r, null);
-            return {blockId: id};
+            return withLoc({blockId: id});
         }
         if (ast.kind === 'binop') {
             if (ast.op === '+' && (isDefinitelyStringExpr(ast.left) || isDefinitelyStringExpr(ast.right))) {
                 errors.push({
-                    line: ast.line || 0,
-                    col: ast.col || 0,
+                    line: astLine(ast),
+                    col: astCol(ast),
                     message: '字符串拼接不能使用 +；请使用 join(a, b)。多个片段请嵌套 join，例如 join(join("第", n), "关")。'
                 });
                 return {prim: [10, '']};
             }
             if (ast.op === '>=' || ast.op === '<=' || ast.op === '!=') {
                 const compareOp = ast.op === '>=' ? '<' : (ast.op === '<=' ? '>' : '==');
-                const notId = addBlock('operator_not', {parent: parentId});
-                const compareId = addBlock(BIN_OP_TO_OPCODE[compareOp], {parent: notId});
+                const notId = addBlock('operator_not', {parent: parentId, line: astLine(ast), col: astCol(ast)});
+                const compareId = addBlock(BIN_OP_TO_OPCODE[compareOp], {parent: notId, line: astLine(ast), col: astCol(ast)});
                 const [a1, a2, primType] = BIN_OP_ARGS[compareOp];
                 const rL = compileExpr(ast.left, compareId, primType);
                 const rR = compileExpr(ast.right, compareId, primType);
                 setInputRef(compareId, a1, rL, primType);
                 setInputRef(compareId, a2, rR, primType);
                 setInputRef(notId, 'OPERAND', {blockId: compareId}, null);
-                return {blockId: notId};
+                return withLoc({blockId: notId});
             }
             const opcode = BIN_OP_TO_OPCODE[ast.op];
             const [a1, a2, primType] = BIN_OP_ARGS[ast.op];
-            const id = addBlock(opcode, {parent: parentId});
+            const id = addBlock(opcode, {parent: parentId, line: astLine(ast), col: astCol(ast)});
             const rL = compileExpr(ast.left, id, primType);
             const rR = compileExpr(ast.right, id, primType);
             setInputRef(id, a1, rL, primType);
             setInputRef(id, a2, rR, primType);
-            return {blockId: id};
+            return withLoc({blockId: id});
         }
         if (ast.kind === 'call') {
             if (ast.name === '@op') {
-                return compileOpCall(ast, parentId);
+                return withLoc(compileOpCall(ast, parentId));
             }
             // procedures 专用：arg/arg_bool → argument_reporter_*，call/callret → procedures_call
             if (ast.name === 'arg' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
-                const id = addBlock('argument_reporter_string_number', {parent: parentId});
+                const id = addBlock('argument_reporter_string_number', {parent: parentId, line: astLine(ast), col: astCol(ast)});
                 outBlocks[id].fields.VALUE = [ast.args[0].value, null];
-                return {blockId: id};
+                return withLoc({blockId: id});
             }
             if (ast.name === 'arg_bool' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
-                const id = addBlock('argument_reporter_boolean', {parent: parentId});
+                const id = addBlock('argument_reporter_boolean', {parent: parentId, line: astLine(ast), col: astCol(ast)});
                 outBlocks[id].fields.VALUE = [ast.args[0].value, null];
-                return {blockId: id};
+                return withLoc({blockId: id});
             }
             if ((ast.name === 'call' || ast.name === 'callret') && ast.args.length >= 1) {
                 const tok = astAsProcToken(ast.args[0]);
                 if (tok != null) {
                     const proccode = resolveProccodeFromCallName(tok);
                     const restAsts = ast.args.slice(1);
-                    return buildProcedureCall(proccode, restAsts, ast.name === 'callret', parentId);
+                    return withLoc(buildProcedureCall(proccode, restAsts, ast.name === 'callret', parentId, ast));
                 }
             }
             // 特判 var("x") / list("x") / broadcast_ref("x")
             if (ast.name === 'var' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
                 const ref = resolveVariableRef(ast.args[0].value);
-                return {prim: [12, ref.name, ref.id]};
+                return withLoc({prim: [12, ref.name, ref.id]});
             }
             if (ast.name === 'list' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
                 const ref = resolveListRef(ast.args[0].value);
-                return {prim: [13, ref.name, ref.id]};
+                return withLoc({prim: [13, ref.name, ref.id]});
             }
             if (ast.name === 'broadcast_ref' && ast.args.length === 1 && ast.args[0].kind === 'strlit') {
                 const n = ast.args[0].value;
-                return {prim: [11, n, resolveBroadcastId(n)]};
+                return withLoc({prim: [11, n, resolveBroadcastId(n)]});
             }
             const mathOperator = MATH_OP_NAME_TO_OPERATOR.get(ast.name);
             if (mathOperator && ast.args.length === 1) {
-                const id = addBlock('operator_mathop', {parent: parentId});
+                const id = addBlock('operator_mathop', {parent: parentId, line: astLine(ast), col: astCol(ast)});
                 outBlocks[id].fields.OPERATOR = [mathOperator, null];
                 const r = compileExpr(ast.args[0], id, 4);
                 setInputRef(id, 'NUM', r, 4);
-                return {blockId: id};
+                return withLoc({blockId: id});
             }
-            const def = nameToDef.get(ast.name);
+            const def = getNameDef(ast.name);
             // 裸标识符：无参调用且 def 要么不是 reporter/boolean、要么根本没登记 → 当成对变量/列表的引用。
             // 支持 "a" 这种写法直接代表 var("a")；变量名是下划线化过的，也能反查到真实 VM 变量。
             const defIsExpr = def && (def.kind === 'reporter' || def.kind === 'boolean');
@@ -2031,41 +2215,41 @@ const parsePseudocode = (source, ctx) => {
                 if (currentProcParams && currentProcParams.has(ast.name)) {
                     const t = currentProcParams.get(ast.name);
                     const opcode = t === 'b' ? 'argument_reporter_boolean' : 'argument_reporter_string_number';
-                    const id = addBlock(opcode, {parent: parentId});
+                    const id = addBlock(opcode, {parent: parentId, line: astLine(ast), col: astCol(ast)});
                     outBlocks[id].fields.VALUE = [ast.name, null];
-                    return {blockId: id};
+                    return withLoc({blockId: id});
                 }
                 const declaredOrPending = resolveKnownDataIdent(ast.name);
-                if (declaredOrPending) return declaredOrPending;
+                if (declaredOrPending) return withLoc(declaredOrPending);
                 if (ctxTarget) {
                     if (ctxTarget.lookupVariableByNameAndType) {
                         const vExact = ctxTarget.lookupVariableByNameAndType(ast.name, '');
-                        if (vExact) return {prim: [12, vExact.name, vExact.id]};
+                        if (vExact) return withLoc({prim: [12, vExact.name, vExact.id]});
                         const lExact = ctxTarget.lookupVariableByNameAndType(ast.name, 'list');
-                        if (lExact) return {prim: [13, lExact.name, lExact.id]};
+                        if (lExact) return withLoc({prim: [13, lExact.name, lExact.id]});
                     }
                     const vSan = findBySanitizedName(ast.name, '');
-                    if (vSan) return {prim: [12, vSan.name, vSan.id]};
+                    if (vSan) return withLoc({prim: [12, vSan.name, vSan.id]});
                     const lSan = findBySanitizedName(ast.name, 'list');
-                    if (lSan) return {prim: [13, lSan.name, lSan.id]};
+                    if (lSan) return withLoc({prim: [13, lSan.name, lSan.id]});
                 }
             }
             if (!def) {
                 // reporter 位置 `foo(args)` 兜底：如果 name 能被 resolve 为已知 proccode → procedures_call reporter
                 if (ast.name && isKnownProcName(ast.name)) {
                     const proccode = resolveProccodeFromCallName(ast.name);
-                    return buildProcedureCall(proccode, ast.args, true, parentId);
+                    return withLoc(buildProcedureCall(proccode, ast.args, true, parentId, ast));
                 }
-                errors.push({line: 0, col: 0, message: `未知函数: ${ast.name}`});
-                return {prim: [10, '']};
+                errors.push({line: astLine(ast), col: astCol(ast), message: `未知函数: ${ast.name}`});
+                return withLoc({prim: [10, '']});
             }
             // 建 block
-            const id = addBlock(def.opcode, {parent: parentId});
+            const id = addBlock(def.opcode, {parent: parentId, line: astLine(ast), col: astCol(ast)});
             applyCallArgsToBlock(id, def, ast.args);
-            return {blockId: id};
+            return withLoc({blockId: id});
         }
-        errors.push({line: 0, col: 0, message: `无法编译表达式: ${JSON.stringify(ast)}`});
-        return {prim: [10, '']};
+        errors.push({line: astLine(ast), col: astCol(ast), message: `无法编译表达式: ${JSON.stringify(ast)}`});
+        return withLoc({prim: [10, '']});
     };
 
     // @op("opcode", shadow=?, fields={..}, inputs={..}, mutation="json") 的通用编译。
@@ -2075,11 +2259,24 @@ const parsePseudocode = (source, ctx) => {
         const opArg = ast.args && ast.args[0];
         const opcode = (opArg && opArg.kind === 'strlit') ? opArg.value : '';
         if (!opcode) {
-            errors.push({line: 0, col: 0, message: '@op 需要字符串 opcode 作为第一个参数'});
+            errors.push({line: astLine(ast), col: astCol(ast), message: '@op 需要字符串 opcode 作为第一个参数'});
             return {prim: [10, '']};
         }
+        const staticDef = getOpcodeDef(opcode);
+        const runtimeMeta = runtimeOpcodeMeta.get(opcode);
         const isShadow = !!(kwargs.shadow && kwargs.shadow.kind === 'boollit' && kwargs.shadow.value);
-        const id = addBlock(opcode, {parent: parentId, shadow: isShadow});
+        const id = addBlock(opcode, {parent: parentId, shadow: isShadow, line: astLine(ast), col: astCol(ast)});
+        const kindKeys = ['kind', 'type', 'blockType', 'block_type', 'shape'];
+        let opKind = (staticDef && staticDef.kind) || (runtimeMeta && runtimeMeta.kind);
+        for (const key of kindKeys) {
+            if (!kwargs[key]) continue;
+            const explicitKind = normalizeRuntimeBlockKind(astToPlainString(kwargs[key]));
+            if (explicitKind) {
+                opKind = explicitKind;
+                break;
+            }
+        }
+        if (opKind) genericOpKindById.set(id, opKind);
         if (kwargs.fields && kwargs.fields.kind === 'objlit') {
             for (const entry of kwargs.fields.entries) {
                 const v = astToPlainString(entry.value);
@@ -2094,9 +2291,24 @@ const parsePseudocode = (source, ctx) => {
         if (kwargs.inputs && kwargs.inputs.kind === 'objlit') {
             for (const entry of kwargs.inputs.entries) {
                 const key = entry.key;
-                const r = compileExpr(entry.value, id, null);
-                if (r.blockId) outBlocks[id].inputs[key] = [1, r.blockId];
-                else if (r.prim) outBlocks[id].inputs[key] = [1, r.prim];
+                const staticArg = staticDef && Array.isArray(staticDef.args) ?
+                    staticDef.args.find(arg => arg && arg.type !== 'field' && arg.name === key) : null;
+                const slotMeta = runtimeMeta && runtimeMeta.args ? runtimeMeta.args[key] : null;
+                const expectedPrimType = staticArg ? staticArg.primType :
+                    (slotMeta && slotMeta.kind !== 'field' ? slotMeta.primType : undefined);
+                const r = compileExpr(entry.value, id, expectedPrimType === undefined ? null : expectedPrimType);
+                let ref = null;
+                const child = r.blockId && outBlocks[r.blockId];
+                if (child && !Array.isArray(child) && child.shadow) {
+                    ref = [1, r.blockId];
+                } else if (expectedPrimType !== undefined) {
+                    ref = buildInputRef(r, id, expectedPrimType);
+                } else if (r.blockId) {
+                    ref = [1, r.blockId];
+                } else if (r.prim) {
+                    ref = [1, r.prim];
+                }
+                if (ref) outBlocks[id].inputs[key] = ref;
             }
         }
         return {blockId: id};
@@ -2104,7 +2316,7 @@ const parsePseudocode = (source, ctx) => {
 
     // call("proccode", v1, v2...) / callret(...) 构造 procedures_call block。
     // 按 proccode 找 argumentids（ctxProcedures → VM prototype → hash 兜底），把 input 按位置挂到对应 argumentid key。
-    const buildProcedureCall = (proccode, argAsts, isReturn, parentBlockId) => {
+    const buildProcedureCall = (proccode, argAsts, isReturn, parentBlockId, sourceAst) => {
         const argIds = resolveProcArgIds(proccode, argAsts.length);
         if (!ctxProcedures[proccode]) ctxProcedures[proccode] = argIds;
         // 顺便抄一份 prototype 的 warp 到 call 的 mutation（和 Scratch 生成一致）
@@ -2120,7 +2332,11 @@ const parsePseudocode = (source, ctx) => {
                 }
             }
         }
-        const callId = addBlock('procedures_call', {parent: parentBlockId});
+        const callId = addBlock('procedures_call', {
+            parent: parentBlockId,
+            line: astLine(sourceAst),
+            col: astCol(sourceAst)
+        });
         outBlocks[callId].mutation = {
             tagName: 'mutation',
             children: [],
@@ -2135,7 +2351,7 @@ const parsePseudocode = (source, ctx) => {
             if (r.blockId) outBlocks[callId].inputs[argIds[i]] = [1, r.blockId];
             else if (r.prim) outBlocks[callId].inputs[argIds[i]] = [1, r.prim];
         }
-        return {blockId: callId};
+        return {blockId: callId, line: astLine(sourceAst), col: astCol(sourceAst)};
     };
 
     // 构建一个"输入引用"数组 [type, ref, shadow?]；返回 null 表示"不应该填此输入"
@@ -2143,8 +2359,11 @@ const parsePseudocode = (source, ctx) => {
         const block = outBlocks[blockId];
         if (!block || Array.isArray(block)) return false;
         if (block.opcode === 'argument_reporter_boolean') return true;
-        const def = opcodeToDef.get(block.opcode);
-        return !!(def && def.kind === 'boolean');
+        const def = getOpcodeDef(block.opcode);
+        if (def && def.kind === 'boolean') return true;
+        if (genericOpKindById.get(blockId) === 'boolean') return true;
+        const meta = runtimeOpcodeMeta.get(block.opcode);
+        return !!(meta && meta.kind === 'boolean');
     };
 
     const buildInputRef = (result, parentId, expectedPrimType) => {
@@ -2154,7 +2373,8 @@ const parsePseudocode = (source, ctx) => {
                 if (blockIsBooleanReporter(result.blockId)) return [2, result.blockId];
                 const block = outBlocks[result.blockId];
                 const opcode = block && block.opcode ? block.opcode : result.blockId;
-                errors.push({line: 0, col: 0, message: `${opcode} 不能直接放进布尔输入，请写成比较表达式`});
+                const loc = blockLoc.get(result.blockId) || blockLoc.get(parentId) || result;
+                errors.push({line: tokenLine(loc), col: tokenCol(loc), message: `${opcode} 不能直接放进布尔输入，请写成比较表达式`});
             }
             return null;
         }
@@ -2269,7 +2489,7 @@ const parsePseudocode = (source, ctx) => {
         if (block.opcode === 'control_forever' || block.opcode === 'control_delete_this_clone') {
             return false;
         }
-        const def = opcodeToDef.get(block.opcode);
+        const def = getOpcodeDef(block.opcode);
         return !(def && def.kind === 'cap');
     };
 
@@ -2308,7 +2528,8 @@ const parsePseudocode = (source, ctx) => {
                     outBlocks[tail].next = heads[i + 1];
                     outBlocks[heads[i + 1]].parent = tail;
                 } else {
-                    errors.push({line: 0, col: 0, message: `${outBlocks[tail].opcode} 后面不能继续接语句`});
+                    const loc = blockLoc.get(heads[i + 1]) || blockLoc.get(tail);
+                    errors.push({line: tokenLine(loc), col: tokenCol(loc), message: `${outBlocks[tail].opcode} 后面不能继续接语句`});
                 }
             }
         }
@@ -2319,7 +2540,9 @@ const parsePseudocode = (source, ctx) => {
         kind: 'call',
         name: 'var',
         args: [{kind: 'strlit', value: name}],
-        kwargs: {}
+        kwargs: {},
+        line: 1,
+        col: 1
     });
 
     // 复合赋值：
@@ -2336,14 +2559,18 @@ const parsePseudocode = (source, ctx) => {
         const rhsAst = parseExpression(0);
         if (assignOp === '+=' && isDefinitelyStringExpr(rhsAst)) {
             errors.push({
-                line: opToken.line || 0,
-                col: opToken.col || 0,
+                line: tokenLine(opToken),
+                col: tokenCol(opToken),
                 message: '字符串拼接不能使用 +=；请使用 join(a, b) 后再赋值，例如 name = join(name, "后缀")。'
             });
             return null;
         }
         const ref = resolveVariableRef(name);
-        const id = addBlock(assignOp === '+=' ? 'data_changevariableby' : 'data_setvariableto', {parent: parentBlockId});
+        const id = addBlock(assignOp === '+=' ? 'data_changevariableby' : 'data_setvariableto', {
+            parent: parentBlockId,
+            line: tokenLine(tok),
+            col: tokenCol(tok)
+        });
         outBlocks[id].fields.VARIABLE = [ref.name, ref.id];
         if (assignOp === '+=') {
             const r = compileExpr(rhsAst, id, 4);
@@ -2381,7 +2608,11 @@ const parsePseudocode = (source, ctx) => {
             const t = targetNames[i];
             const valueAst = i === targetNames.length - 1 ? rhsAst : varRefAst(targetNames[i + 1].raw);
             const ref = resolveVariableRef(t.raw);
-            const id = addBlock('data_setvariableto', {parent: parentBlockId});
+            const id = addBlock('data_setvariableto', {
+                parent: parentBlockId,
+                line: tokenLine(t),
+                col: tokenCol(t)
+            });
             outBlocks[id].fields.VARIABLE = [ref.name, ref.id];
             const r = compileExpr(valueAst, id, 10);
             setInputRef(id, 'VALUE', r, 10);
@@ -2463,7 +2694,7 @@ const parsePseudocode = (source, ctx) => {
             return `${hashStr(proccode)}_arg_${i}`;
         });
         const argdefaults = paramTypes.map(t => t === 'b' ? 'false' : '');
-        const protoId = addBlock('procedures_prototype', {parent: null, shadow: true});
+        const protoId = addBlock('procedures_prototype', {parent: null, shadow: true, line: tokenLine(pcTok), col: tokenCol(pcTok)});
         outBlocks[protoId].mutation = {
             tagName: 'mutation',
             children: [],
@@ -2475,11 +2706,11 @@ const parsePseudocode = (source, ctx) => {
         };
         for (let i = 0; i < paramIds.length; i++) {
             const op = paramTypes[i] === 'b' ? 'argument_reporter_boolean' : 'argument_reporter_string_number';
-            const argId = addBlock(op, {parent: protoId, shadow: true});
+            const argId = addBlock(op, {parent: protoId, shadow: true, line: tokenLine(pcTok), col: tokenCol(pcTok)});
             outBlocks[argId].fields.VALUE = [paramNames[i], null];
             outBlocks[protoId].inputs[paramIds[i]] = [1, argId];
         }
-        const defId = addBlock('procedures_definition', {parent: parentBlockId});
+        const defId = addBlock('procedures_definition', {parent: parentBlockId, line: tokenLine(pcTok), col: tokenCol(pcTok)});
         outBlocks[protoId].parent = defId;
         outBlocks[defId].inputs.custom_block = [1, protoId];
         // body：push 当前 proc 的参数上下文，让裸标识符/字符串识别为 argument_reporter_* 引用
@@ -2519,14 +2750,18 @@ const parsePseudocode = (source, ctx) => {
         }
         skipNewlines();
         expect(T.RPAREN);
-        const r = buildProcedureCall(proccode, argAsts, false, parentBlockId);
+        const r = buildProcedureCall(proccode, argAsts, false, parentBlockId, {
+            line: tokenLine(pcTok),
+            col: tokenCol(pcTok)
+        });
         return r.blockId || null;
     };
 
     // return <expr> / return —— 构造 TW 扩展 procedures_return block
     const parseReturn = (parentBlockId) => {
+        const retTok = peek();
         eat(); // 'return'
-        const retId = addBlock('procedures_return', {parent: parentBlockId});
+        const retId = addBlock('procedures_return', {parent: parentBlockId, line: tokenLine(retTok), col: tokenCol(retTok)});
         if (peek().type !== T.NEWLINE && peek().type !== T.RBRACE && peek().type !== T.EOF) {
             const rhs = parseExpression(0);
             const r = compileExpr(rhs, retId, 10);
@@ -2578,7 +2813,7 @@ const parsePseudocode = (source, ctx) => {
                 const nm = t0.value;
                 // 排除关键字（define/call/return/@op/at）和已登记的语句 opcode
                 if (nm === 'define' || nm === 'call' || nm === 'return' || nm === '@op' || nm === 'at') return null;
-                const def = nameToDef.get(nm);
+                const def = getNameDef(nm);
                 if (def && (def.kind === 'hat' || def.kind === 'stmt' || def.kind === 'c' || def.kind === 'if-else' || def.kind === 'cap')) return null;
                 if (isKnownProcName(nm)) return nm;
                 return null;
@@ -2586,6 +2821,7 @@ const parsePseudocode = (source, ctx) => {
             return null;
         })();
         if (implicitProc != null) {
+            const procTok = peek();
             const proccode = resolveProccodeFromCallName(implicitProc);
             eat(); // name token
             eat(); // LPAREN
@@ -2601,7 +2837,10 @@ const parsePseudocode = (source, ctx) => {
             }
             skipNewlines();
             expect(T.RPAREN);
-            const r = buildProcedureCall(proccode, argAsts, false, parentBlockId);
+            const r = buildProcedureCall(proccode, argAsts, false, parentBlockId, {
+                line: tokenLine(procTok),
+                col: tokenCol(procTok)
+            });
             return r.blockId || null;
         }
         // 优先识别赋值：IDENT = ... / STRING = ...（含连等）
@@ -2631,11 +2870,11 @@ const parsePseudocode = (source, ctx) => {
         }
         // @op 语句：绕开常规 def 分发，直接用通用路径构造 block（不接 substack）
         if (name === '@op') {
-            const ast = {kind: 'call', name: '@op', args, kwargs};
+            const ast = {kind: 'call', name: '@op', args, kwargs, line: t.line, col: t.col};
             const r = compileOpCall(ast, parentBlockId);
             return r.blockId || null;
         }
-        const def = nameToDef.get(name);
+        const def = getNameDef(name);
         if (!def) {
             errors.push({line: t.line, col: t.col, message: `未知语句: ${name}`});
             return null;
@@ -2662,7 +2901,7 @@ const parsePseudocode = (source, ctx) => {
 
         // 特判：if 跟两个主体 → 升级为 control_if_else（渲染时会写 if (...) { } else { }）
         if (name === 'if' && subBodies.length === 2) {
-            const blockId = addBlock('control_if_else', {parent: parentBlockId});
+            const blockId = addBlock('control_if_else', {parent: parentBlockId, line: t.line, col: t.col});
             applyCallArgsToBlock(blockId, def, args); // CONDITION 槽位一样
             if (subBodies[0]) {
                 outBlocks[blockId].inputs.SUBSTACK = [2, subBodies[0]];
@@ -2674,7 +2913,7 @@ const parsePseudocode = (source, ctx) => {
             }
             return blockId;
         }
-        const blockId = addBlock(def.opcode, {parent: parentBlockId});
+        const blockId = addBlock(def.opcode, {parent: parentBlockId, line: t.line, col: t.col});
         applyCallArgsToBlock(blockId, def, args);
         if (def.opcode === 'control_stop') applyControlStopMutation(blockId);
         if (def.substacks && def.substacks.length) {
@@ -2837,7 +3076,7 @@ const parsePseudocode = (source, ctx) => {
         }
         // IDENT 且是已知 hat/stmt/c/if-else/cap → 解析为语句；否则回退到表达式（浮动 reporter）
         if (after.type === T.IDENT) {
-            const def = nameToDef.get(after.value);
+            const def = getNameDef(after.value);
             const asStmt = def && (def.kind === 'hat' || def.kind === 'stmt' || def.kind === 'c' || def.kind === 'if-else' || def.kind === 'cap');
             const isProcKeyword = after.value === 'define' || after.value === 'call' || after.value === 'return';
             // 裸 `foo(args)` 若 foo 是已知 proccode 的 name → 作 stmt procedures_call
