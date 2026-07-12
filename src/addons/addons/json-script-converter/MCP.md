@@ -113,6 +113,20 @@ as `get_target_info`, `get_pseudocode`, `search_text`, `list_extensions`,
 `create_bitmap_costume`, `replace_bitmap_costume`, `edit_pseudocode`,
 `click_green_flag`, `click_pause`, and `click_stop`.
 
+Call `get_pseudocode` with an empty argument object to fetch every sprite in a
+single response:
+
+```json
+{}
+```
+
+The full result contains `scope: "all_sprites"`, `targetCount`, and a `fetched`
+array. Every item includes the target metadata, `totalLines`, and the complete
+`pseudocode` text. Set `includeStage: true` to include the stage as well. The
+explicit aliases `targetRefs: ["all_sprites"]` and `targetRefs: ["all"]` mean
+all sprites and all targets (stage plus sprites), respectively. Supplying
+specific target refs and optional line ranges remains supported.
+
 `create_bitmap_costume` and `replace_bitmap_costume` accept `imageData` as a
 base64 data URL for PNG, JPEG, WebP, BMP, or GIF. Raw base64 is also accepted;
 set `mimeType` when it is not PNG. The page validates and decodes the image,

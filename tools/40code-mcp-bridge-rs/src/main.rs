@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVER_NAME: &str = "40code-json-script-converter";
-const SERVER_VERSION: &str = "0.3.0-native";
+const SERVER_VERSION: &str = "0.4.0-native";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const LEGACY_BRIDGE_PATH: &str = "/json-script-converter/mcp";
 const PSEUDOCODE_SYNTAX_URI: &str = "jsc://pseudocode/syntax";
@@ -34,7 +34,7 @@ Use this syntax when calling edit_pseudocode. The pseudocode is converted to Scr
 
 Workflow:
 1. Call get_target_info to learn targetRef values.
-2. Call get_pseudocode for targets you will modify.
+2. Call get_pseudocode for targets you will modify. Omit targetRefs to read every sprite in one response; set includeStage to true to include the stage.
 3. Create or replace SVG costumes/backdrops for vector UI. Use the bitmap costume tools when complete bitmap image data is available.
 4. Apply code with edit_pseudocode.
 
@@ -257,8 +257,15 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "get_pseudocode",
-            "Read pseudocode for one or more targets.",
-            json!({"targetRefs": array_prop("Target refs."), "startLine": number_prop("Optional 1-based start line."), "endLine": number_prop("Optional 1-based end line."), "lineRanges": {"type": "array", "items": object_prop("Line range.")}}),
+            "Read pseudocode for selected targets or every sprite in one response. With no arguments, returns all sprites and their complete pseudocode.",
+            json!({
+                "targetRefs": array_prop("Target refs such as [\"a\", \"b\"]. Use [\"all_sprites\"] for every sprite or [\"all\"] for the stage and every sprite. Empty means every sprite."),
+                "allSprites": bool_prop("Read every sprite. This is the default when targetRefs is omitted."),
+                "includeStage": bool_prop("Also include the stage when reading every sprite."),
+                "startLine": number_prop("Optional 1-based start line."),
+                "endLine": number_prop("Optional 1-based end line."),
+                "lineRanges": {"type": "array", "items": object_prop("Line range.")}
+            }),
             &[],
         ),
         tool(
@@ -551,7 +558,7 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
             json!({
                 "protocolVersion": message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
                 "capabilities": {"tools": {}, "resources": {}},
-                "instructions": format!("This server edits 40code/Scratch projects through the json-script-converter addon. Before calling edit_pseudocode, read {} with resources/read or call jsc_get_pseudocode_syntax. Use the SVG costume tools for vector content and the bitmap costume tools for complete bitmap image data.", PSEUDOCODE_SYNTAX_URI),
+                "instructions": format!("This server edits 40code/Scratch projects through the json-script-converter addon. Before calling edit_pseudocode, read {} with resources/read or call jsc_get_pseudocode_syntax. Call get_pseudocode with no arguments to read every sprite in one response; set includeStage to true to include the stage. Use the SVG costume tools for vector content and the bitmap costume tools for complete bitmap image data.", PSEUDOCODE_SYNTAX_URI),
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}
             }),
         ),
@@ -1251,6 +1258,32 @@ mod tests {
         assert!(message.contains("已经在运行"));
         assert!(message.contains("无需重复启动"));
         assert!(message.contains("启用 MCP 桥接"));
+    }
+
+    #[test]
+    fn get_pseudocode_schema_supports_reading_every_sprite() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("get_pseudocode"))
+            .expect("get_pseudocode tool definition");
+        assert_eq!(
+            definition
+                .pointer("/inputSchema/properties/allSprites/type")
+                .and_then(Value::as_str),
+            Some("boolean")
+        );
+        assert_eq!(
+            definition
+                .pointer("/inputSchema/properties/includeStage/type")
+                .and_then(Value::as_str),
+            Some("boolean")
+        );
+        assert!(
+            definition
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("no arguments"))
+        );
     }
 
     #[test]

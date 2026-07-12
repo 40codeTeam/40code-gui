@@ -3792,8 +3792,23 @@ export default async ({addon, console, msg}) => {
                 }
             };
         }
-        if (type === 'get_pseudocode' && (targetIds.length || lineRanges.some(range => range.targetId))) {
-            return {ok: true, tool: {type: 'get_pseudocode', targetIds, lineRanges}};
+        if (type === 'get_pseudocode') {
+            const scope = String(parsed.scope || '').trim().toLowerCase();
+            return {
+                ok: true,
+                tool: {
+                    type: 'get_pseudocode',
+                    targetIds,
+                    lineRanges,
+                    allSprites: parsed.allSprites === true ||
+                        parsed.allCharacters === true ||
+                        scope === 'sprites' ||
+                        scope === 'all_sprites' ||
+                        scope === 'characters' ||
+                        scope === 'all_characters',
+                    includeStage: parsed.includeStage === true
+                }
+            };
         }
         if (type === 'search_text' || type === 'find_text' || type === 'search_pseudocode') {
             const query = String(parsed.query || parsed.text || parsed.pattern || parsed.keyword || '').trim();
@@ -7390,6 +7405,37 @@ export default async ({addon, console, msg}) => {
                 }
                 return {targets, errors};
             };
+            const resolvePseudocodeTargets = pseudocodeTool => {
+                const requested = (Array.isArray(pseudocodeTool && pseudocodeTool.targetIds) ?
+                    pseudocodeTool.targetIds : [])
+                    .map(item => String(item).trim())
+                    .filter(Boolean);
+                const normalized = requested.map(item => item.toLowerCase());
+                const wantsAllTargets = normalized.some(item => item === '*' || item === 'all' || item === 'all_targets');
+                const wantsAllSprites = !!(pseudocodeTool && pseudocodeTool.allSprites) ||
+                    !requested.length ||
+                    normalized.some(item =>
+                        item === 'all_sprites' ||
+                        item === 'sprites' ||
+                        item === 'all_characters' ||
+                        item === 'characters' ||
+                        item === '所有角色' ||
+                        item === '全部角色'
+                    );
+                if (wantsAllTargets) {
+                    return {targets: getAiTargets(vm), errors: [], scope: 'all_targets'};
+                }
+                if (wantsAllSprites) {
+                    const allTargets = getAiTargets(vm);
+                    const sprites = allTargets.filter(target => !target.isStage);
+                    const targets = pseudocodeTool && pseudocodeTool.includeStage ?
+                        allTargets.filter(target => target.isStage).concat(sprites) :
+                        sprites;
+                    return {targets, errors: [], scope: pseudocodeTool && pseudocodeTool.includeStage ?
+                        'all_targets' : 'all_sprites'};
+                }
+                return {...resolveRequestedTargets(requested), scope: 'selected'};
+            };
             if (tool.type === 'list_extensions') {
                 const result = await this.listAiExtensions(tool);
                 if (messageId) this.addAiMessageDetail(messageId, '扩展列表', formatAiExtensionsDetail(result));
@@ -7526,6 +7572,8 @@ export default async ({addon, console, msg}) => {
             const snippets = [];
             const errors = [];
             const lineRanges = Array.isArray(tool.lineRanges) ? tool.lineRanges : [];
+            const resolvedPseudocodeTargets = resolvePseudocodeTargets(tool);
+            errors.push(...resolvedPseudocodeTargets.errors);
             if (lineRanges.length) {
                 const genericRanges = lineRanges.filter(range => !(range && range.targetId));
                 const targetSpecificRanges = lineRanges.filter(range => range && range.targetId);
@@ -7539,13 +7587,8 @@ export default async ({addon, console, msg}) => {
                     }
                     targetRangeMap.get(target.id).ranges.push(range);
                 };
-                for (const requested of tool.targetIds || []) {
-                    const resolved = this.resolveAiTarget(requested);
-                    if (!resolved.target) {
-                        errors.push(resolved.error || `找不到角色: ${requested}`);
-                        continue;
-                    }
-                    genericRanges.forEach(range => addRangeForTarget(resolved.target, range));
+                for (const target of resolvedPseudocodeTargets.targets) {
+                    genericRanges.forEach(range => addRangeForTarget(target, range));
                 }
                 for (const range of targetSpecificRanges) {
                     const resolved = this.resolveAiTarget(range.targetId);
@@ -7581,33 +7624,59 @@ export default async ({addon, console, msg}) => {
                     }
                 }
                 if (errors.length) {
-                    return {ok: false, type: 'get_pseudocode', mode: 'snippet', error: errors.join(' | '), fetched, snippets};
+                    return {
+                        ok: false,
+                        type: 'get_pseudocode',
+                        mode: 'snippet',
+                        scope: resolvedPseudocodeTargets.scope,
+                        error: errors.join(' | '),
+                        fetched,
+                        snippets
+                    };
                 }
-                return {ok: true, type: 'get_pseudocode', mode: 'snippet', fetched, snippets};
+                return {
+                    ok: true,
+                    type: 'get_pseudocode',
+                    mode: 'snippet',
+                    scope: resolvedPseudocodeTargets.scope,
+                    targetCount: targetRangeMap.size,
+                    fetched,
+                    snippets
+                };
             }
-            for (const requested of tool.targetIds || []) {
-                const resolved = this.resolveAiTarget(requested);
-                if (!resolved.target) {
-                    errors.push(resolved.error || `找不到角色: ${requested}`);
-                    continue;
-                }
-                const target = resolved.target;
-                if (knownTargetTexts.has(target.id)) {
-                    fetched.push({...this.getAiTargetSummary(target, {includeCostumes: false}), cached: true});
-                    continue;
-                }
+            for (const target of resolvedPseudocodeTargets.targets) {
                 try {
-                    const pseudocode = this.getTargetPseudocode(target, currentText);
-                    knownTargetTexts.set(target.id, pseudocode);
+                    const cached = knownTargetTexts.has(target.id);
+                    const pseudocode = this.getAiToolPseudocodeText(
+                        target,
+                        knownTargetTexts,
+                        currentText
+                    );
+                    if (!cached) knownTargetTexts.set(target.id, pseudocode);
                     const summary = this.getAiTargetSummary(target, {includeCostumes: false});
-                    fetched.push(summary);
-                    this.addAiMessageDetail(messageId, `已读取的伪代码 - ${summary.targetName}`, pseudocode);
+                    fetched.push({
+                        ...summary,
+                        cached,
+                        totalLines: splitAiLines(pseudocode).length,
+                        pseudocode
+                    });
+                    if (messageId && !cached) {
+                        this.addAiMessageDetail(messageId, `已读取的伪代码 - ${summary.targetName}`, pseudocode);
+                    }
                 } catch (err) {
                     errors.push(`${getAiTargetName(target)}: ${err.message}`);
                 }
             }
-            if (errors.length) return {ok: false, type: 'get_pseudocode', error: errors.join(' | '), fetched};
-            return {ok: true, type: 'get_pseudocode', fetched};
+            const result = {
+                ok: !errors.length,
+                type: 'get_pseudocode',
+                mode: 'full',
+                scope: resolvedPseudocodeTargets.scope,
+                targetCount: fetched.length,
+                fetched
+            };
+            if (errors.length) result.error = errors.join(' | ');
+            return result;
         };
 
         normalizeAiEditPayload = (payload, knownTargetTexts) => {
@@ -7965,7 +8034,20 @@ export default async ({addon, console, msg}) => {
                     if (tool && tool.type === 'click_green_flag') return `${prefix}点击绿旗`;
                     if (tool && tool.type === 'click_pause') return `${prefix}点击暂停`;
                     if (tool && tool.type === 'click_stop') return `${prefix}点击停止`;
-                    if (tool && tool.type === 'get_pseudocode') return `${prefix}查看伪代码`;
+                    if (tool && tool.type === 'get_pseudocode') {
+                        const requested = Array.isArray(tool.targetIds) ? tool.targetIds : [];
+                        const normalized = requested.map(item => String(item).trim().toLowerCase());
+                        if (normalized.some(item => item === '*' || item === 'all' || item === 'all_targets')) {
+                            return `${prefix}查看全部目标伪代码`;
+                        }
+                        if (tool.allSprites || !requested.length || normalized.some(item =>
+                            item === 'all_sprites' || item === 'sprites' ||
+                            item === 'all_characters' || item === 'characters'
+                        )) {
+                            return `${prefix}查看所有角色伪代码`;
+                        }
+                        return `${prefix}查看伪代码`;
+                    }
                     if (tool && tool.type === 'create_sprite') return `${prefix}创建角色${tool.name ? `：${tool.name}` : ''}`;
                     if (tool && tool.type === 'delete_sprite') return `${prefix}删除角色`;
                     if (tool && tool.type === 'create_costume') return `${prefix}创建造型/背景${tool.name ? `：${tool.name}` : ''}`;
@@ -8210,6 +8292,8 @@ export default async ({addon, console, msg}) => {
                                 toolType: 'get_pseudocode',
                                 mode: 'full',
                                 ok: true,
+                                scope: toolResult.scope,
+                                targetCount: toolResult.targetCount,
                                 fetched: toolResult.fetched
                             }
                         };
@@ -8635,12 +8719,13 @@ export default async ({addon, console, msg}) => {
                         'context.extensions.core 是 Scratch 打开就自带的核心分类；context.extensions.loaded 是当前已加载扩展；context.extensions.localAvailable 是本地已存在、可加载的扩展薄列表，只包含 id/name/loaded/hardware，不包含未加载扩展的 opcode 表。伪代码里使用扩展 opcode 时，插件会在应用前自动加载可识别的本地扩展，例如 pen/music/microbit。远程扩展不会靠 opcode 自动猜测 URL；使用远程扩展前必须先调用 list_extensions 搜索或 load_extension 传入 url/slug。找不到或不能自动加载的扩展会让伪代码应用失败。',
                         '加载扩展只表示项目可以使用该扩展，不表示你已经知道它的 opcode 和参数。需要编写某个已加载扩展的积木时，先调用 get_extension_blocks 获取 opcode 表、参数槽和 @op 示例；未列入 context.keywords 的扩展积木必须使用 @op("完整opcode", inputs={...}, fields={...})。',
                         '如果 load_extension 的 tool_result 带有 nextSuggestedAction，请优先按这个 extensionId 调用 get_extension_blocks；URL 加载的远程扩展尤其需要这样获取真实 id。',
-                        'availablePseudocode 中已有的伪代码可以直接使用，且带有 totalLines/numberedLines 行号；没有的目标需要用 get_pseudocode 读取。currentPseudocode 是当前选中目标的原始伪代码，行号以 availablePseudocode 为准。',
+                        'availablePseudocode 中已有的伪代码可以直接使用，且带有 totalLines/numberedLines 行号；没有的目标需要用 get_pseudocode 读取。get_pseudocode 不传 targetRefs 时会一次返回所有角色；includeStage 为 true 时同时返回舞台。currentPseudocode 是当前选中目标的原始伪代码，行号以 availablePseudocode 为准。',
                         `查看扩展列表或搜索远程扩展：${AI_ACTION_OPEN}{"type":"list_extensions","query":"clones","includeRemote":true}${AI_ACTION_CLOSE}`,
                         `加载扩展：${AI_ACTION_OPEN}{"type":"load_extension","extensionId":"pen"}${AI_ACTION_CLOSE}`,
                         `查看已加载扩展 opcode 表：${AI_ACTION_OPEN}{"type":"get_extension_blocks","extensionId":"pen"}${AI_ACTION_CLOSE}`,
                         `加载 TurboWarp 远程扩展：${AI_ACTION_OPEN}{"type":"load_extension","slug":"clones"}${AI_ACTION_CLOSE} 或 ${AI_ACTION_OPEN}{"type":"load_extension","url":"https://extensions.turbowarp.org/xxx.js"}${AI_ACTION_CLOSE}`,
                         `读取伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"]}${AI_ACTION_CLOSE}`,
+                        `一次读取所有角色伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode"}${AI_ACTION_CLOSE}`,
                         `读取指定行：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"],"startLine":3,"endLine":8}${AI_ACTION_CLOSE}`,
                         `查找文本：${AI_ACTION_OPEN}{"type":"search_text","query":"当前关卡","targetRefs":["a"],"caseSensitive":false,"regex":false}${AI_ACTION_CLOSE}`,
                         `点击绿旗：${AI_ACTION_OPEN}{"type":"click_green_flag"}${AI_ACTION_CLOSE}`,

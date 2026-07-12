@@ -11,7 +11,7 @@ const normalizeHttpPath = value => {
 };
 
 const SERVER_NAME = '40code-json-script-converter';
-const SERVER_VERSION = '0.3.0';
+const SERVER_VERSION = '0.4.0';
 const PROTOCOL_VERSION = '2025-06-18';
 const HOST = process.env.JSC_MCP_HOST || '127.0.0.1';
 const PORT = Number(process.env.JSC_MCP_PORT || 47740);
@@ -27,6 +27,7 @@ const SERVER_INSTRUCTIONS = [
     'This server edits 40code/Scratch projects through the json-script-converter addon.',
     `Before calling edit_pseudocode for the first time, read ${PSEUDOCODE_SYNTAX_URI} with resources/read or call jsc_get_pseudocode_syntax.`,
     'Use get_target_info and get_pseudocode to inspect the current project before editing.',
+    'Call get_pseudocode with no arguments to read every sprite in one response; set includeStage to true to include the stage.',
     'Use create_svg_costume and replace_svg_costume for vector UI elements.',
     'Use create_bitmap_costume and replace_bitmap_costume when complete bitmap image data is available.'
 ].join(' ');
@@ -39,7 +40,7 @@ Use this syntax when calling edit_pseudocode. The pseudocode is converted to Scr
 ## Workflow
 
 1. Call get_target_info to learn targetRef values for the stage and sprites.
-2. Call get_pseudocode for targets you will modify.
+2. Call get_pseudocode for targets you will modify. Omit targetRefs to read every sprite in one response; set includeStage to true to include the stage.
 3. Create or replace vector costumes/backdrops with create_svg_costume or replace_svg_costume when the project needs visible UI. Use create_bitmap_costume or replace_bitmap_costume for bitmap image data.
 4. Apply code with edit_pseudocode. For simple changes use mode: "replace" and pass targetRef plus full pseudocode.
 
@@ -216,8 +217,10 @@ const TOOL_DEFINITIONS = [
     tool('get_target_info', 'List target/sprite/stage metadata. Use targetRefs/targetIds to limit targets.', {
         targetRefs: arrayProp({type: 'string'}, 'Target refs such as ["a", "b"]. Empty means all targets.')
     }),
-    tool('get_pseudocode', 'Read pseudocode for one or more targets, optionally limited to line ranges.', {
-        targetRefs: arrayProp({type: 'string'}, 'Target refs such as ["a", "b"].'),
+    tool('get_pseudocode', 'Read pseudocode for selected targets or every sprite in one response. With no arguments, returns all sprites and their complete pseudocode.', {
+        targetRefs: arrayProp({type: 'string'}, 'Target refs such as ["a", "b"]. Use ["all_sprites"] for every sprite or ["all"] for the stage and every sprite. Empty means every sprite.'),
+        allSprites: booleanProp('Read every sprite. This is the default when targetRefs is omitted.'),
+        includeStage: booleanProp('Also include the stage when reading every sprite.'),
         startLine: numberProp('Optional 1-based start line for a single range.'),
         endLine: numberProp('Optional 1-based end line for a single range.'),
         lineRanges: arrayProp(objectProp('Line range with targetRef/startLine/endLine.'), 'Optional per-target ranges.')
