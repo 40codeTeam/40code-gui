@@ -314,6 +314,7 @@ const corsHeaders = () => ({
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id',
+    'Access-Control-Allow-Private-Network': 'true',
     'Access-Control-Expose-Headers': 'Mcp-Session-Id',
     'Cache-Control': 'no-store'
 });

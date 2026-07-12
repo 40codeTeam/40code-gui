@@ -1529,6 +1529,8 @@ export default async ({addon, console, msg}) => {
     const AI_REQUEST_RETRY_BASE_DELAY = 800;
     const AI_REQUEST_RETRY_MAX_DELAY = 6000;
     const AI_MCP_BRIDGE_DEFAULT_URL = 'http://127.0.0.1:47740';
+    const AI_MCP_BRIDGE_EXE_NAME = '40code-mcp-bridge-small.exe';
+    const AI_MCP_BRIDGE_EXE_DOWNLOAD_URL = '40code-mcp-bridge/40code-mcp-bridge-small.exe';
     const AI_MCP_BRIDGE_LEGACY_PATH_RE = /\/json-script-converter\/mcp\/?$/;
     const AI_MCP_BRIDGE_STORAGE_KEY = 'jsonScriptConverter.mcpBridgeUrl.v1';
     const AI_MCP_BRIDGE_ENABLED_STORAGE_KEY = 'jsonScriptConverter.mcpBridgeEnabled.v1';
@@ -1563,6 +1565,19 @@ export default async ({addon, console, msg}) => {
     const normalizeMcpBridgeUrl = url => {
         const value = String(url || AI_MCP_BRIDGE_DEFAULT_URL).trim().replace(/\/+$/, '');
         return (value.replace(AI_MCP_BRIDGE_LEGACY_PATH_RE, '') || AI_MCP_BRIDGE_DEFAULT_URL);
+    };
+    const formatMcpBridgeStatus = status => {
+        const value = String(status || 'disabled');
+        if (value.startsWith('desktop-start-failed:')) {
+            return `桌面端 MCP 启动失败：${value.slice('desktop-start-failed:'.length).trim() || '未知错误'}`;
+        }
+        return ({
+            disabled: '未启用',
+            starting: '启动中',
+            connecting: '连接中',
+            connected: '已连接',
+            offline: '未连接'
+        })[value] || value;
     };
     const loadMcpBridgeUrl = () => {
         try {
@@ -10194,38 +10209,62 @@ export default async ({addon, console, msg}) => {
                                             }}>
                                                 启用 MCP 桥接
                                             </span>
-                                            <span style={{
-                                                display: 'block',
-                                                marginTop: 3,
-                                                color: '#64748b',
-                                                fontSize: 12,
-                                                lineHeight: 1.45
-                                            }}>
-                                                {hasDesktopMcpApi
-                                                    ? '开启后桌面端会启动本地 MCP 服务，并允许外部客户端调用当前页面工具。'
-                                                    : '开启后页面会连接本地 MCP 服务；需要外部先启动 mcp-server.cjs。'}
-                                            </span>
+                                            {mcpBridgeEnabled ? (
+                                                <span style={{
+                                                    display: 'block',
+                                                    marginTop: 3,
+                                                    color: '#64748b',
+                                                    fontSize: 12,
+                                                    lineHeight: 1.45
+                                                }}>
+                                                    {hasDesktopMcpApi
+                                                        ? '开启后桌面端会启动本地 MCP 服务，并允许外部客户端调用当前页面工具。'
+                                                        : (
+                                                            <React.Fragment>
+                                                                需要先
+                                                                <a
+                                                                    href={AI_MCP_BRIDGE_EXE_DOWNLOAD_URL}
+                                                                    download={AI_MCP_BRIDGE_EXE_NAME}
+                                                                    onClick={event => event.stopPropagation()}
+                                                                    onMouseDown={event => event.stopPropagation()}
+                                                                    style={{
+                                                                        color: '#2563eb',
+                                                                        fontWeight: 700,
+                                                                        textDecoration: 'none'
+                                                                    }}
+                                                                >
+                                                                    下载并运行 {AI_MCP_BRIDGE_EXE_NAME}
+                                                                </a>
+                                                                ，再开启桥接。
+                                                            </React.Fragment>
+                                                        )}
+                                                </span>
+                                            ) : null}
                                         </span>
                                     </label>
-                                    <input
-                                        ref={this.mcpBridgeUrlRef}
-                                        value={mcpBridgeUrl}
-                                        placeholder={AI_MCP_BRIDGE_DEFAULT_URL}
-                                        onChange={this.handleMcpBridgeUrlChange}
-                                        onBlur={this.handleMcpBridgeUrlBlur}
-                                        style={{
-                                            ...fieldStyle,
-                                            height: 30,
-                                            fontSize: 12
-                                        }}
-                                    />
-                                    <div style={{
-                                        color: mcpBridgeEnabled && mcpBridgeStatus === 'connected' ? '#047857' : '#64748b',
-                                        fontSize: 12,
-                                        lineHeight: 1.35
-                                    }}>
-                                        MCP 状态：{mcpBridgeStatus}
-                                    </div>
+                                    {mcpBridgeEnabled ? (
+                                        <React.Fragment>
+                                            <input
+                                                ref={this.mcpBridgeUrlRef}
+                                                value={mcpBridgeUrl}
+                                                placeholder={AI_MCP_BRIDGE_DEFAULT_URL}
+                                                onChange={this.handleMcpBridgeUrlChange}
+                                                onBlur={this.handleMcpBridgeUrlBlur}
+                                                style={{
+                                                    ...fieldStyle,
+                                                    height: 30,
+                                                    fontSize: 12
+                                                }}
+                                            />
+                                            <div style={{
+                                                color: mcpBridgeStatus === 'connected' ? '#047857' : '#64748b',
+                                                fontSize: 12,
+                                                lineHeight: 1.35
+                                            }}>
+                                                MCP 状态：{formatMcpBridgeStatus(mcpBridgeStatus)}
+                                            </div>
+                                        </React.Fragment>
+                                    ) : null}
                                 </div>
                                 <div style={{
                                     display: 'grid',
