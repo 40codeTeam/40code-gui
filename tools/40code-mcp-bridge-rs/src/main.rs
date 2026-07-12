@@ -360,6 +360,19 @@ fn to_mcp_content(result: Value) -> Value {
     })
 }
 
+fn bridge_url(config: &Config) -> String {
+    format!(
+        "http://{}:{}{}",
+        config.host,
+        config.port,
+        if config.bridge_path == "/" {
+            "/"
+        } else {
+            &config.bridge_path
+        }
+    )
+}
+
 fn get_bridge_status(shared: &Shared) -> Value {
     let now = Instant::now();
     let state = shared.state.lock().unwrap();
@@ -367,10 +380,12 @@ fn get_bridge_status(shared: &Shared) -> Value {
         .clients
         .values()
         .map(|client| {
+            let last_seen_ms = now.duration_since(client.last_seen).as_millis() as u64;
             json!({
                 "clientId": client.client_id,
                 "title": client.title,
-                "lastSeenAgoMs": now.duration_since(client.last_seen).as_millis() as u64
+                "lastSeenAgoMs": last_seen_ms,
+                "lastSeenText": format!("{} 秒前", last_seen_ms / 1000)
             })
         })
         .collect();
@@ -385,21 +400,53 @@ fn get_bridge_status(shared: &Shared) -> Value {
             .unwrap_or(u64::MAX)
             <= shared.config.client_ttl.as_millis() as u64
     });
+    let status = if connected {
+        "connected"
+    } else {
+        "waiting_for_page"
+    };
+    let status_text = if connected {
+        "已连接：网页端已经接入本地桥接器，AI 软件可以调用当前页面工具"
+    } else {
+        "等待网页连接：请在页面里勾选“启用 MCP 桥接”"
+    };
+    let bridge_url = bridge_url(&shared.config);
+    let mcp_http_url = format!(
+        "http://{}:{}{}",
+        shared.config.host, shared.config.port, shared.config.mcp_http_path
+    );
+    let pending_calls = state.calls.len();
+    let waiting_results = state.pending.len();
     json!({
         "ok": true,
+        "message": "40code MCP 本地桥接器正在运行。",
+        "status": status,
+        "statusText": status_text,
+        "summary": format!(
+            "运行中；{}；待发送任务 {} 个，等待返回结果 {} 个。",
+            status_text,
+            pending_calls,
+            waiting_results
+        ),
         "bridge": {
+            "name": "40code MCP 本地桥接器",
             "host": shared.config.host,
             "port": shared.config.port,
             "path": shared.config.bridge_path,
             "legacyPath": LEGACY_BRIDGE_PATH,
-            "bridgeUrl": format!("http://{}:{}{}", shared.config.host, shared.config.port, if shared.config.bridge_path == "/" { "/" } else { &shared.config.bridge_path }),
+            "bridgeUrl": bridge_url,
             "legacyBridgeUrl": format!("http://{}:{}{}", shared.config.host, shared.config.port, LEGACY_BRIDGE_PATH),
-            "mcpHttpUrl": format!("http://{}:{}{}", shared.config.host, shared.config.port, shared.config.mcp_http_path),
+            "mcpHttpUrl": mcp_http_url,
             "rootMcpHttpUrl": format!("http://{}:{}/", shared.config.host, shared.config.port),
             "connected": connected,
+            "status": status,
+            "statusText": status_text,
+            "pageHint": "网页端请连接 bridgeUrl；AI 软件请连接 mcpHttpUrl。",
             "clients": clients,
-            "pendingCalls": state.calls.len(),
-            "waitingResults": state.pending.len()
+            "pendingCalls": pending_calls,
+            "pendingCallsText": format!("待发送任务 {} 个", pending_calls),
+            "waitingResults": waiting_results,
+            "waitingResultsText": format!("等待返回结果 {} 个", waiting_results)
         }
     })
 }
@@ -415,7 +462,7 @@ fn has_active_client(shared: &Shared) -> bool {
 
 fn enqueue_bridge_call(shared: &Shared, name: String, args: Value) -> Result<Value, String> {
     if !has_active_client(shared) {
-        return Err("No 40code page is connected. Open the editor page with json-script-converter enabled, then retry.".to_string());
+        return Err("没有网页端连接到本地桥接器。请打开 40code 网页，进入 json-script-converter，并勾选“启用 MCP 桥接”后重试。".to_string());
     }
     let id = make_call_id(shared);
     let (tx, rx) = mpsc::channel();
@@ -438,7 +485,7 @@ fn enqueue_bridge_call(shared: &Shared, name: String, args: Value) -> Result<Val
     match rx.recv_timeout(shared.config.call_timeout) {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "Timed out waiting for 40code page result after {}ms",
+            "等待网页端返回结果超时，已等待 {} 毫秒。",
             shared.config.call_timeout.as_millis()
         )),
     }
@@ -457,7 +504,7 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     if method.is_empty() {
-        return Some(rpc_error(id, -32600, "Missing method"));
+        return Some(rpc_error(id, -32600, "JSON-RPC 请求缺少 method 字段。"));
     }
     if method.starts_with("notifications/") {
         return None;
@@ -484,7 +531,7 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             if name.is_empty() {
-                rpc_error(id, -32602, "tools/call missing params.name")
+                rpc_error(id, -32602, "tools/call 请求缺少 params.name。")
             } else if name == "jsc_bridge_status" {
                 rpc_result(id, to_mcp_content(get_bridge_status(shared)))
             } else if name == "jsc_get_pseudocode_syntax" {
@@ -505,8 +552,8 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
             id,
             json!({"resources": [{
                 "uri": PSEUDOCODE_SYNTAX_URI,
-                "name": "40code pseudocode syntax",
-                "description": "Syntax guide and examples for edit_pseudocode.",
+                "name": "40code 伪代码语法",
+                "description": "edit_pseudocode 使用的语法说明和示例。",
                 "mimeType": "text/markdown"
             }]}),
         ),
@@ -521,11 +568,11 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
                     json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": PSEUDOCODE_SYNTAX_GUIDE}]}),
                 )
             } else {
-                rpc_error(id, -32602, format!("Unknown resource: {uri}"))
+                rpc_error(id, -32602, format!("未知资源：{uri}"))
             }
         }
         "prompts/list" => rpc_result(id, json!({"prompts": []})),
-        _ => rpc_error(id, -32601, format!("Method not found: {method}")),
+        _ => rpc_error(id, -32601, format!("不支持的 MCP 方法：{method}")),
     };
     Some(response)
 }
@@ -738,7 +785,11 @@ fn handle_mcp_http(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         send_json(
             stream,
             403,
-            rpc_error(Value::Null, -32000, "Forbidden origin"),
+            rpc_error(
+                Value::Null,
+                -32000,
+                "当前网页来源不允许连接本地 MCP 桥接器。",
+            ),
         );
         return;
     }
@@ -761,11 +812,7 @@ fn handle_mcp_http(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         send_json(
             stream,
             400,
-            rpc_error(
-                Value::Null,
-                -32600,
-                "Expected a single JSON-RPC message object",
-            ),
+            rpc_error(Value::Null, -32600, "请求体必须是单个 JSON-RPC 对象。"),
         );
         return;
     }
@@ -857,7 +904,7 @@ fn handle_result(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         send_json(
             stream,
             404,
-            json!({"ok": false, "error": "Unknown or expired call id"}),
+            json!({"ok": false, "error": "未知或已过期的调用 ID。"}),
         );
         return;
     };
@@ -888,7 +935,11 @@ fn handle_http(shared: Arc<Shared>, mut stream: TcpStream) {
         return;
     }
     let Some(suffix) = bridge_suffix(&shared.config, &req.path) else {
-        send_json(&mut stream, 404, json!({"ok": false, "error": "Not found"}));
+        send_json(
+            &mut stream,
+            404,
+            json!({"ok": false, "error": "没有找到这个接口。"}),
+        );
         return;
     };
     match (req.method.as_str(), suffix.as_str()) {
@@ -898,20 +949,26 @@ fn handle_http(shared: Arc<Shared>, mut stream: TcpStream) {
             send_json(&mut stream, 200, get_bridge_status(&shared))
         }
         ("POST", "/result") => handle_result(&shared, req, &mut stream),
-        _ => send_json(&mut stream, 404, json!({"ok": false, "error": "Not found"})),
+        _ => send_json(
+            &mut stream,
+            404,
+            json!({"ok": false, "error": "没有找到这个接口。"}),
+        ),
     }
 }
 
 fn start_http(shared: Arc<Shared>) -> io::Result<()> {
     let addr = format!("{}:{}", shared.config.host, shared.config.port);
     let listener = TcpListener::bind(&addr)?;
+    eprintln!("40code MCP 本地桥接器已启动。");
+    eprintln!("网页端连接地址：{}", bridge_url(&shared.config));
     eprintln!(
-        "[{SERVER_NAME}] bridge listening on http://{}:{}{}",
-        shared.config.host, shared.config.port, shared.config.bridge_path
+        "AI 软件 MCP 地址：http://{}:{}{}",
+        shared.config.host, shared.config.port, shared.config.mcp_http_path
     );
     eprintln!(
-        "[{SERVER_NAME}] MCP HTTP endpoint on http://{}:{}{}",
-        shared.config.host, shared.config.port, shared.config.mcp_http_path
+        "运行状态查看：http://{}:{}/status",
+        shared.config.host, shared.config.port
     );
     for stream in listener.incoming() {
         match stream {
@@ -919,7 +976,7 @@ fn start_http(shared: Arc<Shared>) -> io::Result<()> {
                 let cloned = Arc::clone(&shared);
                 thread::spawn(move || handle_http(cloned, stream));
             }
-            Err(err) => eprintln!("[{SERVER_NAME}] accept failed: {err}"),
+            Err(err) => eprintln!("接收连接失败：{err}"),
         }
     }
     Ok(())
@@ -966,7 +1023,7 @@ fn main() {
     thread::spawn(move || start_stdio(stdio_shared));
 
     if let Err(err) = start_http(shared) {
-        eprintln!("[{SERVER_NAME}] bridge failed: {err}");
+        eprintln!("40code MCP 本地桥接器启动失败：{err}");
         process::exit(1);
     }
 }

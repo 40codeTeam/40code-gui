@@ -9,17 +9,17 @@ The web version needs a local bridge program. Download and run this standalone
 Windows executable before enabling the page bridge:
 
 ```text
-40code-mcp-bridge/40code-mcp-bridge-small.exe
+40code-mcp-bridge/40code-MCP本地桥接器.exe
 ```
 
 In this repository the same executable is kept in
-`static/40code-mcp-bridge/40code-mcp-bridge-small.exe` for web builds and in
-`dist/40code-mcp-bridge/40code-mcp-bridge-small.exe` for the current local
+`static/40code-mcp-bridge/40code-MCP本地桥接器.exe` for web builds and in
+`dist/40code-mcp-bridge/40code-MCP本地桥接器.exe` for the current local
 build output.
 
 ## URL mode
 
-On the web version, start `40code-mcp-bridge-small.exe` first. On 40code
+On the web version, start `40code-MCP本地桥接器.exe` first. On 40code
 Desktop, no manual start is needed. Then open the json-script-converter panel,
 open the AI/config view, and enable **MCP bridge**. The enabled state is
 remembered locally. MCP clients that support Streamable HTTP can then connect
@@ -47,7 +47,7 @@ For MCP clients that prefer launching local servers, use this server command:
 {
   "mcpServers": {
     "40code-json-script-converter": {
-      "command": "E:/S-my/40code/editor/40code-gui/dist/40code-mcp-bridge/40code-mcp-bridge-small.exe"
+      "command": "E:/S-my/40code/editor/40code-gui/dist/40code-mcp-bridge/40code-MCP本地桥接器.exe"
     }
   }
 }
