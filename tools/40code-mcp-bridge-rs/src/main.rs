@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -11,11 +11,22 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVER_NAME: &str = "40code-json-script-converter";
-const SERVER_VERSION: &str = "0.2.0-native";
+const SERVER_VERSION: &str = "0.2.1-native";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const LEGACY_BRIDGE_PATH: &str = "/json-script-converter/mcp";
 const PSEUDOCODE_SYNTAX_URI: &str = "jsc://pseudocode/syntax";
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBoxW(
+        window: *mut std::ffi::c_void,
+        text: *const u16,
+        caption: *const u16,
+        message_type: u32,
+    ) -> i32;
+}
 
 const PSEUDOCODE_SYNTAX_GUIDE: &str = r#"# 40code json-script-converter pseudocode syntax
 
@@ -969,6 +980,159 @@ fn handle_http(shared: Arc<Shared>, mut stream: TcpStream) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupFailureKind {
+    AlreadyRunning,
+    PortInUse,
+    Other,
+}
+
+fn is_address_in_use(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AddrInUse || error.raw_os_error() == Some(10048)
+}
+
+fn probe_existing_bridge(config: &Config) -> bool {
+    let host = match config.host.as_str() {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        value => value,
+    };
+    let address = if host.contains(':') {
+        format!("[{host}]:{}", config.port)
+    } else {
+        format!("{host}:{}", config.port)
+    };
+    let Ok(addresses) = address.to_socket_addrs() else {
+        return false;
+    };
+    let status_path = if config.bridge_path == "/" {
+        "/status".to_string()
+    } else {
+        format!("{}/status", config.bridge_path)
+    };
+    for socket_address in addresses {
+        let Ok(mut stream) =
+            TcpStream::connect_timeout(&socket_address, Duration::from_millis(500))
+        else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(700)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(700)));
+        let request = format!(
+            "GET {status_path} HTTP/1.1\r\nHost: {host}:{}\r\nConnection: close\r\n\r\n",
+            config.port
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+            continue;
+        };
+        if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+            continue;
+        }
+        let Ok(status) = serde_json::from_str::<Value>(body) else {
+            continue;
+        };
+        if status.get("ok").and_then(Value::as_bool) == Some(true)
+            && (status.pointer("/bridge/legacyPath").and_then(Value::as_str)
+                == Some(LEGACY_BRIDGE_PATH)
+                || status.pointer("/bridge/name").and_then(Value::as_str)
+                    == Some("40code MCP 本地桥接器"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn classify_startup_failure(error: &io::Error, existing_bridge: bool) -> StartupFailureKind {
+    if is_address_in_use(error) {
+        if existing_bridge {
+            StartupFailureKind::AlreadyRunning
+        } else {
+            StartupFailureKind::PortInUse
+        }
+    } else {
+        StartupFailureKind::Other
+    }
+}
+
+fn startup_failure_message(config: &Config, error: &io::Error, kind: StartupFailureKind) -> String {
+    match kind {
+        StartupFailureKind::AlreadyRunning => format!(
+            "40code MCP 本地桥接器已经在运行。\n\n\
+             无需重复启动。请返回 40code 页面，勾选“启用 MCP 桥接”即可。\n\n\
+             页面连接地址：{}\n\
+             AI 软件 MCP 地址：http://{}:{}{}",
+            bridge_url(config),
+            config.host,
+            config.port,
+            config.mcp_http_path
+        ),
+        StartupFailureKind::PortInUse => format!(
+            "40code MCP 本地桥接器无法启动。\n\n\
+             本地端口 {} 已被其他程序占用。\n\
+             请关闭占用该端口的程序，或重启电脑后再运行本程序。\n\n\
+             如果已经启动过本桥接器，请只保留一个实例。\n\n\
+             错误详情：{}",
+            config.port, error
+        ),
+        StartupFailureKind::Other => format!(
+            "40code MCP 本地桥接器启动失败。\n\n\
+             请检查权限或网络设置后重试。\n\n\
+             错误详情：{error}"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn show_startup_message(message: &str, is_error: bool) {
+    const MB_ICONERROR: u32 = 0x00000010;
+    const MB_ICONINFORMATION: u32 = 0x00000040;
+    const MB_SETFOREGROUND: u32 = 0x00010000;
+    const MB_TOPMOST: u32 = 0x00040000;
+    let title: Vec<u16> = "40code MCP 本地桥接器"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    let icon = if is_error {
+        MB_ICONERROR
+    } else {
+        MB_ICONINFORMATION
+    };
+    // Keep double-click startup failures visible after the console process exits.
+    let _ = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            icon | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn show_startup_message(message: &str, _is_error: bool) {
+    eprintln!("{message}");
+}
+
+fn report_startup_failure(config: &Config, error: &io::Error) -> i32 {
+    let existing_bridge = is_address_in_use(error) && probe_existing_bridge(config);
+    let kind = classify_startup_failure(error, existing_bridge);
+    let message = startup_failure_message(config, error, kind);
+    eprintln!("{message}");
+    show_startup_message(&message, kind != StartupFailureKind::AlreadyRunning);
+    if kind == StartupFailureKind::AlreadyRunning {
+        0
+    } else {
+        1
+    }
+}
+
 fn start_http(shared: Arc<Shared>) -> io::Result<()> {
     let addr = format!("{}:{}", shared.config.host, shared.config.port);
     let listener = TcpListener::bind(&addr)?;
@@ -1034,8 +1198,63 @@ fn main() {
     let stdio_shared = Arc::clone(&shared);
     thread::spawn(move || start_stdio(stdio_shared));
 
-    if let Err(err) = start_http(shared) {
-        eprintln!("40code MCP 本地桥接器启动失败：{err}");
-        process::exit(1);
+    if let Err(error) = start_http(Arc::clone(&shared)) {
+        process::exit(report_startup_failure(&shared.config, &error));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(port: u16) -> Config {
+        Config {
+            host: "127.0.0.1".to_string(),
+            port,
+            bridge_path: "/".to_string(),
+            mcp_http_path: "/mcp".to_string(),
+            call_timeout: Duration::from_secs(1),
+            poll_timeout: Duration::from_secs(1),
+            client_ttl: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn duplicate_start_message_explains_that_the_bridge_is_ready() {
+        let config = test_config(47740);
+        let error = io::Error::from(io::ErrorKind::AddrInUse);
+        let message = startup_failure_message(&config, &error, StartupFailureKind::AlreadyRunning);
+        assert!(message.contains("已经在运行"));
+        assert!(message.contains("无需重复启动"));
+        assert!(message.contains("启用 MCP 桥接"));
+    }
+
+    #[test]
+    fn occupied_port_message_includes_the_port_and_recovery() {
+        let config = test_config(47740);
+        let error = io::Error::from(io::ErrorKind::AddrInUse);
+        let message = startup_failure_message(&config, &error, StartupFailureKind::PortInUse);
+        assert!(message.contains("47740"));
+        assert!(message.contains("已被其他程序占用"));
+        assert!(message.contains("重启电脑"));
+    }
+
+    #[test]
+    fn existing_bridge_probe_recognizes_the_status_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = format!(r#"{{"ok":true,"bridge":{{"legacyPath":"{LEGACY_BRIDGE_PATH}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        assert!(probe_existing_bridge(&test_config(port)));
+        server.join().unwrap();
     }
 }

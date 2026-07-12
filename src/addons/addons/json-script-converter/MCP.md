@@ -98,6 +98,12 @@ localStorage.setItem(
 );
 ```
 
+Starting the standalone executable more than once is safe. An extra instance
+shows a Chinese dialog explaining that the bridge is already running, then
+exits normally. If another program owns the configured port, the executable
+shows a persistent Chinese error dialog with the occupied port and recovery
+instructions instead of closing silently.
+
 ## Tools
 
 The MCP server exposes the same action names used by the addon AI panel, such
