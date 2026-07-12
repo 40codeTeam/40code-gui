@@ -11,7 +11,7 @@ const normalizeHttpPath = value => {
 };
 
 const SERVER_NAME = '40code-json-script-converter';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 const PROTOCOL_VERSION = '2025-06-18';
 const HOST = process.env.JSC_MCP_HOST || '127.0.0.1';
 const PORT = Number(process.env.JSC_MCP_PORT || 47740);
@@ -27,7 +27,8 @@ const SERVER_INSTRUCTIONS = [
     'This server edits 40code/Scratch projects through the json-script-converter addon.',
     `Before calling edit_pseudocode for the first time, read ${PSEUDOCODE_SYNTAX_URI} with resources/read or call jsc_get_pseudocode_syntax.`,
     'Use get_target_info and get_pseudocode to inspect the current project before editing.',
-    'Use create_svg_costume and replace_svg_costume for visible UI elements such as buttons, menus, and backdrops.'
+    'Use create_svg_costume and replace_svg_costume for vector UI elements.',
+    'Use create_bitmap_costume and replace_bitmap_costume when complete bitmap image data is available.'
 ].join(' ');
 
 const PSEUDOCODE_SYNTAX_GUIDE = String.raw`
@@ -39,7 +40,7 @@ Use this syntax when calling edit_pseudocode. The pseudocode is converted to Scr
 
 1. Call get_target_info to learn targetRef values for the stage and sprites.
 2. Call get_pseudocode for targets you will modify.
-3. Create or replace costumes/backdrops with create_svg_costume or replace_svg_costume when the project needs visible UI.
+3. Create or replace vector costumes/backdrops with create_svg_costume or replace_svg_costume when the project needs visible UI. Use create_bitmap_costume or replace_bitmap_costume for bitmap image data.
 4. Apply code with edit_pseudocode. For simple changes use mode: "replace" and pass targetRef plus full pseudocode.
 
 ## Basic shape
@@ -294,6 +295,24 @@ const TOOL_DEFINITIONS = [
         rotationCenterX: numberProp('Optional rotation center x.'),
         rotationCenterY: numberProp('Optional rotation center y.')
     }, ['svg']),
+    tool('create_bitmap_costume', 'Create a new bitmap costume/backdrop from image data. The image is normalized to PNG.', {
+        targetRef: stringProp('Target ref/name/id. Defaults to current target.'),
+        name: stringProp('Costume/backdrop name.'),
+        imageData: stringProp('PNG, JPEG, WebP, BMP, or GIF as a base64 data URL or raw base64 data.'),
+        mimeType: stringProp('Image MIME type when imageData is raw base64. Defaults to image/png.'),
+        rotationCenterX: numberProp('Optional rotation center x in source-image pixels.'),
+        rotationCenterY: numberProp('Optional rotation center y in source-image pixels.')
+    }, ['imageData']),
+    tool('replace_bitmap_costume', 'Replace an existing costume/backdrop with bitmap image data. The image is normalized to PNG.', {
+        targetRef: stringProp('Target ref/name/id. Defaults to current target.'),
+        costumeName: stringProp('Costume/backdrop name.'),
+        costumeIndex: numberProp('Zero-based costume/backdrop index.'),
+        newName: stringProp('Optional new costume/backdrop name.'),
+        imageData: stringProp('PNG, JPEG, WebP, BMP, or GIF as a base64 data URL or raw base64 data.'),
+        mimeType: stringProp('Image MIME type when imageData is raw base64. Defaults to image/png.'),
+        rotationCenterX: numberProp('Optional rotation center x in source-image pixels.'),
+        rotationCenterY: numberProp('Optional rotation center y in source-image pixels.')
+    }, ['imageData']),
     tool('edit_pseudocode', `Apply pseudocode edits. Supports mode:"replace" with pseudocode or mode:"patch" with patches. Read ${PSEUDOCODE_SYNTAX_URI} or call jsc_get_pseudocode_syntax before using this tool.`, {
         targetRef: stringProp('Target ref/name/id for a simple single-target edit.'),
         mode: stringProp('replace or patch.'),

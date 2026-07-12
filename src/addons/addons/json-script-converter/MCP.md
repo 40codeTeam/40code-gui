@@ -14,7 +14,7 @@ Windows executable before enabling the page bridge:
 
 In this repository the same executable is kept in
 `static/40code-mcp-bridge/40code-MCP本地桥接器.exe` for web builds and in
-`dist/40code-mcp-bridge/40code-MCP本地桥接器.exe` for the current local
+`build/40code-mcp-bridge/40code-MCP本地桥接器.exe` for the current local
 build output.
 
 ## URL mode
@@ -47,7 +47,7 @@ For MCP clients that prefer launching local servers, use this server command:
 {
   "mcpServers": {
     "40code-json-script-converter": {
-      "command": "E:/S-my/40code/editor/40code-gui/dist/40code-mcp-bridge/40code-MCP本地桥接器.exe"
+      "command": "E:/S-my/40code/editor/40code-gui/build/40code-mcp-bridge/40code-MCP本地桥接器.exe"
     }
   }
 }
@@ -103,8 +103,15 @@ localStorage.setItem(
 The MCP server exposes the same action names used by the addon AI panel, such
 as `get_target_info`, `get_pseudocode`, `search_text`, `list_extensions`,
 `load_extension`, `get_extension_blocks`, `get_costume_info`,
-`create_sprite`, `create_svg_costume`, `edit_pseudocode`, `click_green_flag`,
-`click_pause`, and `click_stop`.
+`create_sprite`, `create_svg_costume`, `replace_svg_costume`,
+`create_bitmap_costume`, `replace_bitmap_costume`, `edit_pseudocode`,
+`click_green_flag`, `click_pause`, and `click_stop`.
+
+`create_bitmap_costume` and `replace_bitmap_costume` accept `imageData` as a
+base64 data URL for PNG, JPEG, WebP, BMP, or GIF. Raw base64 is also accepted;
+set `mimeType` when it is not PNG. The page validates and decodes the image,
+scales very large images down, and stores the resulting costume/backdrop as
+PNG. HTTP image URLs and incomplete or abbreviated base64 are not accepted.
 
 Destructive tools like `delete_sprite` and `delete_costume` still ask for
 in-page confirmation by default. Pass `confirm: true` only when the external

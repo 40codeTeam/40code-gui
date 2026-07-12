@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVER_NAME: &str = "40code-json-script-converter";
-const SERVER_VERSION: &str = "0.1.0-native";
+const SERVER_VERSION: &str = "0.2.0-native";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const LEGACY_BRIDGE_PATH: &str = "/json-script-converter/mcp";
 const PSEUDOCODE_SYNTAX_URI: &str = "jsc://pseudocode/syntax";
@@ -24,7 +24,7 @@ Use this syntax when calling edit_pseudocode. The pseudocode is converted to Scr
 Workflow:
 1. Call get_target_info to learn targetRef values.
 2. Call get_pseudocode for targets you will modify.
-3. Create or replace SVG costumes/backdrops for visible UI.
+3. Create or replace SVG costumes/backdrops for vector UI. Use the bitmap costume tools when complete bitmap image data is available.
 4. Apply code with edit_pseudocode.
 
 Scripts are separated by a blank line. Use braces for script bodies and control blocks.
@@ -336,6 +336,18 @@ fn tool_definitions() -> Vec<Value> {
             &["svg"],
         ),
         tool(
+            "create_bitmap_costume",
+            "Create a new bitmap costume/backdrop from image data. The image is normalized to PNG.",
+            json!({"targetRef": string_prop("Target ref/name/id."), "name": string_prop("Costume/backdrop name."), "imageData": string_prop("PNG, JPEG, WebP, BMP, or GIF as a base64 data URL or raw base64 data."), "mimeType": string_prop("Image MIME type for raw base64. Defaults to image/png."), "rotationCenterX": number_prop("Optional rotation center x in source-image pixels."), "rotationCenterY": number_prop("Optional rotation center y in source-image pixels.")}),
+            &["imageData"],
+        ),
+        tool(
+            "replace_bitmap_costume",
+            "Replace an existing costume/backdrop with bitmap image data. The image is normalized to PNG.",
+            json!({"targetRef": string_prop("Target ref/name/id."), "costumeName": string_prop("Costume/backdrop name."), "costumeIndex": number_prop("Zero-based costume/backdrop index."), "newName": string_prop("Optional new costume/backdrop name."), "imageData": string_prop("PNG, JPEG, WebP, BMP, or GIF as a base64 data URL or raw base64 data."), "mimeType": string_prop("Image MIME type for raw base64. Defaults to image/png."), "rotationCenterX": number_prop("Optional rotation center x in source-image pixels."), "rotationCenterY": number_prop("Optional rotation center y in source-image pixels.")}),
+            &["imageData"],
+        ),
+        tool(
             "edit_pseudocode",
             "Apply pseudocode edits. Read jsc://pseudocode/syntax first.",
             json!({"targetRef": string_prop("Target ref/name/id."), "mode": string_prop("replace or patch."), "pseudocode": string_prop("Full pseudocode when mode is replace."), "patches": {"type": "array", "items": object_prop("Patch object.")}, "edits": {"type": "array", "items": object_prop("Multi-target edit object.")}}),
@@ -515,7 +527,7 @@ fn handle_rpc(shared: &Shared, message: Value) -> Option<Value> {
             json!({
                 "protocolVersion": message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
                 "capabilities": {"tools": {}, "resources": {}},
-                "instructions": format!("This server edits 40code/Scratch projects through the json-script-converter addon. Before calling edit_pseudocode, read {} with resources/read or call jsc_get_pseudocode_syntax.", PSEUDOCODE_SYNTAX_URI),
+                "instructions": format!("This server edits 40code/Scratch projects through the json-script-converter addon. Before calling edit_pseudocode, read {} with resources/read or call jsc_get_pseudocode_syntax. Use the SVG costume tools for vector content and the bitmap costume tools for complete bitmap image data.", PSEUDOCODE_SYNTAX_URI),
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}
             }),
         ),

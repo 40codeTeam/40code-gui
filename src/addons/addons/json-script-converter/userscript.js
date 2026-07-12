@@ -1524,6 +1524,10 @@ export default async ({addon, console, msg}) => {
     const AI_SVG_SOURCE_LIMIT = 24000;
     const AI_SVG_WRITE_LIMIT = 200000;
     const AI_IMAGE_DATA_URL_LIMIT = 3500000;
+    const AI_BITMAP_WRITE_DATA_URL_LIMIT = 6 * 1024 * 1024;
+    const AI_BITMAP_WRITE_BYTE_LIMIT = 16 * 1024 * 1024;
+    const AI_BITMAP_MAX_DIMENSION = 4096;
+    const AI_BITMAP_MAX_PIXELS = 4096 * 4096;
     const AI_REQUEST_RETRY_DEFAULT_COUNT = 2;
     const AI_REQUEST_RETRY_MAX_COUNT = 5;
     const AI_REQUEST_RETRY_BASE_DELAY = 800;
@@ -2319,6 +2323,94 @@ export default async ({addon, console, msg}) => {
         image.onerror = () => reject(new Error('图片无法加载'));
         image.src = dataUrl;
     });
+    const decodeAiBase64Bytes = base64 => {
+        const normalized = String(base64 || '').replace(/\s+/g, '');
+        if (!normalized || !/^[a-z0-9+/]+={0,2}$/i.test(normalized)) {
+            throw new Error('图片不是有效的 Base64 数据');
+        }
+        const binary = atob(normalized);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    };
+    const normalizeAiBitmapInput = (rawImageData, rawMimeType) => {
+        let imageData = stripCodeFence(String(rawImageData || '')).trim();
+        if (!imageData) return {ok: false, error: '位图数据为空'};
+        if (imageData.length > AI_BITMAP_WRITE_DATA_URL_LIMIT) {
+            return {ok: false, error: `位图数据过大，最多 ${AI_BITMAP_WRITE_DATA_URL_LIMIT} 个字符`};
+        }
+        let mimeType = String(rawMimeType || '').trim().toLowerCase();
+        if (!/^data:/i.test(imageData)) {
+            mimeType = mimeType || 'image/png';
+            imageData = `data:${mimeType};base64,${imageData}`;
+        }
+        const match = imageData.match(/^data:([^;,]+)((?:;[^,]*)*),([\s\S]*)$/i);
+        if (!match || !/(?:^|;)base64(?:;|$)/i.test(match[2])) {
+            return {ok: false, error: '位图必须是 Base64 data URL，或者是单独的 Base64 数据'};
+        }
+        mimeType = String(match[1] || '').trim().toLowerCase();
+        if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+        if (!/^image\/(?:png|jpeg|webp|bmp|x-ms-bmp|gif)$/.test(mimeType)) {
+            return {ok: false, error: `不支持的位图格式: ${mimeType || '未知'}`};
+        }
+        try {
+            const bytes = decodeAiBase64Bytes(match[3]);
+            if (!bytes.length) return {ok: false, error: '位图数据为空'};
+        } catch (err) {
+            return {ok: false, error: err.message};
+        }
+        return {
+            ok: true,
+            mimeType,
+            dataUrl: `data:${mimeType};base64,${String(match[3] || '').replace(/\s+/g, '')}`
+        };
+    };
+    const renderAiBitmapToPng = async (rawImageData, rawMimeType) => {
+        const checked = normalizeAiBitmapInput(rawImageData, rawMimeType);
+        if (!checked.ok) return checked;
+        let loaded;
+        try {
+            loaded = await loadAiImageFromDataUrl(checked.dataUrl);
+        } catch (err) {
+            return {ok: false, error: `位图无法解码: ${err.message}`};
+        }
+        const sourceWidth = Math.max(1, loaded.width);
+        const sourceHeight = Math.max(1, loaded.height);
+        const scale = Math.min(
+            1,
+            AI_BITMAP_MAX_DIMENSION / sourceWidth,
+            AI_BITMAP_MAX_DIMENSION / sourceHeight,
+            Math.sqrt(AI_BITMAP_MAX_PIXELS / (sourceWidth * sourceHeight))
+        );
+        const width = Math.max(1, Math.round(sourceWidth * scale));
+        const height = Math.max(1, Math.round(sourceHeight * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return {ok: false, error: '当前浏览器无法处理位图'};
+        ctx.drawImage(loaded.image, 0, 0, width, height);
+        let bytes;
+        try {
+            const pngDataUrl = canvas.toDataURL('image/png');
+            bytes = decodeAiBase64Bytes(pngDataUrl.slice(pngDataUrl.indexOf(',') + 1));
+        } catch (err) {
+            return {ok: false, error: `位图转换为 PNG 失败: ${err.message}`};
+        }
+        if (bytes.length > AI_BITMAP_WRITE_BYTE_LIMIT) {
+            return {ok: false, error: `转换后的 PNG 过大，最多 ${AI_BITMAP_WRITE_BYTE_LIMIT} 字节`};
+        }
+        return {
+            ok: true,
+            bytes,
+            width,
+            height,
+            sourceWidth,
+            sourceHeight,
+            sourceMimeType: checked.mimeType,
+            resized: width !== sourceWidth || height !== sourceHeight
+        };
+    };
     const assertAiSvgRenderable = async svgText => {
         const loaded = await loadAiImageFromDataUrl(getAiSvgDataUrl(svgText));
         return {ok: true, width: loaded.width, height: loaded.height};
@@ -3724,7 +3816,9 @@ export default async ({addon, console, msg}) => {
             type === 'create_costume' ||
             type === 'delete_costume' ||
             type === 'create_svg_costume' ||
-            type === 'replace_svg_costume'
+            type === 'replace_svg_costume' ||
+            type === 'create_bitmap_costume' ||
+            type === 'replace_bitmap_costume'
         ) {
             return {
                 ok: true,
@@ -3736,6 +3830,10 @@ export default async ({addon, console, msg}) => {
                     costumeIndex: parsed.costumeIndex != null ? parsed.costumeIndex : parsed.index,
                     newName: String(parsed.newName || parsed.newCostumeName || parsed.newBackdropName || '').trim(),
                     svg: String(parsed.svg || parsed.svgText || parsed.content || '').trim(),
+                    imageData: String(
+                        parsed.imageData || parsed.dataUrl || parsed.bitmapData || parsed.base64 || parsed.content || ''
+                    ).trim(),
+                    mimeType: String(parsed.mimeType || parsed.mediaType || parsed.contentType || '').trim().toLowerCase(),
                     rotationCenterX: parsed.rotationCenterX,
                     rotationCenterY: parsed.rotationCenterY,
                     confirm: parsed.confirm === true,
@@ -4852,6 +4950,39 @@ export default async ({addon, console, msg}) => {
                         }
                     });
                 },
+                createBitmapCostume: async (targetIdOrName, name, imageData, options) => {
+                    const resolved = this.resolveAiTarget(targetIdOrName || (vm.editingTarget && vm.editingTarget.id));
+                    if (!resolved.target) return {ok: false, error: resolved.error};
+                    return this.executeAiProjectTool({
+                        type: 'create_bitmap_costume',
+                        targetId: this.getAiTargetRef(resolved.target),
+                        name,
+                        costumeName: name,
+                        imageData,
+                        mimeType: options && options.mimeType,
+                        rotationCenterX: options && options.rotationCenterX,
+                        rotationCenterY: options && options.rotationCenterY
+                    });
+                },
+                replaceBitmapCostume: async (targetIdOrName, costumeNameOrIndex, imageData, options) => {
+                    const resolved = this.resolveAiTarget(targetIdOrName || (vm.editingTarget && vm.editingTarget.id));
+                    if (!resolved.target) return {ok: false, error: resolved.error};
+                    return this.executeAiProjectTool({
+                        type: 'replace_bitmap_costume',
+                        targetId: this.getAiTargetRef(resolved.target),
+                        costumeName: typeof costumeNameOrIndex === 'string' ? costumeNameOrIndex : '',
+                        costumeIndex: typeof costumeNameOrIndex === 'number' ? costumeNameOrIndex : null,
+                        newName: options && options.newName,
+                        imageData,
+                        mimeType: options && options.mimeType,
+                        rotationCenterX: options && options.rotationCenterX,
+                        rotationCenterY: options && options.rotationCenterY,
+                        raw: {
+                            costumeName: typeof costumeNameOrIndex === 'string' ? costumeNameOrIndex : '',
+                            costumeIndex: typeof costumeNameOrIndex === 'number' ? costumeNameOrIndex : null
+                        }
+                    });
+                },
                 validateTargetPseudocode: (targetIdOrName, text) => {
                     const resolved = this.resolveAiTarget(targetIdOrName);
                     if (!resolved.target) return {ok: false, error: resolved.error};
@@ -4944,7 +5075,9 @@ export default async ({addon, console, msg}) => {
                             tool.type !== 'create_costume' &&
                             tool.type !== 'delete_costume' &&
                             tool.type !== 'create_svg_costume' &&
-                            tool.type !== 'replace_svg_costume'
+                            tool.type !== 'replace_svg_costume' &&
+                            tool.type !== 'create_bitmap_costume' &&
+                            tool.type !== 'replace_bitmap_costume'
                         )) {
                             return {ok: false, error: `不是项目结构工具：${tool && tool.type}`};
                         }
@@ -6370,6 +6503,8 @@ export default async ({addon, console, msg}) => {
             const bounds = checked.bounds || getAiSvgBounds(checked.svg);
             const rx = Number(options && options.rotationCenterX);
             const ry = Number(options && options.rotationCenterY);
+            const scaleX = rendered.width / rendered.sourceWidth;
+            const scaleY = rendered.height / rendered.sourceHeight;
             const costume = {
                 name,
                 dataFormat: storage.DataFormat.SVG,
@@ -6381,6 +6516,48 @@ export default async ({addon, console, msg}) => {
                 rotationCenterY: Number.isFinite(ry) ? ry : bounds.height / 2
             };
             return {ok: true, svg: checked.svg, bounds, costume};
+        };
+
+        prepareAiBitmapCostume = async (name, imageData, options) => {
+            const rendered = await renderAiBitmapToPng(imageData, options && options.mimeType);
+            if (!rendered.ok) return rendered;
+            const storage = vm.runtime && vm.runtime.storage;
+            if (!storage || !storage.AssetType || !storage.DataFormat || typeof storage.createAsset !== 'function') {
+                return {ok: false, error: '当前项目存储不可用'};
+            }
+            const asset = storage.createAsset(
+                storage.AssetType.ImageBitmap,
+                storage.DataFormat.PNG,
+                rendered.bytes,
+                null,
+                true
+            );
+            const rx = Number(options && options.rotationCenterX);
+            const ry = Number(options && options.rotationCenterY);
+            const costume = {
+                name,
+                dataFormat: storage.DataFormat.PNG,
+                asset,
+                assetId: asset.assetId,
+                md5: `${asset.assetId}.${storage.DataFormat.PNG}`,
+                bitmapResolution: 1,
+                rotationCenterX: Number.isFinite(rx) ? rx * scaleX : rendered.width / 2,
+                rotationCenterY: Number.isFinite(ry) ? ry * scaleY : rendered.height / 2
+            };
+            return {
+                ok: true,
+                costume,
+                image: {
+                    mimeType: 'image/png',
+                    width: rendered.width,
+                    height: rendered.height,
+                    sourceWidth: rendered.sourceWidth,
+                    sourceHeight: rendered.sourceHeight,
+                    sourceMimeType: rendered.sourceMimeType,
+                    byteLength: rendered.bytes.length,
+                    resized: rendered.resized
+                }
+            };
         };
 
         inspectAiCostumeImage = async (target, tool) => {
@@ -6755,6 +6932,89 @@ export default async ({addon, console, msg}) => {
                     summary: target.isStage ? `已替换 SVG 背景：${finalName}` : `已替换 SVG 造型：${finalName}`
                 };
             }
+            if (type === 'create_bitmap_costume') {
+                const resolved = this.resolveAiTarget(tool.targetId || (vm.editingTarget && vm.editingTarget.id));
+                if (!resolved.target) return {ok: false, type, error: resolved.error};
+                if (!tool.imageData) return {ok: false, type, error: '缺少 imageData 位图数据'};
+                const existing = resolved.target.sprite && Array.isArray(resolved.target.sprite.costumes)
+                    ? resolved.target.sprite.costumes.map(costume => costume && costume.name)
+                    : [];
+                const fallback = resolved.target.isStage ? 'backdrop1' : 'costume1';
+                const name = getAiUnusedName(tool.costumeName || tool.name || fallback, existing);
+                const prepared = await this.prepareAiBitmapCostume(name, tool.imageData, tool);
+                if (!prepared.ok) return {ok: false, type, error: prepared.error};
+                await vm.addCostume(prepared.costume.md5, prepared.costume, resolved.target.id);
+                const fullTargetSummary = this.getAiTargetSummary(resolved.target);
+                const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
+                const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
+                const costumeNumber = createdCostume.index != null ? createdCostume.index + 1 : existing.length + 1;
+                const costumeSummary = {
+                    ...createdCostume,
+                    name,
+                    number: costumeNumber,
+                    costumeNumber
+                };
+                this.prepareForExternalWorkspaceReset();
+                return {
+                    ok: true,
+                    type,
+                    target: targetSummary,
+                    costume: costumeSummary,
+                    image: prepared.image,
+                    summary: resolved.target.isStage ?
+                        `已创建位图背景：${name}（第 ${costumeNumber} 个背景）` :
+                        `已创建位图造型：${name}（第 ${costumeNumber} 个造型）`
+                };
+            }
+            if (type === 'replace_bitmap_costume') {
+                const resolved = this.resolveAiTarget(tool.targetId || (vm.editingTarget && vm.editingTarget.id));
+                if (!resolved.target) return {ok: false, type, error: resolved.error};
+                if (!tool.imageData) return {ok: false, type, error: '缺少 imageData 位图数据'};
+                const target = resolved.target;
+                const costumes = target.sprite && Array.isArray(target.sprite.costumes) ? target.sprite.costumes : [];
+                const found = this.resolveAiCostume(target, tool, true);
+                if (found.error) return {ok: false, type, error: found.error};
+                const oldCostume = found.costume;
+                const oldName = oldCostume && oldCostume.name ? oldCostume.name : `costume${found.index + 1}`;
+                const usedNames = costumes
+                    .filter((costume, index) => index !== found.index && costume)
+                    .map(costume => costume.name);
+                const finalName = tool.newName ? getAiUnusedName(tool.newName, usedNames) : oldName;
+                const tempName = getAiUnusedName(
+                    `__ai_bitmap_${Date.now()}`,
+                    costumes.map(costume => costume && costume.name)
+                );
+                const prepared = await this.prepareAiBitmapCostume(tempName, tool.imageData, tool);
+                if (!prepared.ok) return {ok: false, type, error: prepared.error};
+                const originalCurrent = typeof target.currentCostume === 'number' ? target.currentCostume : 0;
+                await vm.addCostume(prepared.costume.md5, prepared.costume, target.id);
+                const added = costumes[costumes.length - 1];
+                if (!added) return {ok: false, type, error: '位图造型加载后未找到'};
+                target.sprite.deleteCostumeAt(found.index);
+                let addedIndex = costumes.indexOf(added);
+                if (addedIndex < 0) addedIndex = costumes.length - 1;
+                target.sprite.deleteCostumeAt(addedIndex);
+                added.name = finalName;
+                target.sprite.addCostumeAt(added, Math.min(found.index, costumes.length));
+                target.setCostume(Math.min(originalCurrent, costumes.length - 1));
+                if (vm.runtime && typeof vm.runtime.emitProjectChanged === 'function') vm.runtime.emitProjectChanged();
+                if (typeof vm.emitTargetsUpdate === 'function') vm.emitTargetsUpdate();
+                this.prepareForExternalWorkspaceReset();
+                return {
+                    ok: true,
+                    type,
+                    target: this.getAiTargetSummary(target, {includeCostumes: false}),
+                    costume: {
+                        index: found.index,
+                        name: finalName,
+                        oldName,
+                        oldMd5: getAiCostumeMd5(oldCostume),
+                        md5: added.md5
+                    },
+                    image: prepared.image,
+                    summary: target.isStage ? `已替换位图背景：${finalName}` : `已替换位图造型：${finalName}`
+                };
+            }
             if (type === 'delete_costume') {
                 const resolved = this.resolveAiTarget(tool.targetId || (vm.editingTarget && vm.editingTarget.id));
                 if (!resolved.target) return {ok: false, type, error: resolved.error};
@@ -7076,7 +7336,9 @@ export default async ({addon, console, msg}) => {
                 tool.type !== 'create_costume' &&
                 tool.type !== 'delete_costume' &&
                 tool.type !== 'create_svg_costume' &&
-                tool.type !== 'replace_svg_costume'
+                tool.type !== 'replace_svg_costume' &&
+                tool.type !== 'create_bitmap_costume' &&
+                tool.type !== 'replace_bitmap_costume'
             )) {
                 return {ok: false, error: '不支持的 AI 工具请求'};
             }
@@ -7093,7 +7355,9 @@ export default async ({addon, console, msg}) => {
                 tool.type === 'create_costume' ||
                 tool.type === 'delete_costume' ||
                 tool.type === 'create_svg_costume' ||
-                tool.type === 'replace_svg_costume'
+                tool.type === 'replace_svg_costume' ||
+                tool.type === 'create_bitmap_costume' ||
+                tool.type === 'replace_bitmap_costume'
             ) {
                 return this.executeAiProjectTool(tool);
             }
@@ -7678,7 +7942,9 @@ export default async ({addon, console, msg}) => {
                     tool.type === 'create_costume' ||
                     tool.type === 'delete_costume' ||
                     tool.type === 'create_svg_costume' ||
-                    tool.type === 'replace_svg_costume'
+                    tool.type === 'replace_svg_costume' ||
+                    tool.type === 'create_bitmap_costume' ||
+                    tool.type === 'replace_bitmap_costume'
                 );
                 const getAiToolStatusText = (tool, index, total) => {
                     const prefix = total > 1 ? `AI 正在执行工具 ${index + 1}/${total}：` : '';
@@ -7699,6 +7965,8 @@ export default async ({addon, console, msg}) => {
                     if (tool && tool.type === 'create_costume') return `${prefix}创建造型/背景${tool.name ? `：${tool.name}` : ''}`;
                     if (tool && tool.type === 'create_svg_costume') return `${prefix}创建 SVG 造型/背景${tool.name ? `：${tool.name}` : ''}`;
                     if (tool && tool.type === 'replace_svg_costume') return `${prefix}替换 SVG 造型/背景`;
+                    if (tool && tool.type === 'create_bitmap_costume') return `${prefix}创建位图造型/背景${tool.name ? `：${tool.name}` : ''}`;
+                    if (tool && tool.type === 'replace_bitmap_costume') return `${prefix}替换位图造型/背景`;
                     if (tool && tool.type === 'delete_costume') return `${prefix}删除造型/背景`;
                     return `${prefix}处理工具请求`;
                 };
@@ -7824,7 +8092,8 @@ export default async ({addon, console, msg}) => {
                                 type: toolResult.type || tool.type,
                                 summary: toolResult.summary || '',
                                 target: toolResult.target || null,
-                                costume: toolResult.costume || null
+                                costume: toolResult.costume || null,
+                                image: toolResult.image || null
                             };
                             projectOperationHistory.push(operationRecord);
                             this.addAiProcessStep(messageId, toolResult.summary || '已完成项目结构操作。');
@@ -7843,6 +8112,7 @@ export default async ({addon, console, msg}) => {
                                     summary: operationRecord.summary,
                                     target: operationRecord.target,
                                     costume: operationRecord.costume,
+                                    image: operationRecord.image,
                                     svgLength: toolResult.svg ? toolResult.svg.length : 0,
                                     projectOperationProgress: {
                                         completed: projectOperationHistory.slice()
@@ -8341,7 +8611,7 @@ export default async ({addon, console, msg}) => {
                         `批量规则：多个互不依赖的动作应放在同一个 batch.calls 中，最多 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。后一个动作依赖前一个动作返回结果时，必须分轮执行。`,
                         '例如“创建三个角色”应使用一个 batch，包含三个 create_sprite。例如“读取 a 中名称最长的造型，再用这个名称创建角色”必须先 get_target_info，等 tool_result 返回后再 create_sprite。例如“创建两个角色，一个写加法，一个写乘法”：先 batch 创建两个角色，拿到新 targetRef 后再 edit_pseudocode。',
                         '工具执行后，插件会返回 tool_result 或 edit_result。你必须根据 result 判断下一步，不要猜测执行结果。',
-                        '可用动作：click_green_flag、click_pause、click_stop、get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、edit_pseudocode。',
+                        '可用动作：click_green_flag、click_pause、click_stop、get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、create_bitmap_costume、replace_bitmap_costume、edit_pseudocode。',
                         '运行控制动作只在用户明确要求运行、暂停、停止或需要试运行项目时使用。click_green_flag 点击绿旗并启动项目；click_pause 暂停当前项目（若已暂停则保持暂停）；click_stop 点击停止并清除暂停状态。',
                         ...(visionSupported ? [
                             '用户已为此 AI 配置启用图像理解。额外可用动作：inspect_costume、get_stage_snapshot。',
@@ -8373,13 +8643,16 @@ export default async ({addon, console, msg}) => {
                         `创建角色：${AI_ACTION_OPEN}{"type":"create_sprite","name":"角色名"}${AI_ACTION_CLOSE}`,
                         `批量创建角色：${AI_ACTION_OPEN}{"type":"batch","calls":[{"type":"create_sprite","name":"加法"},{"type":"create_sprite","name":"乘法"}]}${AI_ACTION_CLOSE}`,
                         `创建 SVG 造型：${AI_ACTION_OPEN}{"type":"create_svg_costume","targetRef":"a","name":"按钮1","svg":"<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 60\\">...</svg>"}${AI_ACTION_CLOSE}`,
+                        `创建位图造型：${AI_ACTION_OPEN}{"type":"create_bitmap_costume","targetRef":"a","name":"照片","imageData":"data:image/png;base64,..."}${AI_ACTION_CLOSE}`,
+                        'create_bitmap_costume/replace_bitmap_costume 的 imageData 可以是 PNG、JPEG、WebP、BMP 或 GIF 的 Base64 data URL；传纯 Base64 时可用 mimeType 声明格式。位图会安全解码并统一存为 PNG。',
+                        '位图工具不接受 HTTP 图片链接。只有拿到完整图片数据时才能调用，不要编造、省略或截断 Base64。',
                         'get_costume_info 返回造型/背景元信息；请求具体 SVG 造型/背景时，也会返回 SVG 源码。创建或替换 SVG 必须提供安全、独立的 SVG：不包含 script、事件属性、外链资源或 data URI 图片。',
                         '创建或替换 SVG 时，只生成 Scratch/Paper.js 易识别的简单 SVG 子集。允许的元素只有：svg、g、path、rect、circle、ellipse、line、polyline、polygon、text、tspan。需要复杂图形时，用这些基础元素直接组合。',
                         'SVG 根元素必须包含 xmlns="http://www.w3.org/2000/svg" 和简单 viewBox，例如 viewBox="0 0 100 60"。优先用 viewBox 坐标定位，不依赖百分比 width/height。',
                         '允许的 SVG 属性只使用：viewBox、xmlns、x、y、x1、y1、x2、y2、cx、cy、r、rx、ry、width、height、points、d、fill、stroke、stroke-width、stroke-linecap、stroke-linejoin、opacity、transform、font-size、font-family、font-weight、text-anchor、dominant-baseline、xml:space。',
                         '文字必须保留为真实 <text> 或 <text><tspan>，不要把按钮文字、标签、数字转成 path。文本要写明确 x/y、font-size、text-anchor 和 dominant-baseline；多行文字用多个 text 或 tspan。',
                         '不要使用未列入允许清单的 SVG 元素或属性；尤其不要使用 style、class、defs、use、symbol、filter、mask、clipPath、marker、pattern、linearGradient、radialGradient、textPath、image、foreignObject、animate、外部字体、外链资源或 data URI。',
-                        'create_costume/create_svg_costume 成功后，tool_result.costume.number / costumeNumber 是 Scratch 菜单里可用的 1-based 序号，可直接用于 switch_costume(number) 或 switch_backdrop(number)。',
+                        'create_costume/create_svg_costume/create_bitmap_costume 成功后，tool_result.costume.number / costumeNumber 是 Scratch 菜单里可用的 1-based 序号，可直接用于 switch_costume(number) 或 switch_backdrop(number)。',
                         `修改伪代码 patch：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"patch","patches":[{"op":"replace","startLine":1,"endLine":1,"oldText":"原来的连续行","newText":"新的连续行"}]}]}${AI_ACTION_CLOSE}`,
                         `修改伪代码 replace：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"replace","pseudocode":"完整伪代码"}]}${AI_ACTION_CLOSE}`,
                         '有明确行号且只改少量连续行时优先使用 mode:"patch"。新脚本、空伪代码、新增大段脚本、大范围重写、或修复解析错误时可以使用 mode:"replace" 和 pseudocode。不要为了使用 patch 而拆得很碎。',
