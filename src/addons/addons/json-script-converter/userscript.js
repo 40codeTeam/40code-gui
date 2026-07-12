@@ -1528,6 +1528,13 @@ export default async ({addon, console, msg}) => {
     const AI_REQUEST_RETRY_MAX_COUNT = 5;
     const AI_REQUEST_RETRY_BASE_DELAY = 800;
     const AI_REQUEST_RETRY_MAX_DELAY = 6000;
+    const AI_MCP_BRIDGE_DEFAULT_URL = 'http://127.0.0.1:47740';
+    const AI_MCP_BRIDGE_LEGACY_PATH_RE = /\/json-script-converter\/mcp\/?$/;
+    const AI_MCP_BRIDGE_STORAGE_KEY = 'jsonScriptConverter.mcpBridgeUrl.v1';
+    const AI_MCP_BRIDGE_ENABLED_STORAGE_KEY = 'jsonScriptConverter.mcpBridgeEnabled.v1';
+    const AI_MCP_BRIDGE_IDLE_DELAY = 1500;
+    const AI_MCP_BRIDGE_ACTIVE_DELAY = 80;
+    const AI_MCP_BRIDGE_ERROR_DELAY = 2500;
 
     const loadAiConfig = () => {
         try {
@@ -1539,6 +1546,34 @@ export default async ({addon, console, msg}) => {
     const saveAiConfig = config => {
         try {
             localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(config || {}));
+        } catch (_) { /* ignore */ }
+    };
+    const loadMcpBridgeEnabled = () => {
+        try {
+            return localStorage.getItem(AI_MCP_BRIDGE_ENABLED_STORAGE_KEY) === '1';
+        } catch (_) {
+            return false;
+        }
+    };
+    const saveMcpBridgeEnabled = enabled => {
+        try {
+            localStorage.setItem(AI_MCP_BRIDGE_ENABLED_STORAGE_KEY, enabled ? '1' : '0');
+        } catch (_) { /* ignore */ }
+    };
+    const normalizeMcpBridgeUrl = url => {
+        const value = String(url || AI_MCP_BRIDGE_DEFAULT_URL).trim().replace(/\/+$/, '');
+        return (value.replace(AI_MCP_BRIDGE_LEGACY_PATH_RE, '') || AI_MCP_BRIDGE_DEFAULT_URL);
+    };
+    const loadMcpBridgeUrl = () => {
+        try {
+            return normalizeMcpBridgeUrl(localStorage.getItem(AI_MCP_BRIDGE_STORAGE_KEY));
+        } catch (_) {
+            return AI_MCP_BRIDGE_DEFAULT_URL;
+        }
+    };
+    const saveMcpBridgeUrl = url => {
+        try {
+            localStorage.setItem(AI_MCP_BRIDGE_STORAGE_KEY, normalizeMcpBridgeUrl(url));
         } catch (_) { /* ignore */ }
     };
     const loadUiState = () => {
@@ -3518,9 +3553,14 @@ export default async ({addon, console, msg}) => {
         }
         throw new Error('没有找到工具参数 JSON');
     };
+    const normalizeAiCallableTypeName = value => String(value || '')
+        .trim()
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/[\s-]+/g, '_')
+        .toLowerCase();
     const normalizeAiCallablePayload = parsed => {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
-        const type = String(parsed.type || parsed.name || parsed.action || parsed.toolType || '').trim();
+        const type = normalizeAiCallableTypeName(parsed.type || parsed.name || parsed.action || parsed.toolType);
         let args = parsed.arguments;
         if (typeof args === 'string') {
             try { args = JSON.parse(args); } catch (_) { args = null; }
@@ -3535,7 +3575,7 @@ export default async ({addon, console, msg}) => {
     };
     const normalizeAiSingleToolPayload = parsed => {
         parsed = normalizeAiCallablePayload(parsed);
-        const type = String(parsed && (parsed.type || parsed.action || parsed.toolType) || '').trim();
+        const type = normalizeAiCallableTypeName(parsed && (parsed.type || parsed.action || parsed.toolType));
         const targetIds = normalizeAiToolTargetIds(parsed);
         const lineRanges = normalizeAiToolLineRanges(parsed);
         if (
@@ -3700,7 +3740,7 @@ export default async ({addon, console, msg}) => {
     ].indexOf(type) >= 0;
     const normalizeAiSingleActionPayload = parsed => {
         const payload = normalizeAiCallablePayload(parsed);
-        const type = String(payload && (payload.type || payload.action || payload.toolType) || '').trim();
+        const type = normalizeAiCallableTypeName(payload && (payload.type || payload.action || payload.toolType));
         if (isAiEditActionType(type) || (payload && (typeof payload.pseudocode === 'string' || Array.isArray(payload.edits)))) {
             if (!payload || (typeof payload.pseudocode !== 'string' && !Array.isArray(payload.edits))) {
                 return {ok: false, error: 'edit_pseudocode 动作缺少 pseudocode 或 edits 字段。'};
@@ -4420,6 +4460,8 @@ export default async ({addon, console, msg}) => {
             const storedAiConfig = loadAiConfig();
             const storedAiChats = loadAiChatState();
             const storedUiState = loadUiState();
+            const storedMcpBridgeEnabled = loadMcpBridgeEnabled();
+            const storedMcpBridgeUrl = loadMcpBridgeUrl();
             const storedEndpointPreview = getAiEndpointPreview(storedAiConfig.endpointInput || storedAiConfig.endpoint || '');
             const activeAiConversation = storedAiChats.conversations.find(
                 conversation => conversation.id === storedAiChats.activeConversationId
@@ -4444,6 +4486,9 @@ export default async ({addon, console, msg}) => {
                 aiMessages: activeAiConversation ? activeAiConversation.messages : [],
                 aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES,
                 aiShowProcessLog: false,
+                mcpBridgeEnabled: storedMcpBridgeEnabled,
+                mcpBridgeUrl: storedMcpBridgeUrl,
+                mcpBridgeStatus: storedMcpBridgeEnabled ? 'starting' : 'disabled',
                 aiConfig: storedAiConfig
             };
             this.dirty = false;
@@ -4457,6 +4502,7 @@ export default async ({addon, console, msg}) => {
             this.aiToolNoConfirmRef = React.createRef();
             this.aiRequestRetryEnabledRef = React.createRef();
             this.aiRequestRetryCountRef = React.createRef();
+            this.mcpBridgeUrlRef = React.createRef();
             this.aiInputRef = React.createRef();
             this.aiMessagesRef = React.createRef();
             this.aiShouldAutoScrollMessages = true;
@@ -4480,6 +4526,13 @@ export default async ({addon, console, msg}) => {
             this.aiUserAborted = false;
             this.aiProcessStartedAt = 0;
             this.aiProcessLines = [];
+            this.mcpBridgeClientId = `jsc-page-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            this.mcpBridgeTimer = null;
+            this.mcpBridgeAbortController = null;
+            this.mcpBridgeStopped = true;
+            this.mcpBridgeBusy = false;
+            this.mcpBridgeLastStatus = storedMcpBridgeEnabled ? 'starting' : 'disabled';
+            this.isMountedForMcp = false;
             // 实时同步用的计时器 + 防回环抑制窗口
             this.applyDebounceTimer = null;
             this.regenDebounceTimer = null;
@@ -4504,8 +4557,12 @@ export default async ({addon, console, msg}) => {
             this.projectLoading = false;
         }
         componentDidMount () {
+            this.isMountedForMcp = true;
             this.syncAiInputKeyListener();
             this.installAiDebugApi();
+            if (this.state.mcpBridgeEnabled) {
+                this.enableMcpBridgeFromState();
+            }
             this.syncUiChrome();
             this.syncAiTitleActions();
             window.addEventListener('beforeunload', this.persistAiChatState);
@@ -4528,7 +4585,9 @@ export default async ({addon, console, msg}) => {
             this.syncAiTitleActions();
         }
         componentWillUnmount () {
+            this.isMountedForMcp = false;
             this.cancelAiPendingConfirmations('组件已关闭，删除操作已取消。', false);
+            this.stopMcpBridge();
             this.abortAiRequest(false);
             syncLauncherAiState(false);
             if (this.aiModelsAutoFetchTimer) {
@@ -4880,10 +4939,296 @@ export default async ({addon, console, msg}) => {
                     }
                     return results.length === 1 ? results[0] : {ok: true, results};
                 },
+                executeMcpAction: async (name, args) => this.executeExternalMcpAction(name, args || {}),
+                getMcpBridgeStatus: () => this.getMcpBridgeStatus(),
                 parseHiddenAction: text => parseHiddenAction(text)
             };
             window.__jsonScriptConverterAiDebug = this.aiDebugApi;
         };
+        setMcpBridgeStatus = status => {
+            this.mcpBridgeLastStatus = status;
+            if (this.isMountedForMcp && this.state && this.state.mcpBridgeStatus !== status) {
+                this.setState({mcpBridgeStatus: status});
+            }
+        };
+
+        getMcpBridgeInputUrl = () => {
+            const value = this.mcpBridgeUrlRef.current
+                ? this.mcpBridgeUrlRef.current.value
+                : this.state.mcpBridgeUrl;
+            return normalizeMcpBridgeUrl(value);
+        };
+
+        startDesktopMcpServer = async () => {
+            const desktopMcp = window.fortycodeDesktopMcp;
+            if (!desktopMcp || typeof desktopMcp.start !== 'function') return null;
+            return desktopMcp.start();
+        };
+
+        stopDesktopMcpServer = async () => {
+            const desktopMcp = window.fortycodeDesktopMcp;
+            if (!desktopMcp || typeof desktopMcp.stop !== 'function') return null;
+            return desktopMcp.stop();
+        };
+
+        enableMcpBridgeFromState = async () => {
+            const bridgeUrl = this.getMcpBridgeInputUrl();
+            saveMcpBridgeUrl(bridgeUrl);
+            this.setMcpBridgeStatus('starting');
+            try {
+                const desktopStatus = await this.startDesktopMcpServer();
+                if (desktopStatus && desktopStatus.bridgeUrl) {
+                    saveMcpBridgeUrl(desktopStatus.bridgeUrl);
+                    this.setState({mcpBridgeUrl: desktopStatus.bridgeUrl});
+                }
+            } catch (err) {
+                this.setMcpBridgeStatus(`desktop-start-failed: ${err && err.message ? err.message : String(err)}`);
+            }
+            this.startMcpBridge();
+        };
+
+        handleMcpBridgeEnabledChange = event => {
+            const enabled = !!(event && event.target && event.target.checked);
+            saveMcpBridgeEnabled(enabled);
+            const bridgeUrl = this.getMcpBridgeInputUrl();
+            saveMcpBridgeUrl(bridgeUrl);
+            this.setState({
+                mcpBridgeEnabled: enabled,
+                mcpBridgeUrl: bridgeUrl
+            }, () => {
+                if (enabled) {
+                    this.enableMcpBridgeFromState();
+                } else {
+                    this.stopMcpBridge();
+                    this.stopDesktopMcpServer().catch(() => {});
+                }
+            });
+        };
+
+        handleMcpBridgeUrlChange = event => {
+            const bridgeUrl = String(event && event.target ? event.target.value : '').trim();
+            this.setState({mcpBridgeUrl: bridgeUrl});
+        };
+
+        handleMcpBridgeUrlBlur = () => {
+            const bridgeUrl = this.getMcpBridgeInputUrl();
+            saveMcpBridgeUrl(bridgeUrl);
+            this.setState({mcpBridgeUrl: bridgeUrl}, () => {
+                if (this.state.mcpBridgeEnabled) {
+                    this.stopMcpBridge();
+                    this.enableMcpBridgeFromState();
+                }
+            });
+        };
+
+        getMcpBridgeBaseUrl = () => {
+            const configured = String(
+                window.__JSON_SCRIPT_CONVERTER_MCP_BRIDGE_URL ||
+                this.state.mcpBridgeUrl ||
+                loadMcpBridgeUrl() ||
+                AI_MCP_BRIDGE_DEFAULT_URL
+            ).trim();
+            return normalizeMcpBridgeUrl(configured);
+        };
+
+        getMcpKnownContext = () => {
+            const target = vm.editingTarget;
+            const editor = this.jsonEditorComponent.current;
+            const editorText = editor ? editor.getText() || '' : '';
+            const shouldUseEditorText = !!(this.dirty || (container && container.style.display !== 'none'));
+            const currentText = target
+                ? (shouldUseEditorText ? editorText : this.getTargetPseudocode(target))
+                : '';
+            const knownTargetTexts = new Map();
+            if (target) knownTargetTexts.set(target.id, currentText);
+            return {target, currentText, knownTargetTexts};
+        };
+
+        getMcpBridgeStatus = () => {
+            const editingTarget = vm.editingTarget;
+            return {
+                ok: true,
+                enabled: !!this.state.mcpBridgeEnabled,
+                bridgeUrl: this.getMcpBridgeBaseUrl(),
+                clientId: this.mcpBridgeClientId,
+                status: this.state.mcpBridgeStatus || this.mcpBridgeLastStatus,
+                pageTitle: document.title,
+                addonVisible: !!(container && container.style.display !== 'none'),
+                editingTarget: editingTarget ? this.getAiTargetSummary(editingTarget, {includeCostumes: false}) : null,
+                targets: this.getAiTargetSummaries().map(target => ({
+                    targetRef: target.targetRef,
+                    targetId: target.targetId,
+                    targetName: target.targetName,
+                    targetType: target.targetType,
+                    isStage: !!target.isStage
+                }))
+            };
+        };
+
+        executeExternalMcpEdit = editPayload => {
+            const {knownTargetTexts} = this.getMcpKnownContext();
+            const prepared = this.prepareAiEditPayload(editPayload, knownTargetTexts);
+            if (!prepared.ok) {
+                return {
+                    ok: false,
+                    type: 'edit_pseudocode',
+                    error: prepared.error,
+                    errors: prepared.errors || null
+                };
+            }
+            const result = this.applyAiApplications(prepared.applications);
+            if (!result.ok) return {ok: false, type: 'edit_pseudocode', error: result.error};
+            return {
+                ok: true,
+                type: 'edit_pseudocode',
+                loadedExtensions: result.loadedExtensions || [],
+                applications: prepared.applications.map(app => ({
+                    targetRef: app.targetRef,
+                    targetId: app.targetId,
+                    targetName: app.targetName,
+                    mode: app.mode,
+                    patchCount: Array.isArray(app.patches) ? app.patches.length : 0,
+                    lineCount: splitAiLines(app.pseudocode).length
+                }))
+            };
+        };
+
+        executeExternalMcpAction = async (name, args) => {
+            const toolName = normalizeAiCallableTypeName(name);
+            if (toolName === 'jsc_get_status' || toolName === 'get_status' || toolName === 'status') {
+                return this.getMcpBridgeStatus();
+            }
+            let payload;
+            const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+            if (toolName === 'jsc_call_action' || toolName === 'call_action') {
+                payload = rawArgs.action || rawArgs.payload || rawArgs;
+                if (typeof payload === 'string') {
+                    const parsed = parseHiddenAction(payload);
+                    if (parsed.error) return {ok: false, error: parsed.error};
+                    if (parsed.actions && parsed.actions.length) {
+                        payload = {type: 'batch', calls: parsed.actions.map(action => action.edit || action.tool)};
+                    } else {
+                        try { payload = JSON.parse(stripCodeFence(payload)); } catch (err) { return {ok: false, error: err.message}; }
+                    }
+                }
+            } else {
+                payload = {
+                    ...rawArgs,
+                    type: rawArgs.type || toolName
+                };
+            }
+
+            const normalized = normalizeAiActionPayload(payload);
+            if (!normalized.ok) return {ok: false, error: normalized.error};
+            const {currentText, knownTargetTexts} = this.getMcpKnownContext();
+            const results = [];
+            for (const action of normalized.actions) {
+                if (action.kind === 'edit') {
+                    const result = this.executeExternalMcpEdit(action.edit);
+                    results.push(result);
+                    if (!result.ok) return normalized.actions.length === 1 ? result : {ok: false, results, error: result.error};
+                    continue;
+                }
+                if (action.kind === 'tool') {
+                    const result = await this.executeAiTool(action.tool, knownTargetTexts, currentText, null);
+                    results.push(result);
+                    if (!result.ok) return normalized.actions.length === 1 ? result : {ok: false, results, error: result.error};
+                    continue;
+                }
+                const error = `不支持的 MCP 动作类型: ${action.kind || action.type || ''}`;
+                const result = {ok: false, error};
+                results.push(result);
+                return normalized.actions.length === 1 ? result : {ok: false, results, error};
+            }
+            return results.length === 1 ? results[0] : {ok: true, type: 'batch', results};
+        };
+
+        postMcpBridgeResult = async (callId, payload) => {
+            if (!callId) return;
+            const baseUrl = this.getMcpBridgeBaseUrl();
+            await fetch(`${baseUrl}/result`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    clientId: this.mcpBridgeClientId,
+                    id: callId,
+                    ...payload
+                })
+            });
+        };
+
+        handleMcpBridgeCall = async call => {
+            if (!call || !call.id) return;
+            try {
+                const result = await this.executeExternalMcpAction(call.name, call.arguments || {});
+                await this.postMcpBridgeResult(call.id, {result});
+            } catch (err) {
+                await this.postMcpBridgeResult(call.id, {
+                    error: err && err.message ? err.message : String(err)
+                });
+            }
+        };
+
+        pollMcpBridge = async () => {
+            if (this.mcpBridgeStopped || this.mcpBridgeBusy) return;
+            this.mcpBridgeBusy = true;
+            let nextDelay = AI_MCP_BRIDGE_IDLE_DELAY;
+            const baseUrl = this.getMcpBridgeBaseUrl();
+            const controller = new AbortController();
+            this.mcpBridgeAbortController = controller;
+            try {
+                const url = new URL(`${baseUrl}/poll`);
+                url.searchParams.set('clientId', this.mcpBridgeClientId);
+                url.searchParams.set('title', document.title || '');
+                const response = await fetch(url.toString(), {
+                    method: 'GET',
+                    cache: 'no-store',
+                    signal: controller.signal
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                const calls = Array.isArray(data && data.calls) ? data.calls : [];
+                this.setMcpBridgeStatus('connected');
+                if (calls.length) {
+                    nextDelay = AI_MCP_BRIDGE_ACTIVE_DELAY;
+                    for (const call of calls) {
+                        await this.handleMcpBridgeCall(call);
+                    }
+                }
+            } catch (err) {
+                if (!this.mcpBridgeStopped && (!err || err.name !== 'AbortError')) {
+                    this.setMcpBridgeStatus('offline');
+                    nextDelay = AI_MCP_BRIDGE_ERROR_DELAY;
+                }
+            } finally {
+                if (this.mcpBridgeAbortController === controller) this.mcpBridgeAbortController = null;
+                this.mcpBridgeBusy = false;
+                if (!this.mcpBridgeStopped) {
+                    this.mcpBridgeTimer = setTimeout(this.pollMcpBridge, nextDelay);
+                }
+            }
+        };
+
+        startMcpBridge = () => {
+            this.mcpBridgeStopped = false;
+            if (this.mcpBridgeTimer) clearTimeout(this.mcpBridgeTimer);
+            this.setMcpBridgeStatus('connecting');
+            this.mcpBridgeTimer = setTimeout(this.pollMcpBridge, 250);
+        };
+
+        stopMcpBridge = () => {
+            this.mcpBridgeStopped = true;
+            if (this.mcpBridgeTimer) {
+                clearTimeout(this.mcpBridgeTimer);
+                this.mcpBridgeTimer = null;
+            }
+            if (this.mcpBridgeAbortController) {
+                this.mcpBridgeAbortController.abort();
+                this.mcpBridgeAbortController = null;
+            }
+            this.setMcpBridgeStatus('disabled');
+        };
+
         syncAiInputKeyListener = () => {
             const nextInput = this.aiInputRef.current;
             if (this.aiInputElement === nextInput) return;
@@ -6277,11 +6622,12 @@ export default async ({addon, console, msg}) => {
                 if (!resolved.target) return {ok: false, type, error: resolved.error};
                 if (resolved.target.isStage) return {ok: false, type, error: '不能删除舞台/背景目标'};
                 const summary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
-                const confirmed = await this.requestAiUserConfirmation(
-                    `AI 请求删除角色：${summary.targetName}\n` +
-                    '删除会移除这个角色及其脚本、造型和声音。\n' +
-                    '请在这里确认是否继续。'
-                );
+                const confirmed = tool.confirm === true || this.shouldSkipAiToolConfirmation() ||
+                    await this.requestAiUserConfirmation(
+                        `AI 请求删除角色：${summary.targetName}\n` +
+                        '删除会移除这个角色及其脚本、造型和声音。\n' +
+                        '请在这里确认是否继续。'
+                    );
                 if (!confirmed) {
                     return {ok: false, type, cancelled: true, error: `用户取消删除角色：${summary.targetName}`};
                 }
@@ -6404,11 +6750,12 @@ export default async ({addon, console, msg}) => {
                 if (found.error) return {ok: false, type, error: found.error};
                 const deletedName = costumes[found.index] && costumes[found.index].name;
                 const label = target.isStage ? '背景' : '造型';
-                const confirmed = await this.requestAiUserConfirmation(
-                    `AI 请求删除${label}：${deletedName}\n` +
-                    `所属目标：${getAiTargetName(target)}\n` +
-                    '请在这里确认是否继续。'
-                );
+                const confirmed = tool.confirm === true || this.shouldSkipAiToolConfirmation() ||
+                    await this.requestAiUserConfirmation(
+                        `AI 请求删除${label}：${deletedName}\n` +
+                        `所属目标：${getAiTargetName(target)}\n` +
+                        '请在这里确认是否继续。'
+                    );
                 if (!confirmed) {
                     return {ok: false, type, cancelled: true, error: `用户取消删除${label}：${deletedName}`};
                 }
@@ -6428,18 +6775,133 @@ export default async ({addon, console, msg}) => {
             return {ok: false, type, error: '不支持的项目结构工具请求'};
         };
 
+        getAiGreenFlagHatCount = () => {
+            const targets = vm.runtime && Array.isArray(vm.runtime.targets)
+                ? vm.runtime.targets
+                : [];
+            let count = 0;
+            for (const target of targets) {
+                const blocks = target && target.blocks && target.blocks._blocks;
+                if (!blocks) continue;
+                for (const blockId of Object.keys(blocks)) {
+                    const block = blocks[blockId];
+                    if (block && block.opcode === 'event_whenflagclicked') count++;
+                }
+            }
+            return count;
+        };
+
+        findAiGreenFlagControl = () => {
+            if (typeof document === 'undefined') return null;
+            const selectors = [
+                '[class*="controls_controls-container"] img[class*="green-flag_green-flag"]',
+                'img[class*="green-flag_green-flag"]',
+                '[class*="green-flag-overlay-wrapper"]',
+                'img[title="Go"]',
+                'img[title="运行"]',
+                'img[title="开始"]',
+                'img[title="绿旗"]',
+                'img[aria-label="Go"]'
+            ];
+            const candidates = [];
+            const seen = new Set();
+            const push = element => {
+                if (!element || seen.has(element)) return;
+                seen.add(element);
+                candidates.push(element);
+            };
+            for (const selector of selectors) {
+                for (const element of Array.from(document.querySelectorAll(selector))) {
+                    push(element);
+                }
+            }
+            for (const element of Array.from(document.querySelectorAll('img'))) {
+                const className = String(element.className || '');
+                const src = String(element.getAttribute('src') || '');
+                const title = String(element.getAttribute('title') || '');
+                if (
+                    className.indexOf('green-flag') >= 0 ||
+                    src.indexOf('green-flag') >= 0 ||
+                    title === 'Go' ||
+                    title.indexOf('绿旗') >= 0
+                ) {
+                    push(element);
+                }
+            }
+            return candidates.find(element => {
+                if (!element || typeof element.getBoundingClientRect !== 'function') return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }) || null;
+        };
+
+        clickAiGreenFlagControl = () => {
+            const element = this.findAiGreenFlagControl();
+            if (!element) return {ok: false, error: '找不到界面上的绿旗按钮'};
+            const label = String(element.getAttribute('title') || element.getAttribute('aria-label') || element.className || 'green flag');
+            element.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            }));
+            return {ok: true, label};
+        };
+
+        captureAiStartHats = callback => {
+            const runtime = vm.runtime;
+            const originalStartHats = runtime && runtime.startHats;
+            const capture = {
+                called: false,
+                eventThreadCount: 0,
+                totalThreadCount: 0,
+                calls: []
+            };
+            if (typeof originalStartHats !== 'function') {
+                callback();
+                return capture;
+            }
+            const wrappedStartHats = function (...args) {
+                const result = originalStartHats.apply(this, args);
+                const opcode = String(args[0] || '');
+                const threadCount = Array.isArray(result) ? result.length : 0;
+                capture.calls.push({opcode, threadCount});
+                capture.totalThreadCount += threadCount;
+                if (opcode === 'event_whenflagclicked') {
+                    capture.called = true;
+                    capture.eventThreadCount += threadCount;
+                }
+                return result;
+            };
+            runtime.startHats = wrappedStartHats;
+            try {
+                callback();
+            } finally {
+                if (runtime.startHats === wrappedStartHats) {
+                    runtime.startHats = originalStartHats;
+                }
+            }
+            return capture;
+        };
+
+        waitAiRuntimeControlTick = () => new Promise(resolve => setTimeout(resolve, 60));
+
         getAiRuntimeStatus = () => {
             const state = addon.tab.redux && addon.tab.redux.state;
             const vmStatus = state && state.scratchGui && state.scratchGui.vmStatus;
             const threads = vm.runtime && Array.isArray(vm.runtime.threads)
                 ? vm.runtime.threads
                 : [];
+            const nonMonitorThreadCount = threads.filter(thread => !(thread && thread.updateMonitor)).length;
+            const frameLoopRunning = !!(vm.runtime && vm.runtime.frameLoop && vm.runtime.frameLoop.running);
             return {
-                started: !!(vmStatus && vmStatus.started),
+                started: !!(vmStatus && vmStatus.started) || frameLoopRunning,
                 running: vmStatus && typeof vmStatus.running === 'boolean'
-                    ? vmStatus.running || threads.length > 0
-                    : threads.length > 0,
+                    ? vmStatus.running || nonMonitorThreadCount > 0
+                    : nonMonitorThreadCount > 0,
                 threadCount: threads.length,
+                nonMonitorThreadCount,
+                frameLoopRunning,
+                greenFlagHatCount: this.getAiGreenFlagHatCount(),
                 paused: isPaused()
             };
         };
@@ -6447,24 +6909,101 @@ export default async ({addon, console, msg}) => {
         executeAiRuntimeControlTool = async tool => {
             const type = tool && tool.type;
             if (type === 'click_green_flag') {
-                if (typeof vm.greenFlag !== 'function' && (!vm.runtime || typeof vm.runtime.greenFlag !== 'function')) {
+                if (
+                    typeof vm.greenFlag !== 'function' &&
+                    (!vm.runtime || (
+                        typeof vm.runtime.greenFlag !== 'function' &&
+                        typeof vm.runtime.startHats !== 'function'
+                    )) &&
+                    !this.findAiGreenFlagControl()
+                ) {
                     return {ok: false, type, error: '当前 VM 不支持点击绿旗'};
                 }
                 const before = this.getAiRuntimeStatus();
+                const callPath = [];
                 if (before.paused) setPaused(false);
-                const didStartVm = !before.started && typeof vm.start === 'function';
-                if (didStartVm) vm.start();
-                if (typeof vm.greenFlag === 'function') vm.greenFlag();
-                else vm.runtime.greenFlag();
+                const invokeDirectGreenFlag = () => {
+                    const current = this.getAiRuntimeStatus();
+                    const didStartVm = !current.started && typeof vm.start === 'function';
+                    if (didStartVm) {
+                        vm.start();
+                        callPath.push('vm.start');
+                    }
+                    if (typeof vm.greenFlag === 'function') {
+                        vm.greenFlag();
+                        callPath.push('vm.greenFlag');
+                        return;
+                    }
+                    if (vm.runtime && typeof vm.runtime.greenFlag === 'function') {
+                        vm.runtime.greenFlag();
+                        callPath.push('runtime.greenFlag');
+                    }
+                };
+                const mergeCapture = (target, source) => {
+                    if (!source) return target;
+                    target.called = target.called || source.called;
+                    target.eventThreadCount += source.eventThreadCount || 0;
+                    target.totalThreadCount += source.totalThreadCount || 0;
+                    target.calls = target.calls.concat(source.calls || []);
+                    return target;
+                };
+                let capture = {
+                    called: false,
+                    eventThreadCount: 0,
+                    totalThreadCount: 0,
+                    calls: []
+                };
+                let usedDomClick = false;
+                try {
+                    capture = mergeCapture(capture, this.captureAiStartHats(() => {
+                        const clicked = this.clickAiGreenFlagControl();
+                        if (clicked.ok) {
+                            usedDomClick = true;
+                            callPath.push(`dom.click:${clicked.label}`);
+                        } else {
+                            invokeDirectGreenFlag();
+                        }
+                    }));
+                    if (
+                        usedDomClick &&
+                        !capture.called &&
+                        (typeof vm.greenFlag === 'function' || (vm.runtime && typeof vm.runtime.greenFlag === 'function'))
+                    ) {
+                        capture = mergeCapture(capture, this.captureAiStartHats(invokeDirectGreenFlag));
+                    }
+                } catch (err) {
+                    return {
+                        ok: false,
+                        type,
+                        error: `点击绿旗失败：${err && err.message ? err.message : String(err)}`
+                    };
+                }
+                let fallbackThreadCount = 0;
+                if (
+                    !capture.called &&
+                    vm.runtime &&
+                    typeof vm.runtime.startHats === 'function' &&
+                    (before.greenFlagHatCount > 0 || this.getAiGreenFlagHatCount() > 0)
+                ) {
+                    const threads = vm.runtime.startHats('event_whenflagclicked') || [];
+                    fallbackThreadCount = Array.isArray(threads) ? threads.length : 0;
+                    callPath.push('runtime.startHats:fallback');
+                }
+                await this.waitAiRuntimeControlTick();
                 const status = this.getAiRuntimeStatus();
                 return {
                     ok: true,
                     type,
                     summary: '已点击绿旗。',
-                    started: status.started || before.started || didStartVm,
+                    started: status.started || before.started || callPath.indexOf('vm.start') >= 0,
                     running: status.running,
                     paused: status.paused,
-                    threadCount: status.threadCount
+                    threadCount: status.threadCount,
+                    nonMonitorThreadCount: status.nonMonitorThreadCount,
+                    frameLoopRunning: status.frameLoopRunning,
+                    greenFlagHatCount: status.greenFlagHatCount,
+                    greenFlagStartedThreads: capture.eventThreadCount + fallbackThreadCount,
+                    callPath
                 };
             }
             if (type === 'click_pause') {
@@ -7313,6 +7852,11 @@ export default async ({addon, console, msg}) => {
                                     running: !!toolResult.running,
                                     paused: !!toolResult.paused,
                                     threadCount: toolResult.threadCount || 0,
+                                    nonMonitorThreadCount: toolResult.nonMonitorThreadCount || 0,
+                                    frameLoopRunning: !!toolResult.frameLoopRunning,
+                                    greenFlagHatCount: toolResult.greenFlagHatCount || 0,
+                                    greenFlagStartedThreads: toolResult.greenFlagStartedThreads || 0,
+                                    callPath: toolResult.callPath || null,
                                     alreadyPaused: !!toolResult.alreadyPaused
                                 }
                             };
@@ -8793,6 +9337,10 @@ export default async ({addon, console, msg}) => {
             const toolNoConfirm = !!config.toolNoConfirm;
             const requestRetryEnabled = config.requestRetryEnabled !== false;
             const requestRetryCount = normalizeAiRequestRetryCount(config.requestRetryCount);
+            const mcpBridgeEnabled = !!this.state.mcpBridgeEnabled;
+            const mcpBridgeStatus = this.state.mcpBridgeStatus || this.mcpBridgeLastStatus || 'disabled';
+            const mcpBridgeUrl = this.state.mcpBridgeUrl || AI_MCP_BRIDGE_DEFAULT_URL;
+            const hasDesktopMcpApi = !!(window.fortycodeDesktopMcp && typeof window.fortycodeDesktopMcp.start === 'function');
             const endpointInputValue = this.aiEndpointRef.current
                 ? this.aiEndpointRef.current.value
                 : (config.endpointInput || config.endpoint || '');
@@ -9379,15 +9927,18 @@ export default async ({addon, console, msg}) => {
                     {showConfig ? (
                         <div style={{
                             flex: '1 1 auto',
+                            minHeight: 0,
                             display: 'flex',
-                            alignItems: 'center',
+                            alignItems: 'flex-start',
                             justifyContent: 'center',
-                            padding: 24
+                            padding: 24,
+                            overflow: 'auto'
                         }}>
                             <div style={{
                                 width: 'min(560px, 100%)',
                                 display: 'grid',
-                                gap: 12
+                                gap: 12,
+                                paddingBottom: 24
                             }}>
                                 <input
                                     ref={this.aiEndpointRef}
@@ -9605,6 +10156,77 @@ export default async ({addon, console, msg}) => {
                                         </span>
                                     </span>
                                 </label>
+                                <div style={{
+                                    display: 'grid',
+                                    gap: 8,
+                                    padding: '10px 11px',
+                                    border: '1px solid #dbe3ee',
+                                    borderRadius: 8,
+                                    background: mcpBridgeEnabled ? '#eff6ff' : '#ffffff'
+                                }}>
+                                    <label style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: 'auto minmax(0, 1fr)',
+                                        gap: 10,
+                                        alignItems: 'start',
+                                        cursor: 'pointer'
+                                    }}>
+                                        <input
+                                            className="jsonConverterCheckbox"
+                                            type="checkbox"
+                                            checked={mcpBridgeEnabled}
+                                            onChange={this.handleMcpBridgeEnabledChange}
+                                            style={{
+                                                width: 16,
+                                                height: 16,
+                                                margin: '2px 0 0',
+                                                accentColor: '#2563eb',
+                                                cursor: 'pointer'
+                                            }}
+                                        />
+                                        <span style={{minWidth: 0}}>
+                                            <span style={{
+                                                display: 'block',
+                                                color: '#172033',
+                                                fontSize: 13,
+                                                fontWeight: 700,
+                                                lineHeight: 1.35
+                                            }}>
+                                                启用 MCP 桥接
+                                            </span>
+                                            <span style={{
+                                                display: 'block',
+                                                marginTop: 3,
+                                                color: '#64748b',
+                                                fontSize: 12,
+                                                lineHeight: 1.45
+                                            }}>
+                                                {hasDesktopMcpApi
+                                                    ? '开启后桌面端会启动本地 MCP 服务，并允许外部客户端调用当前页面工具。'
+                                                    : '开启后页面会连接本地 MCP 服务；需要外部先启动 mcp-server.cjs。'}
+                                            </span>
+                                        </span>
+                                    </label>
+                                    <input
+                                        ref={this.mcpBridgeUrlRef}
+                                        value={mcpBridgeUrl}
+                                        placeholder={AI_MCP_BRIDGE_DEFAULT_URL}
+                                        onChange={this.handleMcpBridgeUrlChange}
+                                        onBlur={this.handleMcpBridgeUrlBlur}
+                                        style={{
+                                            ...fieldStyle,
+                                            height: 30,
+                                            fontSize: 12
+                                        }}
+                                    />
+                                    <div style={{
+                                        color: mcpBridgeEnabled && mcpBridgeStatus === 'connected' ? '#047857' : '#64748b',
+                                        fontSize: 12,
+                                        lineHeight: 1.35
+                                    }}>
+                                        MCP 状态：{mcpBridgeStatus}
+                                    </div>
+                                </div>
                                 <div style={{
                                     display: 'grid',
                                     gap: 8,
@@ -10224,6 +10846,8 @@ export default async ({addon, console, msg}) => {
     }
 
     document.body.appendChild(initButton);
+    renderModal();
+    addon.tab.displayNoneWhileDisabled(container);
 
     addon.self.addEventListener('disabled', () => {
         container.style.display = 'none';
