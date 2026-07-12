@@ -125,6 +125,9 @@ caller intentionally confirms the delete.
 
 Use `jsc_bridge_status` to check whether the browser page is attached, and
 `jsc_get_status` to inspect the connected page state and target refs.
+`jsc_bridge_status` returns the active address as `bridge.pageUrl` and on each
+entry in `bridge.clients[].pageUrl`. `jsc_get_status` returns the current
+browser address directly as `pageUrl`, including its query string and hash.
 
 ## Pseudocode syntax
 

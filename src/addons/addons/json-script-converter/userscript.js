@@ -5192,6 +5192,8 @@ export default async ({addon, console, msg}) => {
             return {target, currentText, knownTargetTexts};
         };
 
+        getMcpPageUrl = () => String(window.location && window.location.href || '');
+
         getMcpBridgeStatus = () => {
             const editingTarget = vm.editingTarget;
             return {
@@ -5201,6 +5203,7 @@ export default async ({addon, console, msg}) => {
                 clientId: this.mcpBridgeClientId,
                 status: this.state.mcpBridgeStatus || this.mcpBridgeLastStatus,
                 pageTitle: document.title,
+                pageUrl: this.getMcpPageUrl(),
                 addonVisible: !!(container && container.style.display !== 'none'),
                 editingTarget: editingTarget ? this.getAiTargetSummary(editingTarget, {includeCostumes: false}) : null,
                 targets: this.getAiTargetSummaries().map(target => ({
@@ -5299,6 +5302,8 @@ export default async ({addon, console, msg}) => {
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     clientId: this.mcpBridgeClientId,
+                    title: document.title || '',
+                    pageUrl: this.getMcpPageUrl(),
                     id: callId,
                     ...payload
                 })
@@ -5328,6 +5333,7 @@ export default async ({addon, console, msg}) => {
                 const url = new URL(`${baseUrl}/poll`);
                 url.searchParams.set('clientId', this.mcpBridgeClientId);
                 url.searchParams.set('title', document.title || '');
+                url.searchParams.set('pageUrl', this.getMcpPageUrl());
                 const response = await fetch(url.toString(), {
                     method: 'GET',
                     cache: 'no-store',

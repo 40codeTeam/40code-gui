@@ -1,6 +1,7 @@
 import ScratchStorage from '@turbowarp/scratch-storage';
 
 import defaultProject from './default-project';
+import normalizeAssetRequestUrl from './normalize-asset-request-url';
 
 /**
  * Wrapper for ScratchStorage which adds default web sources.
@@ -55,7 +56,9 @@ class Storage extends ScratchStorage {
         this.assetHost = assetHost;
     }
     getAssetGetConfig (asset) {
-        return `${this.assetHost}/internalapi/asset/${asset.assetId}.${asset.dataFormat}`;
+        return normalizeAssetRequestUrl(
+            `${this.assetHost}/internalapi/asset/${asset.assetId}.${asset.dataFormat}`
+        );
     }
     getAssetCreateConfig (asset) {
         return {

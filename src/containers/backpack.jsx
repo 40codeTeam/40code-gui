@@ -16,6 +16,7 @@ import {
 } from '../lib/backpack-api';
 import DragConstants from '../lib/drag-constants';
 import DropAreaHOC from '../lib/drop-area-hoc.jsx';
+import normalizeAssetRequestUrl from '../lib/normalize-asset-request-url';
 
 import {connect} from 'react-redux';
 import storage from '../lib/storage';
@@ -81,7 +82,7 @@ class Backpack extends React.Component {
         this.props.vm.removeListener('BLOCK_DRAG_UPDATE', this.handleBlockDragUpdate);
     }
     getBackpackAssetURL (asset) {
-        return `${this.props.host}/${asset.assetId}.${asset.dataFormat}`;
+        return normalizeAssetRequestUrl(`${this.props.host}/${asset.assetId}.${asset.dataFormat}`);
     }
     handleToggle () {
         const newState = !this.state.expanded;

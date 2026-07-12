@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVER_NAME: &str = "40code-json-script-converter";
-const SERVER_VERSION: &str = "0.2.1-native";
+const SERVER_VERSION: &str = "0.3.0-native";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const LEGACY_BRIDGE_PATH: &str = "/json-script-converter/mcp";
 const PSEUDOCODE_SYNTAX_URI: &str = "jsc://pseudocode/syntax";
@@ -111,6 +111,7 @@ struct BridgeCall {
 struct BridgeClient {
     client_id: String,
     title: String,
+    page_url: String,
     last_seen: Instant,
 }
 
@@ -226,7 +227,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "jsc_bridge_status",
-            "Return MCP bridge status without calling the 40code page.",
+            "Return MCP bridge status and the connected 40code page URL without calling page tools.",
             json!({}),
             &[],
         ),
@@ -238,7 +239,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "jsc_get_status",
-            "Return the connected 40code page status, current target, and target refs.",
+            "Return the connected 40code page URL, status, current target, and target refs.",
             json!({}),
             &[],
         ),
@@ -407,6 +408,7 @@ fn get_bridge_status(shared: &Shared) -> Value {
             json!({
                 "clientId": client.client_id,
                 "title": client.title,
+                "pageUrl": client.page_url,
                 "lastSeenAgoMs": last_seen_ms,
                 "lastSeenText": format!("{} 秒前", last_seen_ms / 1000)
             })
@@ -417,12 +419,21 @@ fn get_bridge_status(shared: &Shared) -> Value {
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX)
     });
-    let connected = clients.iter().any(|item| {
+    let active_client = clients.iter().find(|item| {
         item.get("lastSeenAgoMs")
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX)
             <= shared.config.client_ttl.as_millis() as u64
     });
+    let connected = active_client.is_some();
+    let page_title = active_client
+        .and_then(|item| item.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let page_url = active_client
+        .and_then(|item| item.get("pageUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let status = if connected {
         "connected"
     } else {
@@ -462,6 +473,8 @@ fn get_bridge_status(shared: &Shared) -> Value {
             "mcpHttpUrl": mcp_http_url,
             "rootMcpHttpUrl": format!("http://{}:{}/", shared.config.host, shared.config.port),
             "connected": connected,
+            "pageTitle": page_title,
+            "pageUrl": page_url,
             "status": status,
             "statusText": status_text,
             "pageHint": "网页端请连接 bridgeUrl；AI 软件请连接 mcpHttpUrl。",
@@ -859,6 +872,7 @@ fn handle_poll(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         .cloned()
         .unwrap_or_else(|| "unknown".to_string());
     let title = req.query.get("title").cloned().unwrap_or_default();
+    let page_url = req.query.get("pageUrl").cloned().unwrap_or_default();
     let deadline = Instant::now() + shared.config.poll_timeout;
     let mut state = shared.state.lock().unwrap();
     state.clients.insert(
@@ -866,6 +880,7 @@ fn handle_poll(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         BridgeClient {
             client_id,
             title,
+            page_url,
             last_seen: Instant::now(),
         },
     );
@@ -903,17 +918,26 @@ fn handle_result(shared: &Shared, req: HttpRequest, stream: &mut TcpStream) {
         }
     };
     if let Some(client_id) = payload.get("clientId").and_then(Value::as_str) {
+        let mut state = shared.state.lock().unwrap();
+        let previous = state.clients.get(client_id);
         let title = payload
             .get("title")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let mut state = shared.state.lock().unwrap();
+            .map(str::to_string)
+            .or_else(|| previous.map(|client| client.title.clone()))
+            .unwrap_or_default();
+        let page_url = payload
+            .get("pageUrl")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| previous.map(|client| client.page_url.clone()))
+            .unwrap_or_default();
         state.clients.insert(
             client_id.to_string(),
             BridgeClient {
                 client_id: client_id.to_string(),
                 title,
+                page_url,
                 last_seen: Instant::now(),
             },
         );
@@ -1237,6 +1261,42 @@ mod tests {
         assert!(message.contains("47740"));
         assert!(message.contains("已被其他程序占用"));
         assert!(message.contains("重启电脑"));
+    }
+
+    #[test]
+    fn bridge_status_exposes_the_connected_page_url() {
+        let mut clients = HashMap::new();
+        clients.insert(
+            "page-1".to_string(),
+            BridgeClient {
+                client_id: "page-1".to_string(),
+                title: "40code Editor".to_string(),
+                page_url: "https://example.com/editor?project=42#code".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+        let shared = Shared {
+            config: test_config(47740),
+            state: Mutex::new(BridgeState {
+                calls: VecDeque::new(),
+                pending: HashMap::new(),
+                clients,
+            }),
+            cv: Condvar::new(),
+            counter: AtomicU64::new(1),
+        };
+
+        let status = get_bridge_status(&shared);
+        assert_eq!(
+            status.pointer("/bridge/pageUrl").and_then(Value::as_str),
+            Some("https://example.com/editor?project=42#code")
+        );
+        assert_eq!(
+            status
+                .pointer("/bridge/clients/0/pageUrl")
+                .and_then(Value::as_str),
+            Some("https://example.com/editor?project=42#code")
+        );
     }
 
     #[test]

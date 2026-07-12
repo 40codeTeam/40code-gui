@@ -11,7 +11,7 @@ const normalizeHttpPath = value => {
 };
 
 const SERVER_NAME = '40code-json-script-converter';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.3.0';
 const PROTOCOL_VERSION = '2025-06-18';
 const HOST = process.env.JSC_MCP_HOST || '127.0.0.1';
 const PORT = Number(process.env.JSC_MCP_PORT || 47740);
@@ -207,9 +207,9 @@ const tool = (name, description, properties = {}, required = []) => ({
 });
 
 const TOOL_DEFINITIONS = [
-    tool('jsc_bridge_status', 'Return MCP bridge status without calling the 40code page.'),
+    tool('jsc_bridge_status', 'Return MCP bridge status and the connected 40code page URL without calling page tools.'),
     tool('jsc_get_pseudocode_syntax', 'Return the pseudocode syntax guide for edit_pseudocode. Call this before generating pseudocode.'),
-    tool('jsc_get_status', 'Return the connected 40code page status, current target, and target refs.'),
+    tool('jsc_get_status', 'Return the connected 40code page URL, status, current target, and target refs.'),
     tool('jsc_call_action', 'Call any json-script-converter action payload directly. Use this for batch calls or advanced payloads.', {
         action: objectProp('Action payload, hidden ACTION JSON, or batch payload.')
     }, ['action']),
@@ -384,9 +384,11 @@ const getBridgeStatus = () => {
         .map(client => ({
             clientId: client.clientId,
             title: client.title,
+            pageUrl: client.pageUrl || '',
             lastSeenAgoMs: now - client.lastSeen
         }))
         .sort((a, b) => a.lastSeenAgoMs - b.lastSeenAgoMs);
+    const activeClient = clients.find(client => client.lastSeenAgoMs <= BRIDGE_CLIENT_TTL_MS) || null;
     return {
         ok: true,
         bridge: {
@@ -398,7 +400,9 @@ const getBridgeStatus = () => {
             legacyBridgeUrl: `http://${HOST}:${PORT}${LEGACY_BRIDGE_PATH}`,
             mcpHttpUrl: `http://${HOST}:${PORT}${MCP_HTTP_PATH}`,
             rootMcpHttpUrl: `http://${HOST}:${PORT}/`,
-            connected: clients.some(client => client.lastSeenAgoMs <= BRIDGE_CLIENT_TTL_MS),
+            connected: !!activeClient,
+            pageTitle: activeClient ? activeClient.title : '',
+            pageUrl: activeClient ? activeClient.pageUrl : '',
             clients,
             pendingCalls: bridgeCalls.length,
             waitingResults: bridgeResults.size
@@ -438,7 +442,8 @@ const enqueueBridgeCall = (name, args) => new Promise((resolve, reject) => {
 const handlePoll = (req, res, url) => {
     const clientId = url.searchParams.get('clientId') || 'unknown';
     const title = url.searchParams.get('title') || '';
-    bridgeClients.set(clientId, {clientId, title, lastSeen: Date.now()});
+    const pageUrl = url.searchParams.get('pageUrl') || '';
+    bridgeClients.set(clientId, {clientId, title, pageUrl, lastSeen: Date.now()});
     if (bridgeCalls.length) {
         sendJson(res, 200, {ok: true, calls: bridgeCalls.splice(0, Math.min(8, bridgeCalls.length))});
         return;
@@ -466,9 +471,11 @@ const handleResult = async (req, res) => {
     const body = await readBody(req);
     const payload = body ? JSON.parse(body) : {};
     if (payload.clientId) {
+        const previous = bridgeClients.get(payload.clientId);
         bridgeClients.set(payload.clientId, {
             clientId: payload.clientId,
-            title: payload.title || '',
+            title: payload.title || (previous && previous.title) || '',
+            pageUrl: payload.pageUrl || (previous && previous.pageUrl) || '',
             lastSeen: Date.now()
         });
     }
