@@ -161,6 +161,15 @@ const OPCODE_DEFS = [
         {type: 'input', name: 'SOUND_MENU', primType: null, menu: {opcode: 'sound_sounds_menu', field: 'SOUND_MENU'}}
     ]},
     {opcode: 'sound_stopallsounds', name: 'stop_all_sounds', kind: 'stmt', args: []},
+    {opcode: 'sound_changeeffectby', name: 'change_sound_effect', kind: 'stmt', args: [
+        {type: 'field', name: 'EFFECT'},
+        {type: 'input', name: 'VALUE', primType: 4}
+    ]},
+    {opcode: 'sound_seteffectto', name: 'set_sound_effect', kind: 'stmt', args: [
+        {type: 'field', name: 'EFFECT'},
+        {type: 'input', name: 'VALUE', primType: 4}
+    ]},
+    {opcode: 'sound_cleareffects', name: 'clear_sound_effects', kind: 'stmt', args: []},
     {opcode: 'sound_changevolumeby', name: 'change_volume', kind: 'stmt', args: [{type: 'input', name: 'VOLUME', primType: 4}]},
     {opcode: 'sound_setvolumeto', name: 'set_volume', kind: 'stmt', args: [{type: 'input', name: 'VOLUME', primType: 4}]},
     {opcode: 'sound_volume', name: 'volume', kind: 'reporter', args: []},
@@ -176,6 +185,9 @@ const OPCODE_DEFS = [
 
     // ========== SENSING ==========
     {opcode: 'sensing_askandwait', name: 'ask', kind: 'stmt', args: [{type: 'input', name: 'QUESTION', primType: 10}]},
+    {opcode: 'sensing_setdragmode', name: 'set_drag_mode', kind: 'stmt', args: [
+        {type: 'field', name: 'DRAG_MODE'}
+    ]},
     {opcode: 'sensing_resettimer', name: 'reset_timer', kind: 'stmt', args: []},
     {opcode: 'sensing_answer', name: 'answer', kind: 'reporter', args: []},
     {opcode: 'sensing_mousex', name: 'mouse_x', kind: 'reporter', args: []},
@@ -306,7 +318,7 @@ const OPCODE_DEFS = [
         {type: 'input', name: 'STRING2', primType: 10}
     ]},
     {opcode: 'operator_letter_of', name: 'letter_of', kind: 'reporter', args: [
-        {type: 'input', name: 'LETTER', primType: 7},
+        {type: 'input', name: 'LETTER', primType: 6},
         {type: 'input', name: 'STRING', primType: 10}
     ]},
     {opcode: 'operator_length', name: 'length', kind: 'reporter', args: [{type: 'input', name: 'STRING', primType: 10}]},
@@ -658,12 +670,17 @@ const extractProcTypesFromProccode = (proccode) => {
     const m = String(proccode).match(/%[bsn]/g) || [];
     return m.map(x => x === '%b' ? 'b' : 's');
 };
-// 渲染 proccode 为 token：简单且 name 是合法 bare ident → 省引号；否则完整 "proccode"
+const PROC_ARG_RESERVED_NAMES = new Set([
+    'true', 'false', 'null', 'define', 'call', 'callret', 'return', 'arg', 'arg_bool',
+    'var', 'let', 'list', 'broadcast_ref', 'at', 'if', 'else', 'warp', 'bool', 'str', 'as'
+]);
+// 渲染 proccode 为 token：简单、name 是合法 bare ident 且不会命中已有 opcode/别名时省引号；
+// 否则保留完整 "proccode"。后者避免例如自定义 `图章 %s` 被 parser 当成 pen_stamp。
 const renderProcToken = (proccode) => {
     const s = String(proccode);
     if (isSimpleProccode(s)) {
         const name = getProcName(s);
-        if (BARE_IDENT_RE.test(name)) return name;
+        if (BARE_IDENT_RE.test(name) && !nameToDef.has(name)) return name;
     }
     return escapeString(s);
 };
@@ -681,6 +698,46 @@ const sanitizeIdent = (name) => {
     for (const ch of String(name)) r += /[a-zA-Z_0-9\u4e00-\u9fa5]/.test(ch) ? ch : '_';
     if (/^[0-9]/.test(r)) r = '_' + r;
     return r;
+};
+
+const getStageFromContext = ctx => (ctx && ctx.vm && ctx.vm.runtime && ctx.vm.runtime.getTargetForStage)
+    ? ctx.vm.runtime.getTargetForStage() : null;
+
+// Return the data declarations owned by the stage and the editing target.  The
+// ID is deliberately kept in this internal model: rendered pseudocode uses it
+// to choose the right alias, but never exposes it in the source text.
+const collectContextDataEntities = (ctx, options) => {
+    const target = ctx && ctx.target;
+    const stage = getStageFromContext(ctx);
+    const includeGlobals = !options || options.includeGlobals !== false;
+    const entities = [];
+    const seen = new Set();
+    const collectScope = (scopeTarget, scope) => {
+        if (!scopeTarget || !scopeTarget.variables) return;
+        for (const key of Object.keys(scopeTarget.variables)) {
+            const variable = scopeTarget.variables[key];
+            if (!variable) continue;
+            const type = variable.type || '';
+            if (type !== '' && type !== 'list') continue;
+            const kind = type === 'list' ? 'list' : 'variable';
+            const id = variable.id == null ? String(key) : String(variable.id);
+            const identity = `${kind}\u0000${scope}\u0000${id}`;
+            if (seen.has(identity)) continue;
+            seen.add(identity);
+            entities.push({
+                kind,
+                scope,
+                id,
+                name: String(variable.name == null ? '' : variable.name)
+            });
+        }
+    };
+    if (includeGlobals) collectScope(stage, 'global');
+    if (target && !target.isStage && target !== stage) collectScope(target, 'local');
+    // A few lightweight test/mocked contexts do not expose getTargetForStage.
+    // In that case a stage editing target is still authoritative for globals.
+    if (includeGlobals && !stage && target && target.isStage) collectScope(target, 'global');
+    return entities;
 };
 
 // 把短 ID 序列拓展器（与 userscript.js 中 shortIdAt 对齐 — 单独维护以解耦）
@@ -705,17 +762,93 @@ const renderPseudocode = (blocks, ctx, options) => {
     //    不修改输入：深拷贝。
     const working = JSON.parse(JSON.stringify(blocks));
     const runtimeOpcodeMeta = getRuntimeOpcodeMetadata(ctx);
-    const {opcodeToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeOpcodeMeta);
+    const {opcodeToRuntimeDef, nameToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeOpcodeMeta);
     const getOpcodeDef = opcode => opcodeToDef.get(opcode) || opcodeToRuntimeDef.get(opcode);
     const shouldRenderGeneric = (block, def) => !!(block && def && def.runtime && block.mutation);
     // 当前 define 作用域的参数名集合：renderBlockAsExpr 里遇到 argument_reporter_*
     // 且 VALUE 名字在这集合里时，裸标识符/字符串渲染（可读）；
     // 否则退回 arg("...") / arg_bool("...") 这种全限定形式（防御无 define 场景）。
     let currentProcArgs = null;
-    // 2) 收集所有 variable/broadcast/list 的 name→id 映射（变量/列表用于头部，广播用于引用）
-    const varMap = new Map(); // name -> id
+    // 2) 收集 variable/list 声明。变量和列表必须以 scope + ID 为身份；按名字放进
+    // Map 会把同名的 global/local（以及同作用域的重复项）静默折叠掉。
+    const renderTarget = ctx && ctx.target;
+    // A sprite header is authoritative for all of its local data, but only for
+    // globals actually referenced by this target's blocks. Rendering the stage
+    // itself may list all stage-owned data because that is its current scope.
+    const dataEntities = collectContextDataEntities(ctx, {
+        includeGlobals: !!(renderTarget && renderTarget.isStage)
+    });
+    // Candidate preflight receives declaration records produced by the parser.
+    // A declaration which resolved by ordinary name lookup does not carry an
+    // ID on the record itself, so use the full VM scope as an identity lookup
+    // without rendering every global. Otherwise an existing declaration gets
+    // a synthetic `declaration:*` identity alongside the real variable found
+    // in the blocks, duplicating the header on the next render/parse pass.
+    const availableDataEntities = collectContextDataEntities(ctx, {includeGlobals: true});
+    const dataIdentity = entity => `${entity.kind}\u0000${entity.scope}\u0000${entity.id}`;
+    // Candidate writeback preflight runs before missing declarations exist in
+    // the VM. Carry their internal parser metadata into rendering so a pending
+    // local and a pending global with the same readable name keep their scope.
+    const optionDataRecords = options && options.dataRecords;
+    const preflightRecords = Array.isArray(optionDataRecords)
+        ? optionDataRecords
+        : (optionDataRecords && typeof optionDataRecords.values === 'function'
+            ? [...optionDataRecords.values()]
+            : []);
+    for (const record of preflightRecords) {
+        if (!record) continue;
+        const wantType = record.wantType === 'list' ? 'list' : '';
+        const scope = record.scope === 'local' ? 'local' : 'global';
+        const name = String(record.name == null ? '' : record.name);
+        const kind = wantType === 'list' ? 'list' : 'variable';
+        let resolvedId = record.pendingId || record.id || (record.resolvedRef && record.resolvedRef.id);
+        if (resolvedId == null || resolvedId === '') {
+            const ordinal = Number(record.ordinal) || 0;
+            const existing = availableDataEntities
+                .filter(entity => entity.scope === scope && entity.kind === kind && entity.name === name)
+                .sort((a, b) => a.id < b.id ? -1 : (a.id > b.id ? 1 : 0))[ordinal];
+            if (existing) resolvedId = existing.id;
+        }
+        const id = resolvedId == null || resolvedId === ''
+            ? `declaration:${scope}:${wantType}:${name}:${Number(record.ordinal) || 0}`
+            : String(resolvedId);
+        const entity = {kind, scope, id, name};
+        if (!dataEntities.some(existing => dataIdentity(existing) === dataIdentity(entity))) {
+            dataEntities.push(entity);
+        }
+    }
+    const entityByIdentity = new Map(dataEntities.map(entity => [dataIdentity(entity), entity]));
+    const entitiesByRefId = new Map();
+    const indexEntityRef = entity => {
+        if (!entity.id) return;
+        const key = `${entity.kind}\u0000${entity.id}`;
+        const matches = entitiesByRefId.get(key) || [];
+        if (matches.indexOf(entity) < 0) matches.push(entity);
+        entitiesByRefId.set(key, matches);
+    };
+    dataEntities.forEach(indexEntityRef);
+    const addDataReference = (kind, name, id) => {
+        const stringName = String(name == null ? '' : name);
+        const stringId = id == null ? '' : String(id);
+        if (stringId) {
+            const exact = entitiesByRefId.get(`${kind}\u0000${stringId}`);
+            if (exact && exact.length) return exact[0];
+        }
+        const named = dataEntities.filter(entity => entity.kind === kind && entity.name === stringName);
+        if (!stringId && named.length === 1) return named[0];
+        // References whose owner is unavailable in ctx are treated as global,
+        // matching the converter's historical fallback and Scratch's default.
+        const scope = 'global';
+        const internalId = stringId || `name:${stringName}`;
+        const identity = `${kind}\u0000${scope}\u0000${internalId}`;
+        if (entityByIdentity.has(identity)) return entityByIdentity.get(identity);
+        const entity = {kind, scope, id: stringId, name: stringName};
+        dataEntities.push(entity);
+        entityByIdentity.set(identity, entity);
+        indexEntityRef(entity);
+        return entity;
+    };
     const broadcastMap = new Map();
-    const listMap = new Map();
     const collectReference = (fields) => {
         if (!fields) return;
         for (const fieldName of Object.keys(fields)) {
@@ -723,8 +856,8 @@ const renderPseudocode = (blocks, ctx, options) => {
             if (!Array.isArray(f) || f.length < 2) continue;
             const [name, id] = f;
             if (!id) continue;
-            if (fieldName === 'VARIABLE') varMap.set(String(name), id);
-            else if (fieldName === 'LIST') listMap.set(String(name), id);
+            if (fieldName === 'VARIABLE') addDataReference('variable', name, id);
+            else if (fieldName === 'LIST') addDataReference('list', name, id);
             else if (fieldName === 'BROADCAST_OPTION') broadcastMap.set(String(name), id);
         }
     };
@@ -736,8 +869,8 @@ const renderPseudocode = (blocks, ctx, options) => {
         const refId = arr[2];
         if (!refId) return;
         if (type === 11) broadcastMap.set(String(name), refId);
-        else if (type === 12) varMap.set(String(name), refId);
-        else if (type === 13) listMap.set(String(name), refId);
+        else if (type === 12) addDataReference('variable', name, refId);
+        else if (type === 13) addDataReference('list', name, refId);
     };
     for (const id of Object.keys(working)) {
         const b = working[id];
@@ -758,9 +891,67 @@ const renderPseudocode = (blocks, ctx, options) => {
         }
     }
 
+    // Allocate aliases only when the ordinary bare spelling is ambiguous.
+    // The allocation is deterministic and reserves all unaliased spellings so
+    // generated aliases cannot steal a real variable's normal name.
+    const spellingGroups = new Map();
+    for (const entity of dataEntities) {
+        const sanitized = BARE_IDENT_RE.test(entity.name) ? entity.name : sanitizeIdent(entity.name);
+        entity.hasBareSpelling = !!(sanitized && BARE_IDENT_RE.test(sanitized));
+        entity.baseSpelling = entity.hasBareSpelling ? sanitized : 'value';
+        const group = spellingGroups.get(entity.baseSpelling) || [];
+        group.push(entity);
+        spellingGroups.set(entity.baseSpelling, group);
+    }
+    const usedSpellings = new Set();
+    for (const [spelling, group] of spellingGroups) {
+        if (group.length === 1 && group[0].hasBareSpelling) {
+            group[0].codeName = spelling;
+            group[0].alias = null;
+            usedSpellings.add(spelling);
+        }
+    }
+    const compareEntity = (a, b) => {
+        if (a.scope !== b.scope) return a.scope === 'global' ? -1 : 1;
+        if (a.kind !== b.kind) return a.kind === 'variable' ? -1 : 1;
+        if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+        return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+    };
+    for (const spelling of [...spellingGroups.keys()].sort()) {
+        const group = spellingGroups.get(spelling);
+        if (group.length < 2 && group[0].hasBareSpelling) continue;
+        const hasBothKinds = new Set(group.map(entity => entity.kind)).size > 1;
+        group.sort(compareEntity);
+        for (const entity of group) {
+            const kindPart = hasBothKinds ? (entity.kind === 'variable' ? 'var_' : 'list_') : '';
+            const rawBase = sanitizeIdent(`${entity.scope}_${kindPart}${spelling}`) || 'data_value';
+            let alias = rawBase;
+            let suffix = 2;
+            while (usedSpellings.has(alias)) alias = `${rawBase}_${suffix++}`;
+            usedSpellings.add(alias);
+            entity.codeName = alias;
+            entity.alias = alias;
+        }
+    }
+
+    const findDataEntity = (kind, name, id) => {
+        if (id != null && id !== '') {
+            const matches = entitiesByRefId.get(`${kind}\u0000${String(id)}`);
+            if (matches && matches.length) return matches[0];
+        }
+        const exact = dataEntities.filter(entity => entity.kind === kind && entity.name === String(name));
+        return exact.length === 1 ? exact[0] : null;
+    };
+    const renderDataRef = (kind, name, id) => {
+        const entity = findDataEntity(kind, name, id);
+        if (entity && entity.codeName) return entity.codeName;
+        const stringName = String(name == null ? '' : name);
+        if (BARE_IDENT_RE.test(stringName)) return stringName;
+        const sanitized = sanitizeIdent(stringName);
+        return sanitized && BARE_IDENT_RE.test(sanitized) ? sanitized : escapeString(stringName);
+    };
+
     // 3) 统计 parent 引用，方便定位 top-level。
-    //    top-level 既看 `.topLevel: true`，也补充"没 parent 且不作为其他块 input/next 的块"——
-    //    压缩 primitive 可能只在 inputs 里出现，不算独立脚本。
     const referencedAsChild = new Set();
     for (const id of Object.keys(working)) {
         const b = working[id];
@@ -786,7 +977,9 @@ const renderPseudocode = (blocks, ctx, options) => {
         const b = working[id];
         if (Array.isArray(b)) continue;
         if (referencedAsChild.has(id)) continue;
-        if (b.topLevel === false && b.parent) continue; // 有父就不是顶层
+        // Scratch 明确标成非顶层的孤儿块不可当作脚本渲染。仅兼容旧数据里
+        // topLevel 缺失且 parent 也缺失的根；preflight 会为被排除的孤儿给只读原因。
+        if (b.topLevel !== true && !(b.topLevel == null && b.parent == null)) continue;
         scripts.push(id);
     }
     scripts.sort((idA, idB) => {
@@ -808,35 +1001,20 @@ const renderPseudocode = (blocks, ctx, options) => {
     //    "全局" = stage 持有，或者查不到归属时按全局兜底。
     //    Broadcasts 永远是 global，不区分。
     const lines = [];
-    const ctxTarget = ctx && ctx.target;
-    const ctxStage = (ctx && ctx.vm && ctx.vm.runtime && ctx.vm.runtime.getTargetForStage)
-        ? ctx.vm.runtime.getTargetForStage() : null;
-    const isSpriteLocal = (name, wantType) => {
-        // 只有在 editing target 为 sprite（非 stage）时才可能有"局部变量"；stage 的 variables 都视作全局。
-        if (!ctxTarget || ctxTarget.isStage) return false;
-        if (!ctxTarget.variables) return false;
-        for (const id of Object.keys(ctxTarget.variables)) {
-            const v = ctxTarget.variables[id];
-            if (v && v.name === name && (v.type || '') === wantType) return true;
-        }
-        return false;
-    };
-    const renderHeader = (title, names) => {
-        if (!names.length) return;
-        lines.push(`${title} { ${names.map(escapeString).join(' ')} }`);
+    const renderHeader = (title, entities) => {
+        if (!entities.length) return;
+        const entries = entities.slice().sort(compareEntity).map(entity => entity.alias
+            ? `${escapeString(entity.name)} as ${entity.alias}`
+            : escapeString(entity.name));
+        lines.push(`${title} { ${entries.join(' ')} }`);
         lines.push('');
     };
-    const splitByScope = (map, wantType) => {
-        const global = [];
-        const local = [];
-        for (const name of [...map.keys()].sort()) {
-            if (isSpriteLocal(name, wantType)) local.push(name);
-            else global.push(name);
-        }
-        return {global, local};
-    };
-    const {global: globalVars, local: localVars} = splitByScope(varMap, '');
-    const {global: globalLists, local: localLists} = splitByScope(listMap, 'list');
+    const selectEntities = (scope, kind) => dataEntities.filter(entity =>
+        entity.scope === scope && entity.kind === kind);
+    const globalVars = selectEntities('global', 'variable');
+    const localVars = selectEntities('local', 'variable');
+    const globalLists = selectEntities('global', 'list');
+    const localLists = selectEntities('local', 'list');
     renderHeader('#vars', globalVars);
     renderHeader('#localvars', localVars);
     renderHeader('#lists', globalLists);
@@ -891,20 +1069,8 @@ const renderPseudocode = (blocks, ctx, options) => {
             return escapeString(v);
         }
         if (type === 11) return `broadcast_ref(${escapeString(prim[1])})`;
-        if (type === 12) {
-            const name = prim[1];
-            if (typeof name === 'string' && BARE_IDENT_RE.test(name)) return name;
-            const s = typeof name === 'string' ? sanitizeIdent(name) : '';
-            if (s && BARE_IDENT_RE.test(s)) return s;
-            return `var(${escapeString(name)})`;
-        }
-        if (type === 13) {
-            const name = prim[1];
-            if (typeof name === 'string' && BARE_IDENT_RE.test(name)) return name;
-            const s = typeof name === 'string' ? sanitizeIdent(name) : '';
-            if (s && BARE_IDENT_RE.test(s)) return s;
-            return `list(${escapeString(name)})`;
-        }
+        if (type === 12) return renderDataRef('variable', prim[1], prim[2]);
+        if (type === 13) return renderDataRef('list', prim[1], prim[2]);
         return `prim(${prim.map(escapeString).join(', ')})`;
     };
 
@@ -915,10 +1081,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         if (!field) return null;
         const name = field[0];
         if (typeof name !== 'string') return null;
-        if (BARE_IDENT_RE.test(name)) return name;
-        const s = sanitizeIdent(name);
-        if (s && BARE_IDENT_RE.test(s)) return s;
-        return null;
+        return renderDataRef(b.opcode === 'data_variable' ? 'variable' : 'list', name, field[1]);
     };
 
     const renderBlockAsExpr = (blockId, parentPrec) => {
@@ -932,7 +1095,10 @@ const renderPseudocode = (blocks, ctx, options) => {
             const f = b.fields && b.fields.VALUE;
             const name = f ? String(f[0]) : '';
             if (currentProcArgs && currentProcArgs.has(name)) {
-                return BARE_IDENT_RE.test(name) ? name : escapeString(name);
+                if (!BARE_IDENT_RE.test(name)) return escapeString(name);
+                const conflicts = nameToDef.has(name) || opcodeToRuntimeDef.has(name) ||
+                    nameToRuntimeDef.has(name) || PROC_ARG_RESERVED_NAMES.has(name);
+                if (!conflicts) return name;
             }
             return `arg(${escapeString(name)})`;
         }
@@ -940,7 +1106,10 @@ const renderPseudocode = (blocks, ctx, options) => {
             const f = b.fields && b.fields.VALUE;
             const name = f ? String(f[0]) : '';
             if (currentProcArgs && currentProcArgs.has(name)) {
-                return BARE_IDENT_RE.test(name) ? name : escapeString(name);
+                if (!BARE_IDENT_RE.test(name)) return escapeString(name);
+                const conflicts = nameToDef.has(name) || opcodeToRuntimeDef.has(name) ||
+                    nameToRuntimeDef.has(name) || PROC_ARG_RESERVED_NAMES.has(name);
+                if (!conflicts) return name;
             }
             return `arg_bool(${escapeString(name)})`;
         }
@@ -1010,6 +1179,8 @@ const renderPseudocode = (blocks, ctx, options) => {
             // (避免 broadcast(broadcast_ref("x")) 这类冗余嵌套)
             const pType = primary[0];
             if (argDef && pType === argDef.primType && (pType === 11 || pType === 12 || pType === 13)) {
+                if (pType === 12) return renderDataRef('variable', primary[1], primary[2]);
+                if (pType === 13) return renderDataRef('list', primary[1], primary[2]);
                 return escapeString(primary[1]);
             }
             return renderPrimitive(primary);
@@ -1033,9 +1204,7 @@ const renderPseudocode = (blocks, ctx, options) => {
             const val = f[0];
             // variable/list 字段：优先渲染成裸标识符（用户可读、parser 支持反向查找）
             if ((argDef.kind === 'variable' || argDef.kind === 'list') && typeof val === 'string') {
-                if (BARE_IDENT_RE.test(val)) return val;
-                const s = sanitizeIdent(val);
-                if (s && BARE_IDENT_RE.test(s)) return s;
+                return renderDataRef(argDef.kind, val, f[1]);
             }
             if (typeof val === 'string' && !isNumericLiteral(val)) return escapeString(val);
             return escapeString(String(val));
@@ -1116,12 +1285,9 @@ const renderPseudocode = (blocks, ctx, options) => {
 
     // 变量名要作为裸标识符 LHS 输出时的渲染：原名已是合法标识符 → 原样；否则 sanitize 后若仍是合法 → 下划线形式；
     // 最后兜底用字符串字面量。
-    const renderVarLHS = (name) => {
+    const renderVarLHS = (name, id) => {
         if (!name) return '""';
-        if (BARE_IDENT_RE.test(name)) return name;
-        const s = sanitizeIdent(name);
-        if (s && BARE_IDENT_RE.test(s)) return s;
-        return escapeString(name);
+        return renderDataRef('variable', name, id);
     };
 
     const getVariableRefFromInput = inputArr => {
@@ -1147,7 +1313,6 @@ const renderPseudocode = (blocks, ctx, options) => {
 
     const tryRenderCompoundSet = block => {
         const compoundOps = {
-            operator_add: '+=',
             operator_subtract: '-=',
             operator_multiply: '*=',
             operator_divide: '/=',
@@ -1167,7 +1332,7 @@ const renderPseudocode = (blocks, ctx, options) => {
         const targetRef = {name: vf[0], id: vf[1]};
         if (!sameVariableRef(targetRef, getVariableRefFromInput(leftInput))) return null;
         const right = rightInput ? renderInput(rightInput, def.args[1], def.infix.prec + 1) : '""';
-        return `${renderVarLHS(vf[0])} ${op} ${right}`;
+        return `${renderVarLHS(vf[0], vf[1])} ${op} ${right}`;
     };
 
     const renderStmtBlock = (blockId, depth) => {
@@ -1204,14 +1369,14 @@ const renderPseudocode = (blocks, ctx, options) => {
                     continue;
                 }
                 const valueStr = vInput ? renderInput(vInput, def.args[1], 0) : '""';
-                out.push(indent(depth) + `${renderVarLHS(varName)} = ${valueStr}`);
+                out.push(indent(depth) + `${renderVarLHS(varName, vf && vf[1])} = ${valueStr}`);
             } else if (b.opcode === 'data_changevariableby') {
                 // 特殊渲染为 LHS += rhs 的形式。
                 const vf = b.fields && b.fields.VARIABLE;
                 const varName = vf ? vf[0] : '';
                 const vInput = b.inputs && b.inputs.VALUE;
                 const valueStr = vInput ? renderInput(vInput, def.args[1], 0) : '0';
-                out.push(indent(depth) + `${renderVarLHS(varName)} += ${valueStr}`);
+                out.push(indent(depth) + `${renderVarLHS(varName, vf && vf[1])} += ${valueStr}`);
             } else if (def.kind === 'stmt' || def.kind === 'cap') {
                 out.push(indent(depth) + `${def.name}(${def.args.map(a => renderArg(b, a)).join(', ')})`);
             } else if (def.kind === 'c') {
@@ -1567,10 +1732,19 @@ const parsePseudocode = (source, ctx) => {
     const declaredBroadcasts = new Set();
     const declaredLocalVars = new Set();
     const declaredLocalLists = new Set();
-    // 解析过程中名字无法在目标上找到时产生的"待创建"表：name -> freshId
+    // alias -> declaration record. Records retain scope/kind and declaration
+    // ordinal, allowing two exact duplicate VM variables to be rendered for
+    // inspection without putting their IDs into pseudocode.
+    const declaredDataAliases = new Map();
+    const declaredDataRecords = [];
+    const declarationOrdinals = new Map();
+    // 解析过程中名字无法在目标上找到时产生的"待创建"表：name -> freshId。
+    // pendingDataRecords 是新的权威身份表，使用 scope + kind + name + ordinal
+    // 作为 key；旧 Map 仅保留给无声明的旧语法和兼容调用方。
     const pendingVars = new Map();
     const pendingLists = new Map();
     const pendingBroadcasts = new Map();
+    const pendingDataRecords = new Map();
 
     // procedures: proccode → [argumentids]。由 prescanDefines 预扫 + parseDefine 真正解析时填入；
     // buildProcedureCall 查这张表把 call 的 inputs key 对齐 definition 的 argumentids。
@@ -1584,21 +1758,46 @@ const parsePseudocode = (source, ctx) => {
     // compileExpr 直接产出 argument_reporter_* 而不是 var/list 查询。嵌套 define 不合法，一层栈够用。
     let currentProcParams = null;  // Map<name, 'b' | 's'> 或 null
 
-    // 从 VM 里现有的 procedures_prototype 查某个 proccode 的 argumentids。找不到返回 null。
-    const lookupVmPrototypeArgIds = (proccode) => {
-        if (!ctxTarget || !ctxTarget.blocks || !ctxTarget.blocks._blocks) return null;
+    const lookupVmPrototypeCandidates = proccode => {
+        if (!ctxTarget || !ctxTarget.blocks || !ctxTarget.blocks._blocks) return [];
         const all = ctxTarget.blocks._blocks;
+        const candidates = [];
         for (const id of Object.keys(all)) {
             const b = all[id];
             if (b && b.opcode === 'procedures_prototype' && b.mutation && b.mutation.proccode === proccode) {
-                try { return JSON.parse(b.mutation.argumentids || '[]'); } catch (_) { return null; }
+                candidates.push(b);
             }
+        }
+        return candidates;
+    };
+    const ambiguousPrototypeErrors = new Set();
+    const lookupUniqueVmPrototype = (proccode, sourceAst) => {
+        const candidates = lookupVmPrototypeCandidates(proccode);
+        if (candidates.length === 1) return candidates[0];
+        if (candidates.length > 1 && !ambiguousPrototypeErrors.has(proccode)) {
+            ambiguousPrototypeErrors.add(proccode);
+            errors.push({
+                line: sourceAst && sourceAst.line != null ? sourceAst.line : 1,
+                col: sourceAst && sourceAst.col != null ? sourceAst.col : 1,
+                message: `同一 proccode ${JSON.stringify(proccode)} 存在多个 prototype，无法安全恢复 mutation`
+            });
         }
         return null;
     };
+    // 从 VM 里唯一的 procedures_prototype 查 argumentids。多候选时不能猜。
+    const lookupVmPrototypeArgIds = (proccode, sourceAst) => {
+        const prototype = lookupUniqueVmPrototype(proccode, sourceAst);
+        if (!prototype) return null;
+        try {
+            const ids = JSON.parse(prototype.mutation.argumentids || '[]');
+            return Array.isArray(ids) ? ids : null;
+        } catch (_) {
+            return null;
+        }
+    };
     // 按 proccode + 期望参数数解析一套 argumentids：优先复用（ctxProcedures 或 VM），长度不够用 hash 扩充。
-    const resolveProcArgIds = (proccode, expectedCount) => {
-        let ids = ctxProcedures[proccode] || lookupVmPrototypeArgIds(proccode);
+    const resolveProcArgIds = (proccode, expectedCount, sourceAst) => {
+        let ids = ctxProcedures[proccode] || lookupVmPrototypeArgIds(proccode, sourceAst);
         if (!ids) ids = [];
         if (ids.length < expectedCount) {
             const filled = ids.slice();
@@ -1732,14 +1931,40 @@ const parsePseudocode = (source, ctx) => {
 
     // 解析头部块 #vars { "name1" "name2" ... }
     // 只收集声明名字；空白/逗号/换行都当分隔符；不再接 `:id` 尾巴。
-    const parseHeaderBlock = (set) => {
+    const parseHeaderBlock = (set, scope, wantType) => {
         expect(T.LBRACE);
         skipNewlines();
         while (peek().type !== T.RBRACE && peek().type !== T.EOF) {
             const tok = peek();
             if (tok.type === T.STRING || tok.type === T.IDENT) {
-                set.add(String(tok.value));
+                const name = String(tok.value);
+                set.add(name);
                 eat();
+                let alias = null;
+                if (peek().type === T.IDENT && peek().value === 'as') {
+                    eat();
+                    const aliasTok = peek();
+                    if (aliasTok.type === T.IDENT || aliasTok.type === T.STRING) {
+                        alias = String(aliasTok.value);
+                        eat();
+                    } else {
+                        errors.push({line: aliasTok.line, col: aliasTok.col, message: 'as 后需要别名'});
+                    }
+                }
+                const ordinalKey = `${scope}\u0000${wantType}\u0000${name}`;
+                const ordinal = declarationOrdinals.get(ordinalKey) || 0;
+                declarationOrdinals.set(ordinalKey, ordinal + 1);
+                const record = {name, alias, scope, wantType, ordinal};
+                declaredDataRecords.push(record);
+                if (alias) {
+                    if (!BARE_IDENT_RE.test(alias)) {
+                        errors.push({line: tok.line, col: tok.col, message: `数据别名必须是合法标识符: ${alias}`});
+                    } else if (declaredDataAliases.has(alias)) {
+                        errors.push({line: tok.line, col: tok.col, message: `数据别名重复: ${alias}`});
+                    } else {
+                        declaredDataAliases.set(alias, record);
+                    }
+                }
             } else if (tok.type === T.COMMA) {
                 eat();
             } else {
@@ -1755,6 +1980,66 @@ const parsePseudocode = (source, ctx) => {
     // 拿 stage 的助手（broadcast 永远在 stage；sanitize-match 反查也会扫 stage）
     const getStage = () => (ctx && ctx.vm && ctx.vm.runtime && ctx.vm.runtime.getTargetForStage)
         ? ctx.vm.runtime.getTargetForStage() : null;
+
+    const findAllInScopeByName = (scope, name, wantType) => {
+        const matches = [];
+        if (!scope || !scope.variables) return matches;
+        for (const key of Object.keys(scope.variables)) {
+            const variable = scope.variables[key];
+            if (!variable || variable.name !== name || (variable.type || '') !== wantType) continue;
+            matches.push({
+                name: variable.name,
+                id: String(variable.id == null ? key : variable.id)
+            });
+        }
+        matches.sort((a, b) => a.id < b.id ? -1 : (a.id > b.id ? 1 : 0));
+        return matches;
+    };
+
+    const dataRecordKey = record => [
+        record.scope,
+        record.wantType,
+        record.name,
+        Number(record.ordinal) || 0
+    ].join('\u0000');
+    const registerPendingDataRecord = (record, pending, pendingPrefix) => {
+        record.pendingId = record.pendingId || freshPendingId(pendingPrefix);
+        const key = dataRecordKey(record);
+        if (!pendingDataRecords.has(key)) {
+            pendingDataRecords.set(key, {
+                name: record.name,
+                id: record.pendingId,
+                scope: record.scope,
+                wantType: record.wantType,
+                ordinal: Number(record.ordinal) || 0
+            });
+        }
+        // Keep the historical name-keyed view for callers that have not yet
+        // adopted pendingDataRecords. It cannot represent both scopes, so the
+        // structured table above must be used for actual creation/writeback.
+        if (!pending.has(record.name)) pending.set(record.name, record.pendingId);
+        return {name: record.name, id: record.pendingId};
+    };
+    const findDeclaredDataRecord = (scope, wantType, name) => declaredDataRecords.find(record =>
+        record.scope === scope && record.wantType === wantType && record.name === name && record.ordinal === 0);
+
+    const resolveDeclaredAlias = (alias, wantType, pending, pendingPrefix) => {
+        const record = declaredDataAliases.get(String(alias));
+        if (!record || record.wantType !== wantType) return null;
+        if (record.resolvedRef) return record.resolvedRef;
+        const scopeTarget = record.scope === 'local' && ctxTarget && !ctxTarget.isStage
+            ? ctxTarget : getStage();
+        const matches = findAllInScopeByName(scopeTarget, record.name, wantType);
+        if (matches[record.ordinal]) {
+            record.resolvedRef = matches[record.ordinal];
+            return record.resolvedRef;
+        }
+        // A missing declaration gets an internal scope-aware pending identity.
+        // Exact duplicates in one scope remain non-writable because pseudocode
+        // intentionally exposes no Scratch ID with which to distinguish them.
+        record.resolvedRef = registerPendingDataRecord(record, pending, pendingPrefix);
+        return record.resolvedRef;
+    };
 
     // 用 "sanitize 后的名字" 反查真实变量：给用户一条捷径，可以用下划线形式引用带空格/标点的变量。
     const findBySanitizedName = (ident, wantType) => {
@@ -1800,6 +2085,8 @@ const parsePseudocode = (source, ctx) => {
     };
 
     const resolveDataRef = (name, wantType, pending, pendingPrefix, globalDeclared, localDeclared) => {
+        const aliased = resolveDeclaredAlias(name, wantType, pending, pendingPrefix);
+        if (aliased) return aliased;
         const localName = findMatchingName(name, localDeclared);
         const globalName = findMatchingName(name, globalDeclared);
         const pendingName = findMatchingName(name, pending.keys());
@@ -1807,6 +2094,8 @@ const parsePseudocode = (source, ctx) => {
         if (localName && ctxTarget && !ctxTarget.isStage) {
             const local = findInScopeByName(ctxTarget, localName, wantType);
             if (local) return local;
+            const record = findDeclaredDataRecord('local', wantType, localName);
+            if (record) return registerPendingDataRecord(record, pending, pendingPrefix);
             if (!pending.has(localName)) pending.set(localName, freshPendingId(pendingPrefix));
             return {name: localName, id: pending.get(localName)};
         }
@@ -1814,6 +2103,8 @@ const parsePseudocode = (source, ctx) => {
         if (globalName) {
             const global = findInScopeByName(getStage(), globalName, wantType);
             if (global) return global;
+            const record = findDeclaredDataRecord('global', wantType, globalName);
+            if (record) return registerPendingDataRecord(record, pending, pendingPrefix);
             if (!pending.has(globalName)) pending.set(globalName, freshPendingId(pendingPrefix));
             return {name: globalName, id: pending.get(globalName)};
         }
@@ -1838,6 +2129,10 @@ const parsePseudocode = (source, ctx) => {
     };
 
     const resolveKnownDataIdent = name => {
+        const aliasedVariable = resolveDeclaredAlias(name, '', pendingVars, 'newvar');
+        if (aliasedVariable) return {prim: [12, aliasedVariable.name, aliasedVariable.id]};
+        const aliasedList = resolveDeclaredAlias(name, 'list', pendingLists, 'newlist');
+        if (aliasedList) return {prim: [13, aliasedList.name, aliasedList.id]};
         const varName = findMatchingName(name, declaredLocalVars) ||
             findMatchingName(name, declaredVars) ||
             findMatchingName(name, pendingVars.keys());
@@ -2078,17 +2373,6 @@ const parsePseudocode = (source, ctx) => {
         return {kind: 'strlit', value: '', line: tokenLine(t), col: tokenCol(t)};
     };
 
-    const isDefinitelyStringExpr = ast => {
-        if (!ast) return false;
-        if (ast.kind === 'strlit') return true;
-        if (ast.kind === 'call') {
-            return ast.name === 'join' || ast.name === 'letter_of';
-        }
-        if (ast.kind === 'binop') return isDefinitelyStringExpr(ast.left) || isDefinitelyStringExpr(ast.right);
-        if (ast.kind === 'not') return isDefinitelyStringExpr(ast.inner);
-        return false;
-    };
-
     // AST → blocks：把 reporter AST 编译成一个 block id（reporter / boolean 块）或直接内联 primitive
     // 返回："emitted": 'block' | 'prim', id (block id) 或 prim (Array)
     const compileExpr = (ast, parentId, expectedPrimType) => {
@@ -2100,7 +2384,8 @@ const parsePseudocode = (source, ctx) => {
         };
         if (ast.kind === 'numlit') {
             const primType = (expectedPrimType === 10 || expectedPrimType == null) ? 10 : expectedPrimType;
-            return withLoc({prim: [primType, String(ast.value)]});
+            const raw = ast.raw !== undefined ? ast.raw : String(ast.value);
+            return withLoc({prim: [primType, raw]});
         }
         if (ast.kind === 'strlit') {
             // 在 define body 里且命中当前 proc 参数名 → 作为 argument_reporter_* 引用（参数优先于普通字符串）。
@@ -2133,14 +2418,6 @@ const parsePseudocode = (source, ctx) => {
             return withLoc({blockId: id});
         }
         if (ast.kind === 'binop') {
-            if (ast.op === '+' && (isDefinitelyStringExpr(ast.left) || isDefinitelyStringExpr(ast.right))) {
-                errors.push({
-                    line: astLine(ast),
-                    col: astCol(ast),
-                    message: '字符串拼接不能使用 +；请使用 join(a, b)。多个片段请嵌套 join，例如 join(join("第", n), "关")。'
-                });
-                return {prim: [10, '']};
-            }
             if (ast.op === '>=' || ast.op === '<=' || ast.op === '!=') {
                 const compareOp = ast.op === '>=' ? '<' : (ast.op === '<=' ? '>' : '==');
                 const notId = addBlock('operator_not', {parent: parentId, line: astLine(ast), col: astCol(ast)});
@@ -2317,21 +2594,11 @@ const parsePseudocode = (source, ctx) => {
     // call("proccode", v1, v2...) / callret(...) 构造 procedures_call block。
     // 按 proccode 找 argumentids（ctxProcedures → VM prototype → hash 兜底），把 input 按位置挂到对应 argumentid key。
     const buildProcedureCall = (proccode, argAsts, isReturn, parentBlockId, sourceAst) => {
-        const argIds = resolveProcArgIds(proccode, argAsts.length);
+        const argIds = resolveProcArgIds(proccode, argAsts.length, sourceAst);
         if (!ctxProcedures[proccode]) ctxProcedures[proccode] = argIds;
         // 顺便抄一份 prototype 的 warp 到 call 的 mutation（和 Scratch 生成一致）
-        let protoWarp = false;
-        const vmArg = lookupVmPrototypeArgIds(proccode);
-        if (vmArg && ctxTarget && ctxTarget.blocks && ctxTarget.blocks._blocks) {
-            const all = ctxTarget.blocks._blocks;
-            for (const id of Object.keys(all)) {
-                const b = all[id];
-                if (b && b.opcode === 'procedures_prototype' && b.mutation && b.mutation.proccode === proccode) {
-                    protoWarp = b.mutation.warp === 'true';
-                    break;
-                }
-            }
-        }
+        const vmPrototype = lookupUniqueVmPrototype(proccode, sourceAst);
+        const protoWarp = !!(vmPrototype && vmPrototype.mutation.warp === 'true');
         const callId = addBlock('procedures_call', {
             parent: parentBlockId,
             line: astLine(sourceAst),
@@ -2345,11 +2612,16 @@ const parsePseudocode = (source, ctx) => {
             warp: protoWarp ? 'true' : 'false'
         };
         if (isReturn) outBlocks[callId].mutation.return = '1';
+        const argTypes = extractProcTypesFromProccode(proccode);
         const n = Math.min(argAsts.length, argIds.length);
         for (let i = 0; i < n; i++) {
-            const r = compileExpr(argAsts[i], callId, 10);
-            if (r.blockId) outBlocks[callId].inputs[argIds[i]] = [1, r.blockId];
-            else if (r.prim) outBlocks[callId].inputs[argIds[i]] = [1, r.prim];
+            // Scratch custom-procedure %s/%n parameters are value slots, while
+            // %b is a boolean slot. Reuse the normal input builder so reporters
+            // get type 3 + an inactive value shadow and booleans get type 2.
+            const expectedPrimType = argTypes[i] === 'b' ? null : 10;
+            const r = compileExpr(argAsts[i], callId, expectedPrimType);
+            const ref = buildInputRef(r, callId, expectedPrimType);
+            if (ref) outBlocks[callId].inputs[argIds[i]] = ref;
         }
         return {blockId: callId, line: astLine(sourceAst), col: astCol(sourceAst)};
     };
@@ -2557,14 +2829,6 @@ const parsePseudocode = (source, ctx) => {
         const mathOp = assignOp.slice(0, -1);
         eat(); // compound operator
         const rhsAst = parseExpression(0);
-        if (assignOp === '+=' && isDefinitelyStringExpr(rhsAst)) {
-            errors.push({
-                line: tokenLine(opToken),
-                col: tokenCol(opToken),
-                message: '字符串拼接不能使用 +=；请使用 join(a, b) 后再赋值，例如 name = join(name, "后缀")。'
-            });
-            return null;
-        }
         const ref = resolveVariableRef(name);
         const id = addBlock(assignOp === '+=' ? 'data_changevariableby' : 'data_setvariableto', {
             parent: parentBlockId,
@@ -2687,7 +2951,8 @@ const parsePseudocode = (source, ctx) => {
         const proccode = PROC_PLACEHOLDER_RE.test(rawProccode)
             ? rawProccode
             : composeProccode(rawProccode, paramTypes);
-        const vmIds = lookupVmPrototypeArgIds(proccode) || [];
+        const vmPrototype = lookupUniqueVmPrototype(proccode, pcTok);
+        const vmIds = lookupVmPrototypeArgIds(proccode, pcTok) || [];
         const paramIds = paramNames.map((_, i) => {
             if (paramExplicitIds[i] != null) return paramExplicitIds[i];
             if (i < vmIds.length) return vmIds[i];
@@ -2695,7 +2960,7 @@ const parsePseudocode = (source, ctx) => {
         });
         const argdefaults = paramTypes.map(t => t === 'b' ? 'false' : '');
         const protoId = addBlock('procedures_prototype', {parent: null, shadow: true, line: tokenLine(pcTok), col: tokenCol(pcTok)});
-        outBlocks[protoId].mutation = {
+        const canonicalMutation = {
             tagName: 'mutation',
             children: [],
             proccode,
@@ -2704,6 +2969,22 @@ const parsePseudocode = (source, ctx) => {
             argumentdefaults: JSON.stringify(argdefaults),
             warp: warp ? 'true' : 'false'
         };
+        const parseMutationArray = value => {
+            try {
+                const parsed = JSON.parse(value || '[]');
+                return Array.isArray(parsed) ? parsed : null;
+            } catch (_) {
+                return null;
+            }
+        };
+        const existingMutation = vmPrototype && vmPrototype.mutation;
+        const signatureUnchanged = !!existingMutation &&
+            JSON.stringify(parseMutationArray(existingMutation.argumentids)) === JSON.stringify(paramIds) &&
+            JSON.stringify(parseMutationArray(existingMutation.argumentnames)) === JSON.stringify(paramNames) &&
+            existingMutation.warp === canonicalMutation.warp;
+        outBlocks[protoId].mutation = signatureUnchanged
+            ? JSON.parse(JSON.stringify(existingMutation))
+            : canonicalMutation;
         for (let i = 0; i < paramIds.length; i++) {
             const op = paramTypes[i] === 'b' ? 'argument_reporter_boolean' : 'argument_reporter_string_number';
             const argId = addBlock(op, {parent: protoId, shadow: true, line: tokenLine(pcTok), col: tokenCol(pcTok)});
@@ -2974,7 +3255,7 @@ const parsePseudocode = (source, ctx) => {
             const proccode = PROC_PLACEHOLDER_RE.test(rawProccode)
                 ? rawProccode
                 : composeProccode(rawProccode, paramTypes);
-            const vmIds = lookupVmPrototypeArgIds(proccode) || [];
+            const vmIds = lookupVmPrototypeArgIds(proccode, pcTok) || [];
             const ids = explicitIds.map((aid, idx) => {
                 if (aid != null) return aid;
                 if (idx < vmIds.length) return vmIds[idx];
@@ -2992,10 +3273,19 @@ const parsePseudocode = (source, ctx) => {
         if (t.type === T.HASH_KEYWORD) {
             const kw = t.value;
             eat();
-            if (kw === 'vars' || kw === '变量') parseHeaderBlock(declaredVars);
-            else if (kw === 'lists' || kw === '列表') parseHeaderBlock(declaredLists);
-            else if (kw === 'localvars' || kw === '局部变量') parseHeaderBlock(declaredLocalVars);
-            else if (kw === 'locallists' || kw === '局部列表') parseHeaderBlock(declaredLocalLists);
+            if (kw === 'vars' || kw === '变量') parseHeaderBlock(declaredVars, 'global', '');
+            else if (kw === 'lists' || kw === '列表') parseHeaderBlock(declaredLists, 'global', 'list');
+            else if (kw === 'localvars' || kw === '局部变量') {
+                if (ctxTarget && ctxTarget.isStage) {
+                    errors.push({line: t.line, col: t.col, message: '舞台不支持局部变量声明'});
+                }
+                parseHeaderBlock(declaredLocalVars, 'local', '');
+            } else if (kw === 'locallists' || kw === '局部列表') {
+                if (ctxTarget && ctxTarget.isStage) {
+                    errors.push({line: t.line, col: t.col, message: '舞台不支持局部列表声明'});
+                }
+                parseHeaderBlock(declaredLocalLists, 'local', 'list');
+            }
             else {
                 errors.push({line: t.line, col: t.col, message: `未知头部关键字: #${kw}`});
                 // 尝试跳到下一个换行
@@ -3125,8 +3415,568 @@ const parsePseudocode = (source, ctx) => {
         blocks: outBlocks, errors,
         declaredVars, declaredLists, declaredBroadcasts,
         declaredLocalVars, declaredLocalLists,
-        pendingVars, pendingLists, pendingBroadcasts,
+        declaredDataAliases, declaredDataRecords,
+        pendingVars, pendingLists, pendingBroadcasts, pendingDataRecords,
         comments: outComments
+    };
+};
+
+// ========================= ROUNDTRIP PREFLIGHT =========================
+// Canonical semantic form used by the writeback preflight. Block IDs,
+// parents, coordinates and comment IDs are presentation details; input modes,
+// fallback shadows, mutations and complete next/substack chains are not.
+const stableCanonicalValue = value => {
+    if (value === undefined) return {$undefined: true};
+    if (value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(stableCanonicalValue);
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = stableCanonicalValue(value[key]);
+    return out;
+};
+
+const canonicalizePseudocodeBlocks = (blocks, ctx, options) => {
+    const source = blocks && typeof blocks === 'object' ? blocks : {};
+    const ids = Object.keys(source);
+    const runtimeMetadata = getRuntimeOpcodeMetadata(ctx);
+    const {opcodeToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeMetadata);
+    const optionDataRecords = options && options.dataRecords;
+    const dataRecords = Array.isArray(optionDataRecords)
+        ? optionDataRecords
+        : (optionDataRecords && typeof optionDataRecords.values === 'function'
+            ? [...optionDataRecords.values()]
+            : []);
+    const pendingDataIdentities = new Map();
+    for (const record of dataRecords) {
+        if (!record || !record.pendingId) continue;
+        const kind = record.wantType === 'list' ? 'list' : 'variable';
+        pendingDataIdentities.set(`${kind}\u0000${String(record.pendingId)}`, {
+            pendingData: [
+                record.scope === 'local' ? 'local' : 'global',
+                kind,
+                String(record.name == null ? '' : record.name),
+                Number(record.ordinal) || 0
+            ]
+        });
+    }
+    const addLegacyPendingData = (pending, kind, localNames) => {
+        if (!pending || typeof pending[Symbol.iterator] !== 'function') return;
+        for (const [rawName, rawId] of pending) {
+            const id = String(rawId);
+            const key = `${kind}\u0000${id}`;
+            if (pendingDataIdentities.has(key)) continue;
+            const name = String(rawName);
+            pendingDataIdentities.set(key, {
+                pendingData: [localNames && localNames.has(name) ? 'local' : 'global', kind, name, 0]
+            });
+        }
+    };
+    addLegacyPendingData(options && options.pendingVars, 'variable', options && options.declaredLocalVars);
+    addLegacyPendingData(options && options.pendingLists, 'list', options && options.declaredLocalLists);
+    const pendingBroadcastIdentities = new Map();
+    const pendingBroadcasts = options && options.pendingBroadcasts;
+    if (pendingBroadcasts && typeof pendingBroadcasts[Symbol.iterator] === 'function') {
+        for (const [rawName, rawId] of pendingBroadcasts) {
+            pendingBroadcastIdentities.set(String(rawId), {pendingBroadcast: String(rawName)});
+        }
+    }
+    const canonicalDataId = (kind, id) => {
+        if (id == null) return null;
+        return pendingDataIdentities.get(`${kind}\u0000${String(id)}`) || String(id);
+    };
+    const canonicalBroadcastId = id => {
+        if (id == null) return null;
+        return pendingBroadcastIdentities.get(String(id)) || String(id);
+    };
+    // Menu shadows are part of the friendly syntax of their owning block even
+    // though they do not have standalone entries in OPCODE_DEFS. Treat their
+    // dropdown field like other known fields so `[value]` and `[value, null]`
+    // do not become a false write-safety mismatch. Unknown @op fields remain
+    // strict and continue to preserve their full array shape.
+    const knownMenuFields = new Map();
+    const collectKnownMenus = def => {
+        for (const arg of (def && def.args) || []) {
+            if (!arg.menu || !arg.menu.opcode || !arg.menu.field) continue;
+            knownMenuFields.set(arg.menu.opcode, arg.menu.field);
+        }
+    };
+    OPCODE_DEFS.forEach(collectKnownMenus);
+    opcodeToRuntimeDef.forEach(collectKnownMenus);
+    const canonicalDef = opcode => opcodeToDef.get(opcode) || opcodeToRuntimeDef.get(opcode);
+    const referenced = new Set();
+    for (const id of ids) {
+        const block = source[id];
+        if (!block || Array.isArray(block)) continue;
+        if (typeof block.next === 'string' && Object.prototype.hasOwnProperty.call(source, block.next)) {
+            referenced.add(block.next);
+        }
+        for (const input of Object.values(block.inputs || {})) {
+            if (!Array.isArray(input)) continue;
+            for (let i = 1; i < input.length; i++) {
+                const part = input[i];
+                if (typeof part === 'string' && Object.prototype.hasOwnProperty.call(source, part)) {
+                    referenced.add(part);
+                }
+            }
+        }
+    }
+
+    const canonicalPrimitive = primitive => {
+        if (!Array.isArray(primitive)) return stableCanonicalValue(primitive);
+        if (primitive[0] === 11 && primitive.length >= 2) {
+            return {
+                broadcastRef: {
+                    name: primitive[1] == null ? '' : String(primitive[1]),
+                    id: canonicalBroadcastId(primitive[2])
+                }
+            };
+        }
+        if ((primitive[0] === 12 || primitive[0] === 13) && primitive.length >= 2) {
+            return {
+                dataRef: {
+                     kind: primitive[0] === 12 ? 'variable' : 'list',
+                     name: primitive[1] == null ? '' : String(primitive[1]),
+                     id: canonicalDataId(primitive[0] === 12 ? 'variable' : 'list', primitive[2])
+                 }
+             };
+        }
+        return stableCanonicalValue(primitive);
+    };
+    const stack = new Set();
+    const canonicalNode = id => {
+        const block = source[id];
+        if (Array.isArray(block)) return canonicalPrimitive(block);
+        if (!block || typeof block !== 'object') return {missingBlock: true};
+        if (stack.has(id)) return {cycle: true};
+        stack.add(id);
+        if (block.opcode === 'data_variable' || block.opcode === 'data_listcontents') {
+            const field = block.fields && (block.fields.VARIABLE || block.fields.LIST);
+            if (field && !block.next) {
+                stack.delete(id);
+                return {
+                    dataRef: {
+                         kind: block.opcode === 'data_variable' ? 'variable' : 'list',
+                         name: field[0] == null ? '' : String(field[0]),
+                         id: canonicalDataId(
+                             block.opcode === 'data_variable' ? 'variable' : 'list',
+                             field[1]
+                         )
+                     }
+                 };
+            }
+        }
+        const def = canonicalDef(block.opcode);
+        const procedureCall = block.opcode === 'procedures_call';
+        let procedureArgKinds = null;
+        if (procedureCall) {
+            let argumentIds = [];
+            try {
+                argumentIds = JSON.parse((block.mutation && block.mutation.argumentids) || '[]');
+            } catch (_) { /* malformed mutation remains visible in the strict mutation comparison below */ }
+            if (!Array.isArray(argumentIds)) argumentIds = [];
+            const argumentTypes = extractProcTypesFromProccode(
+                block.mutation && block.mutation.proccode
+            );
+            procedureArgKinds = new Map(argumentIds.map((argumentId, index) => [
+                String(argumentId),
+                argumentTypes[index] === 'b' ? 'boolean' : 'value'
+            ]));
+        }
+        // Runtime blocks carrying mutation are deliberately rendered as @op;
+        // all unknown blocks are @op as well. Their connection representation
+        // must be compared strictly. Friendly known syntax is compared by its
+        // active value, ignoring inactive fallback shadows and dropdown ID
+        // placeholders that the language never exposes.
+        // procedures_call is a dedicated dynamic known form: its mutation is
+        // still compared exactly, but each argument compares only active input.
+        const strictOp = !procedureCall && (!def || !!(def.runtime && block.mutation));
+        const canonicalFields = {};
+        for (const name of Object.keys(block.fields || {}).sort()) {
+            const field = block.fields[name];
+            const knownArg = !strictOp && def && Array.isArray(def.args)
+                ? def.args.find(candidate => candidate.type === 'field' && candidate.name === name)
+                : null;
+            // Keep every other part of a menu helper strict; only its known
+            // dropdown field's optional ID placeholder is non-semantic.
+            const arg = knownArg || (knownMenuFields.get(block.opcode) === name
+                ? {type: 'field', name}
+                : null);
+            const identityField = arg && (arg.kind === 'variable' || arg.kind === 'list' ||
+                arg.kind === 'broadcast' || arg.name === 'BROADCAST_OPTION');
+            if (arg && Array.isArray(field) && (arg.kind === 'variable' || arg.kind === 'list')) {
+                canonicalFields[name] = [
+                    stableCanonicalValue(field[0]),
+                    canonicalDataId(arg.kind, field[1])
+                ];
+            } else if (arg && Array.isArray(field) &&
+                    (arg.kind === 'broadcast' || arg.name === 'BROADCAST_OPTION')) {
+                canonicalFields[name] = [
+                    stableCanonicalValue(field[0]),
+                    canonicalBroadcastId(field[1])
+                ];
+            } else if (arg && Array.isArray(field) && !identityField) {
+                canonicalFields[name] = [stableCanonicalValue(field[0])];
+            } else {
+                canonicalFields[name] = stableCanonicalValue(field);
+            }
+        }
+        const node = {
+            opcode: String(block.opcode || ''),
+            shadow: !!block.shadow,
+            fields: canonicalFields,
+            inputs: {}
+        };
+        for (const name of Object.keys(block.inputs || {}).sort()) {
+            const input = block.inputs[name];
+            if (!Array.isArray(input)) {
+                node.inputs[name] = stableCanonicalValue(input);
+                continue;
+            }
+            const canonicalPart = (part, index) => {
+                if (index > 0 && typeof part === 'string' && Object.prototype.hasOwnProperty.call(source, part)) {
+                    return canonicalNode(part);
+                }
+                if (index > 0 && Array.isArray(part)) return canonicalPrimitive(part);
+                return stableCanonicalValue(part);
+            };
+            if (strictOp) {
+                node.inputs[name] = input.map(canonicalPart);
+            } else {
+                const primary = input.length > 1 ? canonicalPart(input[1], 1) : null;
+                const arg = def && Array.isArray(def.args)
+                    ? def.args.find(candidate => candidate.type !== 'field' && candidate.name === name)
+                    : null;
+                const isSubstack = def && Array.isArray(def.substacks) && def.substacks.indexOf(name) >= 0;
+                node.inputs[name] = {
+                    kind: procedureCall
+                        ? (procedureArgKinds.get(name) || 'value')
+                        : (isSubstack ? 'substack' : (arg && arg.primType == null ? 'boolean' : 'value')),
+                    primary
+                };
+            }
+        }
+        if (!strictOp && def && Array.isArray(def.substacks)) {
+            for (const name of def.substacks) {
+                if (!Object.prototype.hasOwnProperty.call(node.inputs, name)) {
+                    node.inputs[name] = {kind: 'substack', primary: null};
+                }
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(block, 'mutation')) {
+            node.mutation = stableCanonicalValue(block.mutation);
+        }
+        if (typeof block.next === 'string' && Object.prototype.hasOwnProperty.call(source, block.next)) {
+            node.next = canonicalNode(block.next);
+        } else if (block.next != null) {
+            node.next = stableCanonicalValue(block.next);
+        }
+        stack.delete(id);
+        return node;
+    };
+
+    const canBeRenderedRoot = id => {
+        const block = source[id];
+        if (Array.isArray(block)) return true;
+        return !!block && (block.topLevel === true || (block.topLevel == null && block.parent == null));
+    };
+    let roots = ids.filter(id => !referenced.has(id) && canBeRenderedRoot(id));
+    // Malformed cyclic graphs have no roots; retaining every node still makes
+    // the comparison deterministic and, importantly, non-silent. Explicit
+    // topLevel:false blocks remain outside the representable projection.
+    if (!roots.length && ids.length) roots = ids.filter(id => {
+        const block = source[id];
+        return Array.isArray(block) || (block && block.topLevel !== false);
+    });
+    const scripts = roots.map(canonicalNode);
+    scripts.sort((a, b) => {
+        const aa = JSON.stringify(stableCanonicalValue(a));
+        const bb = JSON.stringify(stableCanonicalValue(b));
+        return aa < bb ? -1 : (aa > bb ? 1 : 0);
+    });
+    // canonicalNode may append an omitted known substack after inputs which
+    // were already present. Recursively sort object keys before comparison so
+    // semantically identical input maps do not differ only by insertion order.
+    return stableCanonicalValue({scripts});
+};
+
+const collectRoundTripFacets = blocks => {
+    const source = blocks && typeof blocks === 'object' ? blocks : {};
+    const facets = {inputTypes: {}, shadows: {}, mutations: {}, substacks: {}};
+    const push = (bucket, key, value) => {
+        if (!bucket[key]) bucket[key] = [];
+        bucket[key].push(value);
+    };
+    const substackLength = firstId => {
+        let length = 0;
+        let id = firstId;
+        const seen = new Set();
+        while (typeof id === 'string' && source[id] && !Array.isArray(source[id]) && !seen.has(id)) {
+            seen.add(id);
+            length++;
+            id = source[id].next;
+        }
+        return length;
+    };
+    for (const id of Object.keys(source)) {
+        const block = source[id];
+        if (!block || Array.isArray(block)) continue;
+        const opcode = String(block.opcode || '');
+        push(facets.shadows, `${opcode}\u0000@block`, block.shadow ? 'shadow' : 'normal');
+        if (Object.prototype.hasOwnProperty.call(block, 'mutation')) {
+            push(facets.mutations, opcode, JSON.stringify(stableCanonicalValue(block.mutation)));
+        }
+        for (const inputName of Object.keys(block.inputs || {})) {
+            const input = block.inputs[inputName];
+            if (!Array.isArray(input)) continue;
+            const key = `${opcode}\u0000${inputName}`;
+            push(facets.inputTypes, key, JSON.stringify(input[0]));
+            const fallbackKind = input.length > 2 && input[2] != null
+                ? (Array.isArray(input[2]) ? JSON.stringify(stableCanonicalValue(input[2])) : 'block-shadow')
+                : 'no-fallback-shadow';
+            push(facets.shadows, key, fallbackKind);
+            if (input[0] === 2) push(facets.substacks, key, String(substackLength(input[1])));
+        }
+    }
+    for (const bucket of Object.values(facets)) {
+        for (const values of Object.values(bucket)) values.sort();
+    }
+    return stableCanonicalValue(facets);
+};
+
+const comparePseudocodeRoundTrip = (originalBlocks, roundTrippedBlocks, ctx, options) => {
+    const originalCanonical = canonicalizePseudocodeBlocks(originalBlocks, ctx, {
+        dataRecords: options && options.originalDataRecords,
+        pendingVars: options && options.originalPendingVars,
+        pendingLists: options && options.originalPendingLists,
+        pendingBroadcasts: options && options.originalPendingBroadcasts,
+        declaredLocalVars: options && options.originalDeclaredLocalVars,
+        declaredLocalLists: options && options.originalDeclaredLocalLists
+    });
+    const roundTrippedCanonical = canonicalizePseudocodeBlocks(roundTrippedBlocks, ctx, {
+        dataRecords: options && options.roundTrippedDataRecords,
+        pendingVars: options && options.roundTrippedPendingVars,
+        pendingLists: options && options.roundTrippedPendingLists,
+        pendingBroadcasts: options && options.roundTrippedPendingBroadcasts,
+        declaredLocalVars: options && options.roundTrippedDeclaredLocalVars,
+        declaredLocalLists: options && options.roundTrippedDeclaredLocalLists
+    });
+    const equal = JSON.stringify(originalCanonical) === JSON.stringify(roundTrippedCanonical);
+    const originalFacets = collectRoundTripFacets(originalBlocks);
+    const roundTrippedFacets = collectRoundTripFacets(roundTrippedBlocks);
+    const reasons = [];
+    if (!equal && JSON.stringify(originalFacets.inputTypes) !== JSON.stringify(roundTrippedFacets.inputTypes)) {
+        reasons.push('Input connection types differ after the pseudocode roundtrip.');
+    }
+    if (!equal && JSON.stringify(originalFacets.shadows) !== JSON.stringify(roundTrippedFacets.shadows)) {
+        reasons.push('Shadow block or fallback-shadow semantics differ after the pseudocode roundtrip.');
+    }
+    if (!equal && JSON.stringify(originalFacets.mutations) !== JSON.stringify(roundTrippedFacets.mutations)) {
+        reasons.push('Mutation payloads differ after the pseudocode roundtrip.');
+    }
+    if (!equal && JSON.stringify(originalFacets.substacks) !== JSON.stringify(roundTrippedFacets.substacks)) {
+        reasons.push('A full substack does not survive the pseudocode roundtrip.');
+    }
+    if (!equal && !reasons.length) reasons.push('Canonical block semantics differ after the pseudocode roundtrip.');
+    return {
+        equal,
+        safe: equal,
+        reasons: equal ? [] : reasons,
+        originalCanonical,
+        roundTrippedCanonical,
+        originalFacets,
+        roundTrippedFacets
+    };
+};
+
+const collectDuplicateDataReasons = ctx => {
+    const groups = new Map();
+    for (const entity of collectContextDataEntities(ctx)) {
+        const key = `${entity.scope}\u0000${entity.kind}\u0000${entity.name}`;
+        const group = groups.get(key) || [];
+        group.push(entity);
+        groups.set(key, group);
+    }
+    const reasons = [];
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const entity = group[0];
+        reasons.push(
+            `Unsafe writeback: ${entity.scope} ${entity.kind} ${JSON.stringify(entity.name)} has ` +
+            `${group.length} exact duplicates in the same scope; pseudocode keeps their IDs internal.`
+        );
+    }
+    return reasons;
+};
+
+const collectDeclaredDataRecordReasons = records => {
+    if (!Array.isArray(records)) return [];
+    const counts = new Map();
+    for (const record of records) {
+        if (!record) continue;
+        const scope = record.scope === 'local' ? 'local' : 'global';
+        const kind = record.wantType === 'list' ? 'list' : 'variable';
+        const name = String(record.name == null ? '' : record.name);
+        const key = `${scope}\u0000${kind}\u0000${name}`;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const reasons = [];
+    for (const [key, count] of counts) {
+        if (count < 2) continue;
+        const [scope, kind, name] = key.split('\u0000');
+        reasons.push(
+            `Unsafe writeback: ${scope} ${kind} ${JSON.stringify(name)} has ${count} exact declarations; ` +
+            'pseudocode does not expose Scratch IDs with which to distinguish them.'
+        );
+    }
+    return reasons;
+};
+
+const collectNonTopLevelOrphanReasons = blocks => {
+    const source = blocks && typeof blocks === 'object' ? blocks : {};
+    const referenced = new Set();
+    const childrenById = new Map();
+    for (const id of Object.keys(source)) {
+        const block = source[id];
+        if (!block || Array.isArray(block)) continue;
+        const children = [];
+        if (typeof block.next === 'string' && Object.prototype.hasOwnProperty.call(source, block.next)) {
+            referenced.add(block.next);
+            children.push(block.next);
+        }
+        for (const input of Object.values(block.inputs || {})) {
+            if (!Array.isArray(input)) continue;
+            for (let i = 1; i < input.length; i++) {
+                if (typeof input[i] === 'string' && Object.prototype.hasOwnProperty.call(source, input[i])) {
+                    referenced.add(input[i]);
+                    children.push(input[i]);
+                }
+            }
+        }
+        childrenById.set(id, children);
+    }
+    const roots = Object.keys(source).filter(id => {
+        const block = source[id];
+        return block && !Array.isArray(block) && !referenced.has(id) &&
+            (block.topLevel === true || (block.topLevel == null && block.parent == null));
+    });
+    const reachable = new Set();
+    const pending = roots.slice();
+    while (pending.length) {
+        const id = pending.pop();
+        if (reachable.has(id)) continue;
+        reachable.add(id);
+        for (const child of childrenById.get(id) || []) pending.push(child);
+    }
+    const orphanCount = Object.keys(source).filter(id => {
+        const block = source[id];
+        return block && !Array.isArray(block) && block.topLevel === false && !reachable.has(id);
+    }).length;
+    if (!orphanCount) return [];
+    return [
+        `Unsafe writeback: ${orphanCount} explicit non-top-level orphan ` +
+        `${orphanCount === 1 ? 'block is' : 'blocks are'} unreachable and cannot be represented by pseudocode.`
+    ];
+};
+
+const collectGenericOpRoundTripReasons = (blocks, ctx) => {
+    const source = blocks && typeof blocks === 'object' ? blocks : {};
+    const runtimeMetadata = getRuntimeOpcodeMetadata(ctx);
+    const {opcodeToRuntimeDef} = getRuntimeOpcodeDefinitions(runtimeMetadata);
+    const reasons = [];
+    const add = reason => {
+        if (reasons.indexOf(reason) < 0) reasons.push(reason);
+    };
+    for (const id of Object.keys(source)) {
+        const block = source[id];
+        if (!block || Array.isArray(block)) continue;
+        // procedures_call has its own quoted/bare procedure syntax and dynamic
+        // input semantics; it is not rendered through the lossy generic @op path.
+        if (block.opcode === 'procedures_call') continue;
+        const def = opcodeToDef.get(block.opcode) || opcodeToRuntimeDef.get(block.opcode);
+        const renderedAsOp = !def || !!(def.runtime && block.mutation);
+        if (!renderedAsOp) continue;
+        for (const inputName of Object.keys(block.inputs || {})) {
+            const input = block.inputs[inputName];
+            if (!Array.isArray(input)) continue;
+            if (input[0] !== 1) {
+                add(`Unsafe writeback: @op ${JSON.stringify(block.opcode)} input ${JSON.stringify(inputName)} ` +
+                    `uses input type ${JSON.stringify(input[0])}, which the current @op syntax cannot preserve.`);
+            }
+            if (input.length > 2 && input[2] != null) {
+                add(`Unsafe writeback: @op ${JSON.stringify(block.opcode)} input ${JSON.stringify(inputName)} ` +
+                    'has a fallback shadow that the current @op syntax cannot preserve.');
+            }
+            const primaryId = typeof input[1] === 'string' ? input[1] : null;
+            const first = primaryId && source[primaryId];
+            if (first && !Array.isArray(first) && first.next) {
+                add(`Unsafe writeback: @op ${JSON.stringify(block.opcode)} input ${JSON.stringify(inputName)} ` +
+                    'contains a multi-statement substack; only its first statement can be rendered by @op.');
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(block, 'mutation')) {
+            try {
+                const json = JSON.stringify(block.mutation);
+                if (json === undefined || JSON.stringify(stableCanonicalValue(JSON.parse(json))) !==
+                        JSON.stringify(stableCanonicalValue(block.mutation))) {
+                    add(`Unsafe writeback: @op ${JSON.stringify(block.opcode)} has a mutation that JSON cannot preserve.`);
+                }
+            } catch (_) {
+                add(`Unsafe writeback: @op ${JSON.stringify(block.opcode)} has a mutation that JSON cannot preserve.`);
+            }
+        }
+    }
+    return reasons;
+};
+
+// Render + parse without extending the @op language. Consumers should leave the
+// editor read-only whenever this result says so; `rendered` remains useful for
+// analysis even in that case.
+const preflightPseudocodeRoundTrip = (blocks, ctx, options) => {
+    const reasons = collectDuplicateDataReasons(ctx)
+        .concat(collectDeclaredDataRecordReasons(options && options.dataRecords))
+        .concat(collectNonTopLevelOrphanReasons(blocks));
+    const genericReasons = collectGenericOpRoundTripReasons(blocks, ctx);
+    let rendered = '';
+    let parsed = null;
+    let comparison = null;
+    try {
+        rendered = renderPseudocode(blocks, ctx, options);
+        parsed = parsePseudocode(rendered, ctx);
+        for (const error of parsed.errors || []) {
+            reasons.push(`Pseudocode roundtrip parse failed: ${error.message}`);
+        }
+        if (parsed.errors && parsed.errors.length) {
+            reasons.push(...genericReasons);
+        } else {
+            comparison = comparePseudocodeRoundTrip(blocks, parsed.blocks, ctx, {
+                originalDataRecords: options && options.dataRecords,
+                originalPendingVars: options && options.pendingVars,
+                originalPendingLists: options && options.pendingLists,
+                originalPendingBroadcasts: options && options.pendingBroadcasts,
+                originalDeclaredLocalVars: options && options.declaredLocalVars,
+                originalDeclaredLocalLists: options && options.declaredLocalLists,
+                roundTrippedDataRecords: parsed.declaredDataRecords,
+                roundTrippedPendingVars: parsed.pendingVars,
+                roundTrippedPendingLists: parsed.pendingLists,
+                roundTrippedPendingBroadcasts: parsed.pendingBroadcasts,
+                roundTrippedDeclaredLocalVars: parsed.declaredLocalVars,
+                roundTrippedDeclaredLocalLists: parsed.declaredLocalLists
+            });
+            if (!comparison.equal) reasons.push(...genericReasons);
+            reasons.push(...comparison.reasons);
+        }
+    } catch (error) {
+        reasons.push(`Pseudocode roundtrip failed: ${error && error.message ? error.message : String(error)}`);
+    }
+    const uniqueReasons = [...new Set(reasons)];
+    const safe = uniqueReasons.length === 0;
+    return {
+        safe,
+        readOnly: !safe,
+        reason: safe ? '' : uniqueReasons[0],
+        reasons: uniqueReasons,
+        rendered,
+        parsed,
+        comparison
     };
 };
 
@@ -3213,9 +4063,22 @@ const KEYWORD_NAMES = Array.from(new Set(
             'call', 'callret', 'arg', 'arg_bool', 'return', 'as'])
 )).sort();
 
+export {
+    renderPseudocode,
+    parsePseudocode,
+    preflightPseudocodeRoundTrip,
+    canonicalizePseudocodeBlocks,
+    comparePseudocodeRoundTrip,
+    translatePseudocode,
+    sanitizeIdent
+};
+
 export default {
     renderPseudocode,
     parsePseudocode,
+    preflightPseudocodeRoundTrip,
+    canonicalizePseudocodeBlocks,
+    comparePseudocodeRoundTrip,
     translatePseudocode,
     sanitizeIdent,
     keywordNames: KEYWORD_NAMES,

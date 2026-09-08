@@ -22,7 +22,9 @@
     "start": "webpack-dev-server --mode development --open",
     "test": "npm run test:lint && npm run test:unit && npm run build && npm run test:integration",
     "test:integration": "jest --maxWorkers=4 test[\\\\/]integration",
-    "test:lint": "eslint . --ext .js,.jsx",
+    "test:mcp:conformance": "node --test test/json-script-converter-mcp-process-conformance.test.cjs",
+    "test:lint": "npm run test:lint:jsc && eslint . --ext .js,.jsx --ignore-pattern src/addons/addons/json-script-converter",
+    "test:lint:jsc": "eslint src/addons/addons/json-script-converter --ext .js,.cjs",
     "test:unit": "jest test[\\\\/]unit[\\\\/]addons",
     "test:smoke": "jest --runInBand test[\\\\/]smoke",
     "watch": "webpack --colors --watch"
@@ -40,6 +42,7 @@
     "@turbowarp/scratch-storage": "^0.0.202505311821",
     "@turbowarp/scratch-svg-renderer": "^1.0.0-202312242305-12c360b",
     "@turbowarp/startaudiocontext": "^1.0.0",
+    "ajv": "6.12.6",
     "arraybuffer-loader": "^1.0.6",
     "autoprefixer": "^9.0.1",
     "balance-text": "3.3.1",
@@ -108,6 +111,7 @@
   "devDependencies": {
     "@babel/cli": "^7.26.4",
     "@babel/core": "^7.26.9",
+    "@babel/eslint-parser": "7.27.5",
     "@babel/plugin-proposal-object-rest-spread": "7.14.7",
     "@babel/plugin-syntax-dynamic-import": "7.2.0",
     "@babel/plugin-transform-async-to-generator": "7.14.5",

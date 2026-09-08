@@ -1,11 +1,39 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
+import Ajv from 'ajv';
 import sb3 from 'scratch-vm/src/serialization/sb3';
 import newBlockIds from 'scratch-vm/src/util/new-block-ids';
 import {sanitizeSvg, fixForVanilla} from '@turbowarp/scratch-svg-renderer';
 import {emptyCostume, emptySprite} from '../../../lib/empty-assets';
 import {isPaused, setPaused, setup as setupPauseControls} from '../debugger/module.js';
+import mcpToolCatalog from './mcp-tools.json';
 import pseudoConverter from './pseudocode';
+import {
+    alignPseudocodeDataDeclarations,
+    prunePseudocodeLocalData,
+    validatePseudocodeParseResult,
+    shouldAutoApplyEditorText
+} from './data-alignment';
+
+// The bridge validates every canonical MCP call before queueing it, and the
+// page validates the same arguments again from the exact same catalog before
+// dispatch. This keeps browser, Node and Rust entry points on one contract.
+const mcpPageSchemaValidator = new Ajv({allErrors: true, jsonPointers: true});
+const mcpPageToolValidators = new Map(
+    ((mcpToolCatalog && mcpToolCatalog.tools) || []).map(tool => [
+        tool.name,
+        mcpPageSchemaValidator.compile(tool.inputSchema || {type: 'object'})
+    ])
+);
+const validateMcpPageToolArguments = (name, args) => {
+    const validate = mcpPageToolValidators.get(name);
+    if (!validate || validate(args)) return '';
+    const details = (validate.errors || []).map(error => {
+        const path = error.dataPath || '/';
+        return `${path} ${error.message || '参数无效'}`;
+    });
+    return details.join('；') || '参数无效';
+};
 
 // 保险丝：给 Blockly workspace 装一个变量事件监听器，任何 var_create / var_delete /
 // var_rename 发生后都强制把 flyout 重绘一次。
@@ -89,8 +117,33 @@ const shortIdAt = index => {
 // 应用回去时 deserializeBlocks + newBlockIds 会重新生成真正的 UID，短 ID 只在编辑期间存在。
 const remapBlockIdsForEditor = blocksObj => {
     const keys = Object.keys(blocksObj);
+    const keySet = new Set(keys);
+    const reservedIds = new Set();
+    const reserveDanglingId = id => {
+        if (typeof id === 'string' && !keySet.has(id)) reservedIds.add(id);
+    };
+    for (const oldId of keys) {
+        const entry = blocksObj[oldId];
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        reserveDanglingId(entry.next);
+        reserveDanglingId(entry.parent);
+        if (!entry.inputs || typeof entry.inputs !== 'object') continue;
+        for (const inputName of Object.keys(entry.inputs)) {
+            const input = entry.inputs[inputName];
+            if (!Array.isArray(input)) continue;
+            reserveDanglingId(input[1]);
+            reserveDanglingId(input[2]);
+        }
+    }
     const idMap = new Map();
-    keys.forEach((oldId, i) => idMap.set(oldId, shortIdAt(i)));
+    let shortIdIndex = 0;
+    for (const oldId of keys) {
+        let newId;
+        do {
+            newId = shortIdAt(shortIdIndex++);
+        } while (reservedIds.has(newId));
+        idMap.set(oldId, newId);
+    }
     const mapId = id => (typeof id === 'string' && idMap.has(id) ? idMap.get(id) : id);
 
     const result = {};
@@ -1533,6 +1586,7 @@ export default async ({addon, console, msg}) => {
     const AI_REQUEST_RETRY_BASE_DELAY = 800;
     const AI_REQUEST_RETRY_MAX_DELAY = 6000;
     const AI_MCP_BRIDGE_DEFAULT_URL = 'http://127.0.0.1:47740';
+    const AI_MCP_HTTP_PATH = '/mcp';
     const AI_MCP_BRIDGE_EXE_NAME = '40code-MCP本地桥接器.exe';
     const AI_MCP_BRIDGE_EXE_DOWNLOAD_URL = '40code-mcp-bridge/40code-MCP本地桥接器.exe';
     const AI_MCP_BRIDGE_LEGACY_PATH_RE = /\/json-script-converter\/mcp\/?$/;
@@ -1567,8 +1621,36 @@ export default async ({addon, console, msg}) => {
         } catch (_) { /* ignore */ }
     };
     const normalizeMcpBridgeUrl = url => {
-        const value = String(url || AI_MCP_BRIDGE_DEFAULT_URL).trim().replace(/\/+$/, '');
-        return (value.replace(AI_MCP_BRIDGE_LEGACY_PATH_RE, '') || AI_MCP_BRIDGE_DEFAULT_URL);
+        const fallback = AI_MCP_BRIDGE_DEFAULT_URL;
+        let value = String(url || fallback).trim();
+        try {
+            const parsed = new URL(value || fallback);
+            parsed.search = '';
+            parsed.hash = '';
+            let path = parsed.pathname.replace(/\/+$/, '');
+            path = path.replace(AI_MCP_BRIDGE_LEGACY_PATH_RE, '');
+            if (path === AI_MCP_HTTP_PATH || path === '/poll' || path === '/result') path = '';
+            parsed.pathname = path || '/';
+            return parsed.toString().replace(/\/+$/, '');
+        } catch (_) {
+            value = value.replace(/\/+$/, '')
+                .replace(AI_MCP_BRIDGE_LEGACY_PATH_RE, '')
+                .replace(/\/(?:mcp|poll|result)$/i, '');
+            return value || fallback;
+        }
+    };
+    const buildMcpBridgeUrl = (baseUrl, path) => `${normalizeMcpBridgeUrl(baseUrl)}${path}`;
+    const getMcpHttpEndpointUrl = baseUrl => buildMcpBridgeUrl(baseUrl, AI_MCP_HTTP_PATH);
+    // This is intentionally per-document rather than persisted in sessionStorage.
+    // Browsers copy sessionStorage into duplicated/window.open tabs, which would
+    // otherwise make two live editor pages repeatedly replace each registration.
+    const createMcpBridgeClientId = () => {
+        try {
+            if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+                return `jsc-page-${globalThis.crypto.randomUUID()}`;
+            }
+        } catch (_) { /* use the per-document fallback */ }
+        return `jsc-page-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
     };
     const formatMcpBridgeStatus = status => {
         const value = String(status || 'disabled');
@@ -1621,6 +1703,16 @@ export default async ({addon, console, msg}) => {
         const count = Number(value);
         if (!Number.isFinite(count)) return AI_REQUEST_RETRY_DEFAULT_COUNT;
         return Math.max(0, Math.min(AI_REQUEST_RETRY_MAX_COUNT, Math.floor(count)));
+    };
+    const normalizeAiContextCharBudget = value => {
+        const count = Number(value);
+        if (!Number.isFinite(count)) return AI_CONTEXT_CHAR_BUDGET_DEFAULT;
+        return Math.max(AI_CONTEXT_CHAR_BUDGET_MIN, Math.min(AI_CONTEXT_CHAR_BUDGET_MAX, Math.floor(count)));
+    };
+    const normalizeAiToolMaxChars = value => {
+        const count = Number(value);
+        if (!Number.isFinite(count) || count <= 0) return AI_TOOL_MAX_CHARS_DEFAULT;
+        return Math.max(1, Math.min(AI_TOOL_MAX_CHARS_LIMIT, Math.floor(count)));
     };
     const isAiRequestRetryEnabled = config => !!config && config.requestRetryEnabled !== false &&
         normalizeAiRequestRetryCount(config.requestRetryCount) > 0;
@@ -1983,28 +2075,44 @@ export default async ({addon, console, msg}) => {
         .filter(Boolean)
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, AI_CHAT_MAX_CONVERSATIONS);
-    const loadAiChatState = () => {
+    const getAiProjectHistoryKey = currentVm => {
+        try {
+            const match = String(window.location && window.location.pathname || '').match(/\/projects\/(\d+)/);
+            if (match) return `project:${match[1]}`;
+        } catch (_) { /* ignore */ }
+        const runtime = currentVm && currentVm.runtime;
+        const stage = runtime && typeof runtime.getTargetForStage === 'function'
+            ? runtime.getTargetForStage()
+            : null;
+        if (stage && stage.id) return `stage:${stage.id}`;
+        return 'project:unavailable';
+    };
+    const loadAiChatState = projectKey => {
         try {
             const raw = JSON.parse(localStorage.getItem(AI_CHAT_STORAGE_KEY) || '{}') || {};
-            const conversations = normalizeAiConversations(Array.isArray(raw) ? raw : raw.conversations);
-            const activeConversationId = conversations.some(item => item.id === raw.activeConversationId)
-                ? raw.activeConversationId
+            const stored = raw.projects && raw.projects[projectKey] ? raw.projects[projectKey] : {};
+            const conversations = normalizeAiConversations(stored.conversations);
+            const activeConversationId = conversations.some(item => item.id === stored.activeConversationId)
+                ? stored.activeConversationId
                 : (conversations[0] && conversations[0].id) || null;
             return {
                 conversations,
                 activeConversationId,
-                sidebarCollapsed: !!raw.sidebarCollapsed
+                sidebarCollapsed: !!stored.sidebarCollapsed
             };
         } catch (_) {
             return {conversations: [], activeConversationId: null, sidebarCollapsed: false};
         }
     };
-    const saveAiChatState = chatState => {
+    const saveAiChatState = (projectKey, chatState) => {
         try {
             const conversations = normalizeAiConversations(chatState && (
                 chatState.conversations || chatState.aiConversations
             ));
-            localStorage.setItem(AI_CHAT_STORAGE_KEY, JSON.stringify({
+            let raw = {};
+            try { raw = JSON.parse(localStorage.getItem(AI_CHAT_STORAGE_KEY) || '{}') || {}; } catch (_) { raw = {}; }
+            const projects = raw.projects && typeof raw.projects === 'object' ? {...raw.projects} : {};
+            projects[projectKey || 'project:unavailable'] = {
                 conversations,
                 activeConversationId: chatState && (
                     chatState.activeConversationId || chatState.aiActiveConversationId
@@ -2012,7 +2120,8 @@ export default async ({addon, console, msg}) => {
                 sidebarCollapsed: !!(chatState && (
                     chatState.sidebarCollapsed || chatState.aiSidebarCollapsed
                 ))
-            }));
+            };
+            localStorage.setItem(AI_CHAT_STORAGE_KEY, JSON.stringify({projects}));
         } catch (err) {
             console.warn('[json-script-converter] save AI chat history failed', err);
         }
@@ -2077,11 +2186,36 @@ export default async ({addon, console, msg}) => {
         }
         return out.sort();
     };
-    const getAiTargetName = target => (
-        target && target.sprite && target.sprite.name
-            ? target.sprite.name
-            : (target && target.isStage ? 'Stage' : (target && target.id) || '')
+    const getAiDeclaredDataAliases = pseudocode => {
+        const aliases = new Map();
+        for (const line of String(pseudocode || '').split('\n')) {
+            const header = line.match(/^#(vars|localvars|lists|locallists|变量|局部变量|列表|局部列表)\s*\{/);
+            if (!header) continue;
+            const keyword = header[1];
+            const type = keyword === 'lists' || keyword === 'locallists' || keyword === '列表' || keyword === '局部列表'
+                ? 'list' : 'variable';
+            const scope = keyword === 'localvars' || keyword === 'locallists' ||
+                keyword === '局部变量' || keyword === '局部列表' ? 'local' : 'global';
+            const pattern = /"((?:\\.|[^"\\])*)"\s+as\s+([A-Za-z_\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5]*)/g;
+            let match;
+            while ((match = pattern.exec(line))) {
+                let rawName = match[1];
+                try { rawName = JSON.parse(`"${rawName}"`); } catch (_) { /* keep escaped text */ }
+                aliases.set(`${scope}|${type}|${rawName}`, match[2]);
+            }
+        }
+        return aliases;
+    };
+    const getAiTargetRawName = target => (
+        target && target.sprite && typeof target.sprite.name === 'string' ? target.sprite.name : ''
     );
+    const getAiTargetDisplayName = target => {
+        const rawName = getAiTargetRawName(target);
+        if (rawName.trim()) return rawName;
+        if (target && target.isStage) return 'Stage';
+        return '(未命名角色)';
+    };
+    const getAiTargetName = target => getAiTargetDisplayName(target, '');
     const getAiUnusedName = (baseName, usedNames) => {
         const base = String(baseName || '').trim() || 'Untitled';
         const used = new Set((usedNames || []).map(name => String(name)));
@@ -2115,7 +2249,9 @@ export default async ({addon, console, msg}) => {
     };
     const getAiTargetSummary = (target, vm, targetRef, options) => {
         const isStage = !!(target && target.isStage);
-        const targetName = getAiTargetName(target);
+        const rawName = getAiTargetRawName(target);
+        const displayName = getAiTargetDisplayName(target, targetRef);
+        const targetName = displayName;
         const includeCostumes = !(options && options.includeCostumes === false);
         const costumes = target && target.sprite && Array.isArray(target.sprite.costumes)
             ? target.sprite.costumes.map((costume, index) => ({
@@ -2126,12 +2262,13 @@ export default async ({addon, console, msg}) => {
         const currentCostumeIndex = target && typeof target.currentCostume === 'number'
             ? target.currentCostume
             : null;
-        return {
+        const summary = {
             targetRef: targetRef || '',
-            targetId: target && target.id,
+            rawName,
+            displayName,
             targetName,
             targetType: isStage ? 'stage' : 'sprite',
-            aliases: isStage ? ['Stage', '舞台', '背景', 'backdrop'] : [targetName],
+            aliases: isStage ? ['Stage', '舞台', '背景', 'backdrop'] : (rawName.trim() ? [rawName] : []),
             isStage,
             costumeCount: costumes.length,
             costumes: includeCostumes ? costumes : undefined,
@@ -2141,6 +2278,14 @@ export default async ({addon, console, msg}) => {
                 : '',
             isCurrent: !!(target && vm && vm.editingTarget && target.id === vm.editingTarget.id)
         };
+        // Keep the VM id available to local implementation code without serializing it
+        // into AI/MCP contexts. Stable page-local targetRef is the public identifier.
+        Object.defineProperty(summary, 'targetId', {
+            value: target && target.id,
+            enumerable: false,
+            configurable: true
+        });
+        return summary;
     };
     const findAiTarget = (vm, targetIdOrName) => {
         const value = String(targetIdOrName || '').trim();
@@ -2149,7 +2294,10 @@ export default async ({addon, console, msg}) => {
         const targets = getAiTargets(vm);
         const byId = targets.find(target => target.id === value);
         if (byId) return {target: byId, error: null};
-        const byName = targets.filter(target => getAiTargetName(target) === value);
+        const byName = targets.filter(target => {
+            const rawName = getAiTargetRawName(target);
+            return rawName === value || getAiTargetDisplayName(target, '') === value;
+        });
         if (byName.length === 1) return {target: byName[0], error: null};
         if (byName.length > 1) return {target: null, error: `角色名不唯一: ${value}`};
         const byAlias = targets.filter(target => {
@@ -2491,6 +2639,80 @@ export default async ({addon, console, msg}) => {
         });
         return next;
     };
+    const summarizeAiFeedbackForPrompt = (value, depth = 0) => {
+        if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+        if (typeof value === 'string') {
+            return value.length > 4000 ? `${value.slice(0, 4000)}…（反馈已摘要）` : value;
+        }
+        if (depth > 5) return '[summary omitted]';
+        if (Array.isArray(value)) return value.slice(0, 40).map(item => summarizeAiFeedbackForPrompt(item, depth + 1));
+        if (typeof value !== 'object') return String(value);
+        const result = {};
+        const omittedBodyKeys = new Set([
+            'previousPayload', 'pseudocode', 'numberedLines', 'lines', 'imageData', 'dataUrl'
+        ]);
+        for (const key of Object.keys(value)) {
+            if (omittedBodyKeys.has(key)) continue;
+            result[key] = summarizeAiFeedbackForPrompt(value[key], depth + 1);
+        }
+        return result;
+    };
+    const cacheAiPseudocodeReadWindows = (cache, result) => {
+        if (!Array.isArray(cache) || !result || result.ok !== true || result.type !== 'get_pseudocode') {
+            return cache;
+        }
+        const body = String(result.pseudocode || '');
+        const segments = Array.isArray(result.segments) ? result.segments : [];
+        const next = [];
+        const seen = new Set();
+        for (const segment of segments) {
+            if (!segment || typeof segment !== 'object') continue;
+            const responseStartChar = Math.max(0, Math.min(body.length, Number(segment.responseStartChar) || 0));
+            const responseEndChar = Math.max(
+                responseStartChar,
+                Math.min(body.length, Number(segment.responseEndChar) || 0)
+            );
+            const pseudocode = body.slice(responseStartChar, responseEndChar);
+            const key = [
+                segment.targetRef || '',
+                segment.startLine || '',
+                segment.endLine || '',
+                segment.startChar || 0,
+                segment.endChar || 0,
+                pseudocode
+            ].join('\u0000');
+            if (seen.has(key)) continue;
+            seen.add(key);
+            next.push({
+                ...segment,
+                pseudocode,
+                contextSource: 'recent_get_pseudocode',
+                readMode: result.mode,
+                scope: result.scope,
+                cursor: result.cursor,
+                nextCursor: result.nextCursor
+            });
+        }
+        const replacedTargetRefs = new Set(next.map(item => item.targetRef).filter(Boolean));
+        const previousOtherTargets = cache.filter(item =>
+            item && (!item.targetRef || !replacedTargetRefs.has(item.targetRef))
+        );
+        cache.splice(0, cache.length, ...next, ...previousOtherTargets);
+        return cache;
+    };
+    const prioritizeAiPseudocodeContextEntries = (knownEntries, recentWindows, currentTargetRef) => {
+        const recent = Array.isArray(recentWindows) ? recentWindows.filter(Boolean) : [];
+        const recentTargetRefs = new Set(recent.map(item => item.targetRef).filter(Boolean));
+        const remaining = (Array.isArray(knownEntries) ? knownEntries : [])
+            .filter(item => !recentTargetRefs.has(item && item.targetRef))
+            .map(item => ({...item, contextSource: 'cached_full_text'}))
+            .sort((a, b) => {
+                if (a.targetRef === currentTargetRef) return -1;
+                if (b.targetRef === currentTargetRef) return 1;
+                return 0;
+            });
+        return recent.concat(remaining);
+    };
     const renderTargetPseudocode = (target, vm, options) => {
         if (!target) throw new Error('没有目标角色');
         const includeCoords = !!(options && options.includeCoords);
@@ -2498,6 +2720,53 @@ export default async ({addon, console, msg}) => {
         const blocksObj = (serialized && serialized.blocks) || {};
         const remapped = remapBlockIdsForEditor(blocksObj);
         return pseudoConverter.renderPseudocode(remapped, {target, vm}, {includeCoords});
+    };
+    const getAiConverterWriteSafety = (blocks, target, vm, options) => {
+        const preflight = pseudoConverter && pseudoConverter.preflightPseudocodeRoundTrip;
+        if (typeof preflight !== 'function') {
+            return {
+                available: false,
+                writeSafe: false,
+                unsafeReason: '伪代码往返安全预检不可用；当前目标仅支持只读分析',
+                rendered: ''
+            };
+        }
+        try {
+            const result = preflight(blocks, {target, vm}, options || {});
+            if (!result || typeof result !== 'object') {
+                return {
+                    available: true,
+                    writeSafe: false,
+                    unsafeReason: '伪代码往返安全预检未返回有效结果；当前目标仅支持只读分析',
+                    rendered: ''
+                };
+            }
+            const writeSafe = result.safe === true;
+            return {
+                available: true,
+                writeSafe,
+                unsafeReason: writeSafe ? '' : String(
+                    result.reason || result.unsafeReason || (Array.isArray(result.reasons) ? result.reasons.join('；') : '') ||
+                    '伪代码往返安全预检未明确返回 safe: true；当前目标仅支持只读分析'
+                ),
+                // The full preflight result also owns parsed blocks, two canonical
+                // trees and round-trip facets. Keep only the rendered text that
+                // callers actually use so large-project reads do not retain those
+                // duplicate graphs for every target.
+                rendered: typeof result.rendered === 'string' ? result.rendered : ''
+            };
+        } catch (err) {
+            // A failed/older converter must not break reads, but it also cannot
+            // prove that converting the target back is lossless.
+            return {
+                available: true,
+                writeSafe: false,
+                unsafeReason: `伪代码往返安全预检异常；当前目标仅支持只读分析：${
+                    err && err.message ? err.message : String(err)
+                }`,
+                rendered: ''
+            };
+        }
     };
     const getAiRuntimeContext = vm => {
         const runtime = vm && vm.runtime;
@@ -3060,11 +3329,10 @@ export default async ({addon, console, msg}) => {
             targets: getAiTargets(vm).map(item => summarize(item)),
             runtime: getAiRuntimeContext(vm),
             stageTargetRef: stageSummary && stageSummary.targetRef,
-            stageTargetId: stage && stage.id,
             stageAliases: ['Stage', '舞台', '背景', 'backdrop'],
             currentTargetRef: currentSummary && currentSummary.targetRef,
-            currentTargetId: target && target.id,
-            targetName: target && target.sprite ? target.sprite.name : (target && target.id) || '',
+            rawName: getAiTargetRawName(target),
+            displayName: getAiTargetDisplayName(target),
             isStage: !!(target && target.isStage),
             variables: {
                 local: getTargetNamesByType(target, ''),
@@ -3109,7 +3377,24 @@ export default async ({addon, console, msg}) => {
     const AI_TOOL_TRACE_STRING_LIMIT = 2400;
     const AI_TOOL_TRACE_ARRAY_LIMIT = 30;
     const AI_TOOL_TRACE_DEPTH_LIMIT = 5;
-    const AI_SEARCH_RESULT_LIMIT = 80;
+    const AI_SEARCH_RESULT_LIMIT = 50;
+    const AI_TOOL_MAX_CHARS_DEFAULT = 48000;
+    const AI_TOOL_MAX_CHARS_LIMIT = 200000;
+    const AI_CONTEXT_CHAR_BUDGET_DEFAULT = 48000;
+    const AI_CONTEXT_CHAR_BUDGET_MIN = 8000;
+    const AI_CONTEXT_CHAR_BUDGET_MAX = 200000;
+    const AI_SEARCH_CONTEXT_LINES_DEFAULT = 1;
+    const AI_SEARCH_CONTEXT_LINES_MAX = 10;
+    const AI_SEARCH_REGEX_MAX_LENGTH = 256;
+    const AI_SEARCH_REGEX_TIMEOUT_MS = 300;
+    const AI_SEARCH_CACHE_TTL_MS = 2 * 60 * 1000;
+    const AI_SEARCH_CACHE_MAX_ENTRIES = 12;
+    const AI_SEARCH_SNAPSHOT_MATCH_LIMIT = 2000;
+    const AI_SEARCH_SNAPSHOT_CHAR_LIMIT = 2 * 1024 * 1024;
+    const AI_RUNTIME_DATA_ITEMS_DEFAULT = 20;
+    const AI_RUNTIME_DATA_ITEMS_MAX = 100;
+    const AI_RUNTIME_LIST_ITEMS_DEFAULT = 20;
+    const AI_RUNTIME_LIST_ITEMS_MAX = 200;
     const AI_EXTENSION_BLOCK_LIMIT = 120;
     const AI_PSEUDOCODE_SYNTAX_GUIDE = [
         '伪代码文件结构：',
@@ -3123,6 +3408,8 @@ export default async ({addon, console, msg}) => {
         '- 角色局部变量使用 #localvars { 名字1, 名字2 }。',
         '- 全局列表使用 #lists { 名字1, 名字2 }。',
         '- 角色局部列表使用 #locallists { 名字1, 名字2 }。',
+        '- 名称冲突时，插件可能生成 `"真实名" as readable_alias` 声明。别名由插件管理；保留真实名和别名，不要把别名改写成 Scratch ID。',
+        '- #localvars 和 #locallists 是当前角色局部数据的完整权威清单。小范围修改时必须原样保留所有无关声明；只有用户明确要求删除对应数据时才能移除。',
                         '- 广播消息不需要头部声明；使用 broadcast("消息名")、broadcast_and_wait("消息名") 或 on_broadcast("消息名") 时会自动创建。',
                         '- 中文别名也可用：#变量、#局部变量、#列表、#局部列表。',
         '- 不要在 on_flag_clicked、define、forever、if 等脚本体内部写头部声明。',
@@ -3296,7 +3583,7 @@ export default async ({addon, console, msg}) => {
     const formatAiSearchResultDetail = result => {
         const lines = [];
         const matches = (result && result.matches) || [];
-        const searched = ((result && result.targetsSearched) || [])
+        const searched = ((result && (result.targets || result.targetsSearched)) || [])
             .map(item => item && item.targetName)
             .filter(Boolean);
         lines.push(`查找：${JSON.stringify((result && result.query) || '')}`);
@@ -3307,8 +3594,8 @@ export default async ({addon, console, msg}) => {
             return lines.join('\n');
         }
         for (const match of matches) {
-            const label = match.targetRef ? `${match.targetRef} ${match.targetName}` : match.targetName;
-            lines.push(`${label} 第 ${match.lineNumber} 行，第 ${match.column} 列: ${match.lineText}`);
+            const label = match.targetRef || 'current';
+            lines.push(`${label} 第 ${match.line} 行，第 ${match.column} 列: ${match.text}`);
         }
         return lines.join('\n');
     };
@@ -3351,8 +3638,10 @@ export default async ({addon, console, msg}) => {
         return rows;
     };
     const buildAiLineDiffRows = (beforeText, afterText) => {
-        const beforeLines = splitAiLines(formatAiPseudocodePreview(beforeText));
-        const afterLines = splitAiLines(formatAiPseudocodePreview(afterText));
+        // Diff the complete texts. Display/storage truncation must never change what is
+        // considered added or removed.
+        const beforeLines = splitAiLines(beforeText);
+        const afterLines = splitAiLines(afterText);
         if (!beforeLines.length && !afterLines.length) return [];
         if (beforeLines.join('\n') === afterLines.join('\n')) {
             return afterLines.map((line, index) => ({
@@ -3457,6 +3746,7 @@ export default async ({addon, console, msg}) => {
     };
     const normalizeAiToolLineRanges = payload => {
         const ranges = [];
+        let rangeError = '';
         const pushRange = item => {
             if (item == null) return;
             if (typeof item === 'number' || typeof item === 'string') {
@@ -3465,14 +3755,25 @@ export default async ({addon, console, msg}) => {
                 return;
             }
             if (Array.isArray(item)) {
+                if (item.length !== 2) {
+                    rangeError = 'lineRanges 数组项必须是 [startLine, endLine]';
+                    return;
+                }
                 const startLine = Number(item[0]);
-                const endLine = item.length > 1 ? Number(item[1]) : startLine;
+                const endLine = Number(item[1]);
                 ranges.push({startLine, endLine});
                 return;
             }
             if (typeof item === 'object') {
-                const startLine = Number(item.startLine || item.start || item.from || item.line);
-                const endLine = Number(item.endLine || item.end || item.to || item.startLine || item.start || item.from || item.line);
+                const singleLine = item.line != null ? item.line : null;
+                const rawStart = item.startLine != null ? item.startLine : (item.start != null ? item.start : item.from);
+                const rawEnd = item.endLine != null ? item.endLine : (item.end != null ? item.end : item.to);
+                if (singleLine == null && ((rawStart == null) !== (rawEnd == null))) {
+                    rangeError = 'startLine 和 endLine 必须成对提供';
+                    return;
+                }
+                const startLine = Number(singleLine != null ? singleLine : rawStart);
+                const endLine = Number(singleLine != null ? singleLine : rawEnd);
                 const targetId = item.targetRef || item.targetId || item.target || item.targetName || item.name || '';
                 ranges.push({
                     targetId: targetId ? String(targetId).trim() : '',
@@ -3489,7 +3790,10 @@ export default async ({addon, console, msg}) => {
         else if (rawLines != null) pushRange(rawLines);
         if (payload && (payload.startLine != null || payload.start != null || payload.from != null || payload.line != null)) {
             pushRange(payload);
+        } else if (payload && (payload.endLine != null || payload.end != null || payload.to != null)) {
+            rangeError = 'startLine 和 endLine 必须成对提供';
         }
+        ranges.error = rangeError;
         return ranges;
     };
     const getAiPseudocodeLineSlice = (text, range) => {
@@ -3525,47 +3829,118 @@ export default async ({addon, console, msg}) => {
         }
         return lines.join('\n');
     };
-    const searchAiPseudocodeLines = (text, query, options) => {
+    const looksLikeUnsafeAiRegex = pattern => (
+        /\\[1-9]/.test(pattern) ||
+        /\([^)]*(?:\*|\+|\{\d+,?\})[^)]*\)(?:\*|\+|\{\d+,?\})/.test(pattern) ||
+        /(?:\.\*|\.\+){2,}/.test(pattern)
+    );
+    const searchAiRegexLinesInWorker = (lines, pattern, flags, maxResults) => new Promise((resolve, reject) => {
+        if (typeof Worker !== 'function' || typeof Blob !== 'function' ||
+                typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+            reject(new Error('worker unavailable'));
+            return;
+        }
+        const source = [
+            'self.onmessage = function (event) {',
+            '  try {',
+            '    var value = event.data || {};',
+            '    var re = new RegExp(value.pattern, value.flags);',
+            '    var hits = [];',
+            '    var truncated = false;',
+            '    for (var i = 0; i < value.lines.length; i++) {',
+            '      var match = re.exec(value.lines[i]);',
+            '      if (match && hits.length >= value.maxResults) { truncated = true; break; }',
+            '      if (match) hits.push({lineNumber:i + 1,column:match.index + 1,lineText:value.lines[i]});',
+            '    }',
+            '    self.postMessage({ok:true,hits:hits,truncated:truncated});',
+            '  } catch (error) { self.postMessage({ok:false,error:String(error && error.message || error)}); }',
+            '};'
+        ].join('\n');
+        const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+        let worker;
+        try {
+            worker = new Worker(url);
+        } catch (_) {
+            URL.revokeObjectURL(url);
+            reject(new Error('worker unavailable'));
+            return;
+        }
+        let settled = false;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            worker.terminate();
+            URL.revokeObjectURL(url);
+            callback(value);
+        };
+        const timer = setTimeout(() => finish(reject, new Error('正则查找超时')), AI_SEARCH_REGEX_TIMEOUT_MS);
+        worker.onmessage = event => {
+            const data = event && event.data;
+            if (data && data.ok) finish(resolve, {hits: data.hits || [], truncated: !!data.truncated});
+            else finish(reject, new Error(data && data.error || '正则查找失败'));
+        };
+        worker.onerror = () => finish(reject, new Error('正则查找 Worker 失败'));
+        worker.postMessage({lines, pattern, flags, maxResults});
+    });
+    const searchAiPseudocodeLines = async (text, query, options) => {
         const needle = String(query || '').trim();
         if (!needle) return {ok: false, error: '查找文本不能为空'};
         const caseSensitive = !!(options && options.caseSensitive);
         const useRegex = !!(options && options.regex);
-        let findColumn;
+        const lines = splitAiLines(text);
+        const requestedMaxResults = Number(options && options.maxResults);
+        const maxResults = Math.min(
+            AI_SEARCH_SNAPSHOT_MATCH_LIMIT,
+            Math.max(0, Number.isFinite(requestedMaxResults) ? Math.floor(requestedMaxResults) : AI_SEARCH_RESULT_LIMIT)
+        );
+        let allMatches = [];
+        let truncated = false;
         if (useRegex) {
-            let re;
+            if (needle.length > AI_SEARCH_REGEX_MAX_LENGTH) {
+                return {ok: false, error: `正则表达式过长，最多 ${AI_SEARCH_REGEX_MAX_LENGTH} 个字符`};
+            }
+            if (looksLikeUnsafeAiRegex(needle)) {
+                return {ok: false, error: '正则表达式包含可能导致长时间回溯的结构'};
+            }
             try {
-                re = new RegExp(needle, caseSensitive ? '' : 'i');
+                RegExp(needle, caseSensitive ? '' : 'i');
             } catch (err) {
                 return {ok: false, error: `正则表达式无效: ${err.message}`};
             }
-            findColumn = line => {
-                const match = re.exec(line);
-                return match ? match.index + 1 : 0;
-            };
+            try {
+                const workerResult = await searchAiRegexLinesInWorker(
+                    lines,
+                    needle,
+                    caseSensitive ? '' : 'i',
+                    maxResults
+                );
+                allMatches = workerResult.hits;
+                truncated = workerResult.truncated;
+            } catch (err) {
+                return {ok: false, error: err && err.message === 'worker unavailable' ?
+                    '当前环境无法安全执行正则查找（Web Worker 不可用）' :
+                    (err && err.message ? err.message : String(err))};
+            }
         } else {
             const normalizedNeedle = caseSensitive ? needle : needle.toLowerCase();
-            findColumn = line => {
+            for (let index = 0; index < lines.length; index++) {
+                const line = lines[index];
                 const haystack = caseSensitive ? line : line.toLowerCase();
-                const index = haystack.indexOf(normalizedNeedle);
-                return index >= 0 ? index + 1 : 0;
-            };
-        }
-        const maxResults = Math.max(0, Number(options && options.maxResults) || AI_SEARCH_RESULT_LIMIT);
-        const matches = [];
-        let totalMatches = 0;
-        splitAiLines(text).forEach((line, index) => {
-            const column = findColumn(line);
-            if (!column) return;
-            totalMatches++;
-            if (matches.length < maxResults) {
-                matches.push({
+                const columnIndex = haystack.indexOf(normalizedNeedle);
+                if (columnIndex < 0) continue;
+                if (allMatches.length >= maxResults) {
+                    truncated = true;
+                    break;
+                }
+                allMatches.push({
                     lineNumber: index + 1,
-                    column,
+                    column: columnIndex + 1,
                     lineText: line
                 });
             }
-        });
-        return {ok: true, matches, totalMatches, truncated: totalMatches > matches.length};
+        }
+        return {ok: true, matches: allMatches, totalMatches: allMatches.length, truncated};
     };
     const applyAiLinePatches = (baseText, patches) => {
         const lines = splitAiLines(baseText);
@@ -3710,8 +4085,48 @@ export default async ({addon, console, msg}) => {
         ) {
             return {ok: true, tool: {type: 'click_stop', raw: parsed}};
         }
+        if (type === 'get_runtime_state' || type === 'runtime_state' || type === 'get_runtime_status') {
+            return {
+                ok: true,
+                tool: {
+                    type: 'get_runtime_state',
+                    targetIds,
+                    includeDataValues: parsed.includeDataValues === true,
+                    maxDataItems: Math.min(
+                        AI_RUNTIME_DATA_ITEMS_MAX,
+                        Math.max(0, Number.isFinite(Number(parsed.maxDataItems)) ?
+                            Math.floor(Number(parsed.maxDataItems)) : AI_RUNTIME_DATA_ITEMS_DEFAULT)
+                    ),
+                    maxListItems: Math.min(
+                        AI_RUNTIME_LIST_ITEMS_MAX,
+                        Math.max(0, Number.isFinite(Number(parsed.maxListItems)) ? Math.floor(Number(parsed.maxListItems)) :
+                            AI_RUNTIME_LIST_ITEMS_DEFAULT)
+                    ),
+                    raw: parsed
+                }
+            };
+        }
+        if (type === 'get_project_overview' || type === 'project_overview' || type === 'overview') {
+            return {
+                ok: true,
+                tool: {
+                    type: 'get_project_overview',
+                    maxChars: normalizeAiToolMaxChars(parsed.maxChars),
+                    raw: parsed
+                }
+            };
+        }
         if (type === 'get_target_info' || type === 'get_targets' || type === 'list_targets') {
-            return {ok: true, tool: {type: 'get_target_info', targetIds}};
+            return {
+                ok: true,
+                tool: {
+                    type: 'get_target_info',
+                    targetIds,
+                    scope: String(parsed.scope || (targetIds.length ? 'targets' : 'all_targets')).trim().toLowerCase(),
+                    detailed: parsed.detailed === true || parsed.includeDetails === true,
+                    raw: parsed
+                }
+            };
         }
         if (type === 'get_costume_info' || type === 'get_costumes' || type === 'list_costumes') {
             return {
@@ -3794,19 +4209,17 @@ export default async ({addon, console, msg}) => {
         }
         if (type === 'get_pseudocode') {
             const scope = String(parsed.scope || '').trim().toLowerCase();
+            if (lineRanges.error) return {ok: false, error: lineRanges.error};
             return {
                 ok: true,
                 tool: {
                     type: 'get_pseudocode',
                     targetIds,
                     lineRanges,
-                    allSprites: parsed.allSprites === true ||
-                        parsed.allCharacters === true ||
-                        scope === 'sprites' ||
-                        scope === 'all_sprites' ||
-                        scope === 'characters' ||
-                        scope === 'all_characters',
-                    includeStage: parsed.includeStage === true
+                    scope: scope || (targetIds.length ? 'targets' : 'current'),
+                    includeStage: parsed.includeStage === true,
+                    cursor: parsed.cursor == null ? '' : String(parsed.cursor),
+                    maxChars: normalizeAiToolMaxChars(parsed.maxChars)
                 }
             };
         }
@@ -3819,9 +4232,13 @@ export default async ({addon, console, msg}) => {
                     type: 'search_text',
                     query,
                     targetIds,
+                    scope: String(parsed.scope || (targetIds.length ? 'targets' : 'all_targets')).trim().toLowerCase(),
                     caseSensitive: !!parsed.caseSensitive,
                     regex: !!parsed.regex,
-                    maxResults: parsed.maxResults || parsed.limit
+                    maxResults: parsed.maxResults || parsed.limit,
+                    contextLines: parsed.contextLines,
+                    cursor: parsed.cursor == null ? '' : String(parsed.cursor),
+                    maxChars: normalizeAiToolMaxChars(parsed.maxChars)
                 }
             };
         }
@@ -3851,12 +4268,14 @@ export default async ({addon, console, msg}) => {
                     mimeType: String(parsed.mimeType || parsed.mediaType || parsed.contentType || '').trim().toLowerCase(),
                     rotationCenterX: parsed.rotationCenterX,
                     rotationCenterY: parsed.rotationCenterY,
-                    confirm: parsed.confirm === true,
+                    // Model-authored actions cannot self-confirm. The external MCP
+                    // adapter adds confirm:true only after a claimed, trusted call.
+                    confirm: false,
                     raw: parsed
                 }
             };
         }
-        return {ok: false, error: 'AI 工具块必须是 click_green_flag、click_pause、click_stop、get_pseudocode、get_target_info、get_costume_info、search_text、list_extensions、load_extension、get_extension_blocks、造型工具或项目结构工具。'};
+        return {ok: false, error: 'AI 工具块必须是运行控制、get_project_overview、get_runtime_state、get_pseudocode、get_target_info、get_costume_info、search_text、扩展工具、造型工具或项目结构工具。'};
     };
     const isAiEditActionType = type => [
         'edit_pseudocode',
@@ -3869,9 +4288,17 @@ export default async ({addon, console, msg}) => {
     const normalizeAiSingleActionPayload = parsed => {
         const payload = normalizeAiCallablePayload(parsed);
         const type = normalizeAiCallableTypeName(payload && (payload.type || payload.action || payload.toolType));
-        if (isAiEditActionType(type) || (payload && (typeof payload.pseudocode === 'string' || Array.isArray(payload.edits)))) {
-            if (!payload || (typeof payload.pseudocode !== 'string' && !Array.isArray(payload.edits))) {
-                return {ok: false, error: 'edit_pseudocode 动作缺少 pseudocode 或 edits 字段。'};
+        if (isAiEditActionType(type) || (payload && (
+            typeof payload.pseudocode === 'string' ||
+            Array.isArray(payload.edits) ||
+            Array.isArray(payload.patches)
+        ))) {
+            if (!payload || (
+                typeof payload.pseudocode !== 'string' &&
+                !Array.isArray(payload.edits) &&
+                !Array.isArray(payload.patches)
+            )) {
+                return {ok: false, error: 'edit_pseudocode 动作缺少 pseudocode、patches 或 edits 字段。'};
             }
             return {ok: true, action: {kind: 'edit', type: 'edit_pseudocode', edit: payload}};
         }
@@ -4586,7 +5013,8 @@ export default async ({addon, console, msg}) => {
         constructor (props) {
             super(props);
             const storedAiConfig = loadAiConfig();
-            const storedAiChats = loadAiChatState();
+            const projectHistoryKey = getAiProjectHistoryKey(vm);
+            const storedAiChats = loadAiChatState(projectHistoryKey);
             const storedUiState = loadUiState();
             const storedMcpBridgeEnabled = loadMcpBridgeEnabled();
             const storedMcpBridgeUrl = loadMcpBridgeUrl();
@@ -4617,8 +5045,10 @@ export default async ({addon, console, msg}) => {
                 mcpBridgeEnabled: storedMcpBridgeEnabled,
                 mcpBridgeUrl: storedMcpBridgeUrl,
                 mcpBridgeStatus: storedMcpBridgeEnabled ? 'starting' : 'disabled',
+                mcpActivityLog: [],
                 aiConfig: storedAiConfig
             };
+            this.aiProjectHistoryKey = projectHistoryKey;
             this.dirty = false;
             // 固定不带坐标；apply 后总是走 cleanUp 自动整理
             this.includeCoords = false;
@@ -4630,6 +5060,7 @@ export default async ({addon, console, msg}) => {
             this.aiToolNoConfirmRef = React.createRef();
             this.aiRequestRetryEnabledRef = React.createRef();
             this.aiRequestRetryCountRef = React.createRef();
+            this.aiContextCharBudgetRef = React.createRef();
             this.mcpBridgeUrlRef = React.createRef();
             this.aiInputRef = React.createRef();
             this.aiMessagesRef = React.createRef();
@@ -4654,12 +5085,20 @@ export default async ({addon, console, msg}) => {
             this.aiUserAborted = false;
             this.aiProcessStartedAt = 0;
             this.aiProcessLines = [];
-            this.mcpBridgeClientId = `jsc-page-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            this.mcpBridgeClientId = createMcpBridgeClientId();
+            this.mcpBridgeRegistrationToken = '';
             this.mcpBridgeTimer = null;
             this.mcpBridgeAbortController = null;
             this.mcpBridgeStopped = true;
             this.mcpBridgeBusy = false;
+            this.mcpBridgeNeedsReregister = false;
+            this.mcpBridgeCallQueue = [];
+            this.mcpBridgeActiveCall = null;
+            this.mcpProjectGeneration = 0;
             this.mcpBridgeLastStatus = storedMcpBridgeEnabled ? 'starting' : 'disabled';
+            this.aiSearchSnapshots = new Map();
+            this.aiPseudocodeCache = new Map();
+            this.aiWriteSafetyCache = new Map();
             this.isMountedForMcp = false;
             // 实时同步用的计时器 + 防回环抑制窗口
             this.applyDebounceTimer = null;
@@ -4830,8 +5269,7 @@ export default async ({addon, console, msg}) => {
                                     startLine: snippet.startLine,
                                     endLine: snippet.endLine,
                                     totalLines: snippet.totalLines,
-                                    pseudocode: snippet.pseudocode,
-                                    lines: snippet.lines
+                                    pseudocode: snippet.pseudocode
                                 });
                             }
                             return {ok: true, target: this.getAiTargetSummary(resolved.target), snippets};
@@ -4876,6 +5314,7 @@ export default async ({addon, console, msg}) => {
                         type: 'search_text',
                         query,
                         targetIds: targetIds.length ? targetIds : opts.targetIds,
+                        scope: opts.scope || (targetIds.length ? 'targets' : 'all_targets'),
                         caseSensitive: !!opts.caseSensitive,
                         regex: !!opts.regex,
                         maxResults: opts.maxResults || opts.limit
@@ -5007,20 +5446,16 @@ export default async ({addon, console, msg}) => {
                 applyTargetPseudocode: (targetIdOrName, text) => {
                     const resolved = this.resolveAiTarget(targetIdOrName);
                     if (!resolved.target) return {ok: false, error: resolved.error};
-                    const checked = this.validatePseudoText(text, resolved.target);
-                    if (!checked.ok) return {ok: false, errors: checked.errors};
-                    const meta = this.createPseudoMeta(checked.result);
-                    const result = this.applyAiApplications([{
-                        target: resolved.target,
-                        targetId: resolved.target.id,
-                        targetRef: this.getAiTargetRef(resolved.target),
-                        targetName: getAiTargetName(resolved.target),
+                    const known = new Map([[resolved.target.id, this.getTargetPseudocode(resolved.target)]]);
+                    const prepared = this.prepareAiEditPayload({
                         mode: 'replace',
-                        patches: [],
-                        pseudocode: text,
-                        parsed: checked.result,
-                        meta
-                    }]);
+                        targetRef: this.getAiTargetRef(resolved.target),
+                        pseudocode: text
+                    }, known);
+                    if (!prepared.ok) {
+                        return {ok: false, error: prepared.error, errors: prepared.errors || null};
+                    }
+                    const result = this.applyAiApplications(prepared.applications);
                     return result.ok ? {ok: true, result} : {ok: false, error: result.error};
                 },
                 applyAiEditPayload: payload => {
@@ -5049,7 +5484,6 @@ export default async ({addon, console, msg}) => {
                     const result = this.applyAiApplications(prepared.applications);
                     return result.ok ? {ok: true, applications: prepared.applications.map(app => ({
                         targetRef: app.targetRef,
-                        targetId: app.targetId,
                         targetName: app.targetName,
                         mode: app.mode
                     }))} : {ok: false, error: result.error};
@@ -5141,8 +5575,9 @@ export default async ({addon, console, msg}) => {
             try {
                 const desktopStatus = await this.startDesktopMcpServer();
                 if (desktopStatus && desktopStatus.bridgeUrl) {
-                    saveMcpBridgeUrl(desktopStatus.bridgeUrl);
-                    this.setState({mcpBridgeUrl: desktopStatus.bridgeUrl});
+                    const desktopBridgeUrl = normalizeMcpBridgeUrl(desktopStatus.bridgeUrl);
+                    saveMcpBridgeUrl(desktopBridgeUrl);
+                    this.setState({mcpBridgeUrl: desktopBridgeUrl});
                 }
             } catch (err) {
                 this.setMcpBridgeStatus(`desktop-start-failed: ${err && err.message ? err.message : String(err)}`);
@@ -5215,7 +5650,9 @@ export default async ({addon, console, msg}) => {
                 ok: true,
                 enabled: !!this.state.mcpBridgeEnabled,
                 bridgeUrl: this.getMcpBridgeBaseUrl(),
+                mcpEndpoint: getMcpHttpEndpointUrl(this.getMcpBridgeBaseUrl()),
                 clientId: this.mcpBridgeClientId,
+                registered: !!this.mcpBridgeRegistrationToken,
                 status: this.state.mcpBridgeStatus || this.mcpBridgeLastStatus,
                 pageTitle: document.title,
                 pageUrl: this.getMcpPageUrl(),
@@ -5223,7 +5660,8 @@ export default async ({addon, console, msg}) => {
                 editingTarget: editingTarget ? this.getAiTargetSummary(editingTarget, {includeCostumes: false}) : null,
                 targets: this.getAiTargetSummaries().map(target => ({
                     targetRef: target.targetRef,
-                    targetId: target.targetId,
+                    rawName: target.rawName,
+                    displayName: target.displayName,
                     targetName: target.targetName,
                     targetType: target.targetType,
                     isStage: !!target.isStage
@@ -5231,7 +5669,127 @@ export default async ({addon, console, msg}) => {
             };
         };
 
-        executeExternalMcpEdit = editPayload => {
+        recordMcpActivity = (name, status, detail, extra) => {
+            if (!this.isMountedForMcp) return;
+            const meta = extra || {};
+            const item = {
+                id: `mcp-log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                time: Date.now(),
+                name: String(name || 'bridge'),
+                status: String(status || ''),
+                target: String(meta.target || ''),
+                durationMs: Number(meta.durationMs) || 0,
+                ok: typeof meta.ok === 'boolean' ? meta.ok : null,
+                resultSummary: String(meta.resultSummary || ''),
+                error: String(meta.error || ''),
+                detail: String(detail || '')
+            };
+            this.setState(prev => ({
+                mcpActivityLog: [item].concat(prev.mcpActivityLog || []).slice(0, 8)
+            }));
+        };
+
+        acceptMcpRegistrationToken = token => {
+            const next = String(token || '');
+            if (!next || next === this.mcpBridgeRegistrationToken) return;
+            const previous = this.mcpBridgeRegistrationToken;
+            if (previous) {
+                this.mcpProjectGeneration++;
+                this.cancelMcpPageCalls('The MCP page registration changed.');
+            }
+            this.mcpBridgeRegistrationToken = next;
+            this.resetAiTargetRefs();
+            if (this.aiSearchSnapshots) this.aiSearchSnapshots.clear();
+            if (this.aiPseudocodeCache) this.aiPseudocodeCache.clear();
+            if (this.aiWriteSafetyCache) this.aiWriteSafetyCache.clear();
+            this.recordMcpActivity('bridge', 'registered', '页面已重新注册');
+        };
+
+        copyMcpEndpoint = async () => {
+            const endpoint = getMcpHttpEndpointUrl(this.getMcpBridgeBaseUrl());
+            try {
+                if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                    await navigator.clipboard.writeText(endpoint);
+                } else {
+                    const input = document.createElement('textarea');
+                    input.value = endpoint;
+                    input.style.position = 'fixed';
+                    input.style.opacity = '0';
+                    document.body.appendChild(input);
+                    input.select();
+                    document.execCommand('copy');
+                    input.remove();
+                }
+                this.setInfo('已复制 MCP 地址。');
+            } catch (err) {
+                this.setError(`复制 MCP 地址失败: ${err && err.message ? err.message : String(err)}`);
+            }
+        };
+
+        abortMcpCallExecution = (execution, reason) => {
+            if (!execution || execution.controller.signal.aborted) return;
+            execution.cancelReason = String(reason || 'The MCP call was cancelled.');
+            execution.controller.abort(execution.cancelReason);
+        };
+
+        assertMcpCallActive = execution => {
+            if (!execution) return;
+            if (execution.projectGeneration !== this.mcpProjectGeneration) {
+                this.abortMcpCallExecution(execution, 'Project changed while the MCP call was running.');
+            } else if (!this.mcpBridgeRegistrationToken ||
+                    execution.registrationToken !== this.mcpBridgeRegistrationToken) {
+                this.abortMcpCallExecution(execution, 'MCP page registration changed while the call was running.');
+            } else if (Number.isFinite(execution.expiresAt) && Date.now() >= execution.expiresAt) {
+                this.abortMcpCallExecution(execution, 'MCP call lease expired before the operation could commit.');
+            }
+            if (execution.controller.signal.aborted) {
+                throw new Error(execution.cancelReason || 'The MCP call was cancelled.');
+            }
+        };
+
+        setMcpCallExpiry = (execution, value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) execution.expiresAt = Math.min(execution.expiresAt, parsed);
+            if (execution.expiryTimer) clearTimeout(execution.expiryTimer);
+            if (!Number.isFinite(execution.expiresAt)) return;
+            const delay = execution.expiresAt - Date.now();
+            if (delay <= 0) {
+                this.abortMcpCallExecution(execution, 'MCP call lease expired before execution.');
+                return;
+            }
+            execution.expiryTimer = setTimeout(() => {
+                this.abortMcpCallExecution(execution, 'MCP call lease expired while the operation was running.');
+            }, delay);
+        };
+
+        cancelMcpPageCalls = reason => {
+            if (this.mcpBridgeActiveCall) this.abortMcpCallExecution(this.mcpBridgeActiveCall, reason);
+            this.mcpBridgeCallQueue = [];
+        };
+
+        invalidateMcpRegistration = reason => {
+            this.mcpProjectGeneration++;
+            this.cancelMcpPageCalls(reason || 'MCP page registration expired.');
+            this.mcpBridgeRegistrationToken = '';
+            this.mcpBridgeNeedsReregister = true;
+            this.resetAiTargetRefs();
+            if (this.aiSearchSnapshots) this.aiSearchSnapshots.clear();
+            if (this.aiPseudocodeCache) this.aiPseudocodeCache.clear();
+            if (this.aiWriteSafetyCache) this.aiWriteSafetyCache.clear();
+        };
+
+        consumeMcpCancelledCallIds = ids => {
+            const cancelled = new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean));
+            if (!cancelled.size) return cancelled;
+            this.mcpBridgeCallQueue = this.mcpBridgeCallQueue.filter(call => !cancelled.has(String(call.id)));
+            if (this.mcpBridgeActiveCall && cancelled.has(String(this.mcpBridgeActiveCall.call.id))) {
+                this.abortMcpCallExecution(this.mcpBridgeActiveCall, 'MCP client cancelled the call.');
+            }
+            return cancelled;
+        };
+
+        executeExternalMcpEdit = (editPayload, execution) => {
+            this.assertMcpCallActive(execution);
             const {knownTargetTexts} = this.getMcpKnownContext();
             const prepared = this.prepareAiEditPayload(editPayload, knownTargetTexts);
             if (!prepared.ok) {
@@ -5239,9 +5797,16 @@ export default async ({addon, console, msg}) => {
                     ok: false,
                     type: 'edit_pseudocode',
                     error: prepared.error,
-                    errors: prepared.errors || null
+                    errors: (prepared.errors || []).map(item => ({
+                        targetRef: item.targetRef,
+                        targetName: item.targetName,
+                        errors: item.errors
+                    }))
                 };
             }
+            // Parsing/preflight can be expensive on a large target. Recheck the
+            // lease and project immediately before the synchronous commit.
+            this.assertMcpCallActive(execution);
             const result = this.applyAiApplications(prepared.applications);
             if (!result.ok) return {ok: false, type: 'edit_pseudocode', error: result.error};
             return {
@@ -5250,7 +5815,6 @@ export default async ({addon, console, msg}) => {
                 loadedExtensions: result.loadedExtensions || [],
                 applications: prepared.applications.map(app => ({
                     targetRef: app.targetRef,
-                    targetId: app.targetId,
                     targetName: app.targetName,
                     mode: app.mode,
                     patchCount: Array.isArray(app.patches) ? app.patches.length : 0,
@@ -5259,13 +5823,18 @@ export default async ({addon, console, msg}) => {
             };
         };
 
-        executeExternalMcpAction = async (name, args) => {
+        executeExternalMcpAction = async (name, args, execution) => {
+            this.assertMcpCallActive(execution);
             const toolName = normalizeAiCallableTypeName(name);
             if (toolName === 'jsc_get_status' || toolName === 'get_status' || toolName === 'status') {
                 return this.getMcpBridgeStatus();
             }
             let payload;
             const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+            const pageSchemaError = validateMcpPageToolArguments(toolName, rawArgs);
+            if (pageSchemaError) {
+                return {ok: false, error: `${toolName} 参数无效：${pageSchemaError}`};
+            }
             if (toolName === 'jsc_call_action' || toolName === 'call_action') {
                 payload = rawArgs.action || rawArgs.payload || rawArgs;
                 if (typeof payload === 'string') {
@@ -5289,14 +5858,23 @@ export default async ({addon, console, msg}) => {
             const {currentText, knownTargetTexts} = this.getMcpKnownContext();
             const results = [];
             for (const action of normalized.actions) {
+                this.assertMcpCallActive(execution);
                 if (action.kind === 'edit') {
-                    const result = this.executeExternalMcpEdit(action.edit);
+                    const result = this.executeExternalMcpEdit(action.edit, execution);
                     results.push(result);
                     if (!result.ok) return normalized.actions.length === 1 ? result : {ok: false, results, error: result.error};
                     continue;
                 }
                 if (action.kind === 'tool') {
-                    const result = await this.executeAiTool(action.tool, knownTargetTexts, currentText, null);
+                    const trustedTool = {...action.tool, confirm: true};
+                    const result = await this.executeAiTool(
+                        trustedTool,
+                        knownTargetTexts,
+                        currentText,
+                        null,
+                        {source: 'external_mcp', trusted: true, allowImages: true, mcpExecution: execution}
+                    );
+                    this.assertMcpCallActive(execution);
                     results.push(result);
                     if (!result.ok) return normalized.actions.length === 1 ? result : {ok: false, results, error: result.error};
                     continue;
@@ -5309,32 +5887,171 @@ export default async ({addon, console, msg}) => {
             return results.length === 1 ? results[0] : {ok: true, type: 'batch', results};
         };
 
-        postMcpBridgeResult = async (callId, payload) => {
-            if (!callId) return;
+        postMcpBridgeResult = async (call, payload) => {
+            if (!call || !call.id || !this.mcpBridgeRegistrationToken) return;
             const baseUrl = this.getMcpBridgeBaseUrl();
-            await fetch(`${baseUrl}/result`, {
+            const response = await fetch(buildMcpBridgeUrl(baseUrl, '/result'), {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     clientId: this.mcpBridgeClientId,
-                    title: document.title || '',
-                    pageUrl: this.getMcpPageUrl(),
-                    id: callId,
+                    registrationToken: this.mcpBridgeRegistrationToken,
+                    id: call.id,
+                    leaseToken: call.leaseToken,
                     ...payload
                 })
             });
+            if (response.status === 403) {
+                this.invalidateMcpRegistration('MCP result registration expired.');
+            }
+            if (!response.ok) throw new Error(`MCP result HTTP ${response.status}`);
         };
 
-        handleMcpBridgeCall = async call => {
-            if (!call || !call.id) return;
+        claimMcpBridgeCall = async (call, execution) => {
+            if (!call || !call.id || !call.leaseToken || !this.mcpBridgeRegistrationToken) {
+                return {ok: false, error: 'MCP call 缺少租约信息'};
+            }
             try {
-                const result = await this.executeExternalMcpAction(call.name, call.arguments || {});
-                await this.postMcpBridgeResult(call.id, {result});
+                const response = await fetch(buildMcpBridgeUrl(this.getMcpBridgeBaseUrl(), '/claim'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    signal: execution && execution.controller.signal,
+                    body: JSON.stringify({
+                        clientId: this.mcpBridgeClientId,
+                        registrationToken: this.mcpBridgeRegistrationToken,
+                        id: call.id,
+                        leaseToken: call.leaseToken
+                    })
+                });
+                let data = null;
+                try { data = await response.json(); } catch (_) { /* use status */ }
+                if (response.status === 403) {
+                    this.invalidateMcpRegistration('MCP claim registration expired.');
+                }
+                if (response.status !== 200 || !data || data.ok !== true) {
+                    return {
+                        ok: false,
+                        expired: response.status === 410,
+                        error: data && data.error ? String(data.error) : `claim HTTP ${response.status}`
+                    };
+                }
+                return {ok: true, expiresAt: data.expiresAt};
             } catch (err) {
-                await this.postMcpBridgeResult(call.id, {
+                return {ok: false, error: err && err.message ? err.message : String(err)};
+            }
+        };
+
+        handleMcpBridgeCall = async (call, execution) => {
+            if (!call || !call.id) return;
+            const startedAt = Date.now();
+            const args = call.arguments && typeof call.arguments === 'object' ? call.arguments : {};
+            const editTargets = Array.isArray(args.edits) ? args.edits.map(edit => edit && (
+                edit.targetRef || edit.targetName || edit.targetId
+            )).filter(Boolean) : [];
+            const rawTargets = args.targetRefs || args.targetIds || args.targets || args.targetRef || args.targetId || editTargets;
+            const targetValues = (Array.isArray(rawTargets) ? rawTargets : [rawTargets]).filter(Boolean);
+            const targetLabel = targetValues.length ? targetValues.map(value => {
+                const resolved = this.resolveAiTarget(value);
+                return resolved.target ? this.getAiTargetRef(resolved.target) : String(value);
+            }).join(',') : String(args.scope || 'current');
+            try {
+                this.assertMcpCallActive(execution);
+            } catch (err) {
+                this.recordMcpActivity(call.name, 'skipped', '调用已取消', {
+                    target: targetLabel,
+                    ok: false,
+                    durationMs: Date.now() - startedAt,
+                    error: err.message
+                });
+                return;
+            }
+            const claim = await this.claimMcpBridgeCall(call, execution);
+            if (!claim.ok) {
+                this.recordMcpActivity(call.name, 'skipped', claim.expired ? '租约已过期' : 'claim 失败', {
+                    target: targetLabel,
+                    ok: false,
+                    durationMs: Date.now() - startedAt,
+                    error: claim.error
+                });
+                return;
+            }
+            const numericExpiry = Number(claim.expiresAt);
+            const expiresAt = Number.isFinite(numericExpiry) ? numericExpiry : Date.parse(claim.expiresAt);
+            if (Number.isFinite(expiresAt)) this.setMcpCallExpiry(execution, expiresAt);
+            try {
+                this.assertMcpCallActive(execution);
+                const result = await this.executeExternalMcpAction(call.name, call.arguments || {}, execution);
+                this.assertMcpCallActive(execution);
+                await this.postMcpBridgeResult(call, {result});
+                const ok = !(result && result.ok === false);
+                this.recordMcpActivity(call.name, ok ? 'ok' : 'failed', '', {
+                    target: targetLabel,
+                    durationMs: Date.now() - startedAt,
+                    ok,
+                    resultSummary: result && (result.summary || result.type || (ok ? '完成' : '')),
+                    error: !ok && result ? result.error : ''
+                });
+            } catch (err) {
+                try {
+                    if (execution.projectGeneration === this.mcpProjectGeneration && this.mcpBridgeRegistrationToken) {
+                        await this.postMcpBridgeResult(call, {
+                            error: err && err.message ? err.message : String(err)
+                        });
+                    }
+                } catch (_) { /* result channel is already unavailable */ }
+                this.recordMcpActivity(call.name, 'failed', '', {
+                    target: targetLabel,
+                    durationMs: Date.now() - startedAt,
+                    ok: false,
                     error: err && err.message ? err.message : String(err)
                 });
             }
+        };
+
+        drainMcpBridgeCalls = () => {
+            if (this.mcpBridgeStopped || this.mcpBridgeActiveCall) return;
+            let call = this.mcpBridgeCallQueue.shift();
+            while (call && Number.isFinite(Number(call.expiresAt)) && Number(call.expiresAt) <= Date.now()) {
+                this.recordMcpActivity(call.name, 'skipped', '租约已过期', {ok: false, error: 'lease expired'});
+                call = this.mcpBridgeCallQueue.shift();
+            }
+            if (!call) return;
+            const execution = {
+                call,
+                projectGeneration: call.projectGeneration,
+                registrationToken: this.mcpBridgeRegistrationToken,
+                expiresAt: Number.isFinite(Number(call.expiresAt)) ? Number(call.expiresAt) : Infinity,
+                expiryTimer: null,
+                cancelReason: '',
+                controller: new AbortController()
+            };
+            this.mcpBridgeActiveCall = execution;
+            this.setMcpCallExpiry(execution, execution.expiresAt);
+            this.handleMcpBridgeCall(call, execution)
+                .catch(err => {
+                    this.recordMcpActivity(call.name, 'failed', 'unexpected page execution error', {
+                        ok: false,
+                        error: err && err.message ? err.message : String(err)
+                    });
+                })
+                .finally(() => {
+                    if (execution.expiryTimer) clearTimeout(execution.expiryTimer);
+                    if (this.mcpBridgeActiveCall === execution) this.mcpBridgeActiveCall = null;
+                    this.drainMcpBridgeCalls();
+                });
+        };
+
+        enqueueMcpBridgeCalls = calls => {
+            const activeId = this.mcpBridgeActiveCall && String(this.mcpBridgeActiveCall.call.id);
+            const queuedIds = new Set(this.mcpBridgeCallQueue.map(call => String(call.id)));
+            for (const rawCall of (Array.isArray(calls) ? calls : []).slice(0, 1)) {
+                if (!rawCall || !rawCall.id) continue;
+                const id = String(rawCall.id);
+                if (id === activeId || queuedIds.has(id)) continue;
+                this.mcpBridgeCallQueue.push({...rawCall, projectGeneration: this.mcpProjectGeneration});
+                queuedIds.add(id);
+            }
+            this.drainMcpBridgeCalls();
         };
 
         pollMcpBridge = async () => {
@@ -5345,34 +6062,56 @@ export default async ({addon, console, msg}) => {
             const controller = new AbortController();
             this.mcpBridgeAbortController = controller;
             try {
-                const url = new URL(`${baseUrl}/poll`);
+                const url = new URL(buildMcpBridgeUrl(baseUrl, '/poll'));
                 url.searchParams.set('clientId', this.mcpBridgeClientId);
                 url.searchParams.set('title', document.title || '');
                 url.searchParams.set('pageUrl', this.getMcpPageUrl());
+                if (this.mcpBridgeRegistrationToken) {
+                    url.searchParams.set('registrationToken', this.mcpBridgeRegistrationToken);
+                }
                 const response = await fetch(url.toString(), {
                     method: 'GET',
                     cache: 'no-store',
                     signal: controller.signal
                 });
+                if (response.status === 403) {
+                    this.invalidateMcpRegistration('MCP poll registration expired.');
+                    nextDelay = AI_MCP_BRIDGE_ACTIVE_DELAY;
+                    throw new Error('MCP registration expired');
+                }
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
+                this.acceptMcpRegistrationToken(data && data.registrationToken);
                 const calls = Array.isArray(data && data.calls) ? data.calls : [];
+                const cancelledCallIds = this.consumeMcpCancelledCallIds(data && data.cancelledCallIds);
+                const liveCalls = calls.filter(call => call && !cancelledCallIds.has(String(call.id)));
                 this.setMcpBridgeStatus('connected');
-                if (calls.length) {
+                if (liveCalls.length) {
                     nextDelay = AI_MCP_BRIDGE_ACTIVE_DELAY;
-                    for (const call of calls) {
-                        await this.handleMcpBridgeCall(call);
-                    }
+                    this.enqueueMcpBridgeCalls(liveCalls);
+                } else if (this.mcpBridgeActiveCall || this.mcpBridgeCallQueue.length) {
+                    // Keep a cancellation long-poll active while another call is
+                    // executing; writes still drain strictly one at a time.
+                    nextDelay = AI_MCP_BRIDGE_ACTIVE_DELAY;
                 }
             } catch (err) {
                 if (!this.mcpBridgeStopped && (!err || err.name !== 'AbortError')) {
-                    this.setMcpBridgeStatus('offline');
-                    nextDelay = AI_MCP_BRIDGE_ERROR_DELAY;
+                    if (err && err.message === 'MCP registration expired') {
+                        this.setMcpBridgeStatus('connecting');
+                        nextDelay = AI_MCP_BRIDGE_ACTIVE_DELAY;
+                    } else {
+                        this.setMcpBridgeStatus('offline');
+                        nextDelay = AI_MCP_BRIDGE_ERROR_DELAY;
+                    }
                 }
             } finally {
                 if (this.mcpBridgeAbortController === controller) this.mcpBridgeAbortController = null;
                 this.mcpBridgeBusy = false;
                 if (!this.mcpBridgeStopped) {
+                    if (this.mcpBridgeNeedsReregister) {
+                        this.mcpBridgeNeedsReregister = false;
+                        nextDelay = 0;
+                    }
                     this.mcpBridgeTimer = setTimeout(this.pollMcpBridge, nextDelay);
                 }
             }
@@ -5387,6 +6126,8 @@ export default async ({addon, console, msg}) => {
 
         stopMcpBridge = () => {
             this.mcpBridgeStopped = true;
+            this.mcpProjectGeneration++;
+            this.cancelMcpPageCalls('MCP bridge stopped.');
             if (this.mcpBridgeTimer) {
                 clearTimeout(this.mcpBridgeTimer);
                 this.mcpBridgeTimer = null;
@@ -5395,6 +6136,8 @@ export default async ({addon, console, msg}) => {
                 this.mcpBridgeAbortController.abort();
                 this.mcpBridgeAbortController = null;
             }
+            this.mcpBridgeRegistrationToken = '';
+            this.mcpBridgeNeedsReregister = false;
             this.setMcpBridgeStatus('disabled');
         };
 
@@ -5475,10 +6218,20 @@ export default async ({addon, console, msg}) => {
             }
             this.suppressRegenUntil = 0;
             this.dirty = false;
+            this.invalidateAiReadCaches();
         };
         prepareForProjectLoad = () => {
             this.prepareForExternalWorkspaceReset();
             this.resetAiTargetRefs();
+            this.mcpProjectGeneration++;
+            this.cancelMcpPageCalls('Project reloaded while the MCP call was running.');
+            this.mcpBridgeRegistrationToken = '';
+            this.mcpBridgeNeedsReregister = true;
+            if (this.mcpBridgeAbortController) this.mcpBridgeAbortController.abort();
+            if (!this.mcpBridgeStopped && !this.mcpBridgeBusy) {
+                if (this.mcpBridgeTimer) clearTimeout(this.mcpBridgeTimer);
+                this.mcpBridgeTimer = setTimeout(this.pollMcpBridge, 0);
+            }
             this.editorTargetId = null;
             this.lastAppliedBlocksJson = '';
             this.projectLoading = true;
@@ -5486,6 +6239,7 @@ export default async ({addon, console, msg}) => {
         finishProjectLoad = () => {
             this.prepareForExternalWorkspaceReset();
             this.projectLoading = false;
+            this.switchAiHistoryProjectIfNeeded();
         };
         setError = errorMessage => {
             setStatus(errorMessage ? `✗ ${errorMessage}` : null, 'error');
@@ -5548,6 +6302,9 @@ export default async ({addon, console, msg}) => {
             const requestRetryCount = this.aiRequestRetryCountRef.current
                 ? normalizeAiRequestRetryCount(this.aiRequestRetryCountRef.current.value)
                 : normalizeAiRequestRetryCount(previous.requestRetryCount);
+            const contextCharBudget = this.aiContextCharBudgetRef.current
+                ? normalizeAiContextCharBudget(this.aiContextCharBudgetRef.current.value)
+                : normalizeAiContextCharBudget(previous.contextCharBudget);
             const matchedModel = findAiModelRecord(this.state.aiModels, model);
             const inferredModel = inferAiModelVisionSupportWithSource(model);
             const inferredModelRecord = {
@@ -5577,6 +6334,7 @@ export default async ({addon, console, msg}) => {
                 toolNoConfirm,
                 requestRetryEnabled,
                 requestRetryCount,
+                contextCharBudget,
                 visionSupport: modelVisionSupport,
                 visionSupportSource: modelVisionSource,
                 visionSupportMessage: matchedModel
@@ -5848,6 +6606,16 @@ export default async ({addon, console, msg}) => {
             }));
         };
 
+        handleAiContextCharBudgetChange = e => {
+            const value = e && e.target ? e.target.value : '';
+            this.setState(prev => ({
+                aiConfig: {
+                    ...(prev.aiConfig || {}),
+                    contextCharBudget: normalizeAiContextCharBudget(value)
+                }
+            }));
+        };
+
         abortAiRequest = (cancelConfirmations = true) => {
             if (this.aiAbortController) {
                 this.aiAbortController.abort();
@@ -5859,10 +6627,27 @@ export default async ({addon, console, msg}) => {
         };
 
         persistAiChatState = () => {
-            saveAiChatState({
+            saveAiChatState(this.aiProjectHistoryKey, {
                 conversations: this.state.aiConversations,
                 activeConversationId: this.state.aiActiveConversationId,
                 sidebarCollapsed: this.state.aiSidebarCollapsed
+            });
+        };
+
+        switchAiHistoryProjectIfNeeded = () => {
+            const nextKey = getAiProjectHistoryKey(vm);
+            if (!nextKey || nextKey === this.aiProjectHistoryKey) return;
+            this.persistAiChatState();
+            this.aiProjectHistoryKey = nextKey;
+            const stored = loadAiChatState(nextKey);
+            const active = stored.conversations.find(item => item.id === stored.activeConversationId) || null;
+            this.invalidateAiReadCaches();
+            this.setState({
+                aiConversations: stored.conversations,
+                aiActiveConversationId: stored.activeConversationId,
+                aiSidebarCollapsed: stored.sidebarCollapsed,
+                aiMessages: active ? active.messages : [],
+                aiVisibleMessageLimit: AI_CHAT_RENDER_INITIAL_MESSAGES
             });
         };
 
@@ -6379,11 +7164,13 @@ export default async ({addon, console, msg}) => {
             pendingVars: parsed.pendingVars,
             pendingLists: parsed.pendingLists,
             pendingBroadcasts: parsed.pendingBroadcasts,
+            pendingDataRecords: parsed.pendingDataRecords || new Map(),
             declaredVars: parsed.declaredVars,
             declaredLists: parsed.declaredLists,
             declaredBroadcasts: parsed.declaredBroadcasts,
             declaredLocalVars: parsed.declaredLocalVars || new Set(),
             declaredLocalLists: parsed.declaredLocalLists || new Set(),
+            declaredDataRecords: parsed.declaredDataRecords || [],
             comments: parsed.comments || {}
         });
 
@@ -6391,6 +7178,9 @@ export default async ({addon, console, msg}) => {
             pV: [...meta.pendingVars.keys()],
             pL: [...meta.pendingLists.keys()],
             pB: [...meta.pendingBroadcasts.keys()],
+            pD: [...(meta.pendingDataRecords || new Map()).values()].map(record => [
+                record.scope, record.wantType, record.name, record.ordinal
+            ]),
             dV: [...meta.declaredVars],
             dL: [...meta.declaredLists],
             dB: [...meta.declaredBroadcasts],
@@ -6409,11 +7199,7 @@ export default async ({addon, console, msg}) => {
                 entries.push({
                     ...this.getAiTargetSummary(resolved.target, {includeCostumes: false}),
                     pseudocode: text,
-                    totalLines: lines.length,
-                    numberedLines: lines.map((line, index) => ({
-                        lineNumber: index + 1,
-                        text: line
-                    }))
+                    totalLines: lines.length
                 });
             }
             return entries;
@@ -6423,7 +7209,53 @@ export default async ({addon, console, msg}) => {
             if (knownTargetTexts && knownTargetTexts.has(target.id)) {
                 return knownTargetTexts.get(target.id);
             }
-            return this.getTargetPseudocode(target, currentText);
+            if (this.aiPseudocodeCache && this.aiPseudocodeCache.has(target.id)) {
+                return this.aiPseudocodeCache.get(target.id);
+            }
+            const pseudocode = this.getTargetPseudocode(target, currentText);
+            if (this.aiPseudocodeCache) this.aiPseudocodeCache.set(target.id, pseudocode);
+            return pseudocode;
+        };
+
+        getAiCurrentTargetWriteSafety = (target, blocksOverride) => {
+            if (!target) {
+                return {
+                    available: false,
+                    writeSafe: false,
+                    unsafeReason: '没有可执行伪代码往返安全预检的目标；仅支持只读分析',
+                    rendered: ''
+                };
+            }
+            if (!blocksOverride && this.aiWriteSafetyCache.has(target.id)) {
+                return {
+                    ...this.aiWriteSafetyCache.get(target.id),
+                    rendered: this.aiPseudocodeCache.get(target.id) || ''
+                };
+            }
+            let blocks = blocksOverride;
+            if (!blocks) {
+                const serialized = sb3.serialize(vm.runtime, target.id);
+                blocks = remapBlockIdsForEditor((serialized && serialized.blocks) || {});
+            }
+            const safety = getAiConverterWriteSafety(blocks, target, vm, {includeCoords: this.includeCoords});
+            const cachedSafety = {
+                available: safety.available,
+                writeSafe: safety.writeSafe,
+                unsafeReason: safety.unsafeReason
+            };
+            // blocksOverride is already the caller's current snapshot. Caching its
+            // safety used to retain a result that no later call could reuse.
+            if (!blocksOverride) this.aiWriteSafetyCache.set(target.id, cachedSafety);
+            if (typeof safety.rendered === 'string' && safety.rendered && this.aiPseudocodeCache) {
+                this.aiPseudocodeCache.set(target.id, safety.rendered);
+            }
+            return {...cachedSafety, rendered: safety.rendered || ''};
+        };
+
+        invalidateAiReadCaches = () => {
+            if (this.aiPseudocodeCache) this.aiPseudocodeCache.clear();
+            if (this.aiWriteSafetyCache) this.aiWriteSafetyCache.clear();
+            if (this.aiSearchSnapshots) this.aiSearchSnapshots.clear();
         };
 
         addAiPseudocodeSnippetDetail = (messageId, snippet) => {
@@ -6524,8 +7356,6 @@ export default async ({addon, console, msg}) => {
             const bounds = checked.bounds || getAiSvgBounds(checked.svg);
             const rx = Number(options && options.rotationCenterX);
             const ry = Number(options && options.rotationCenterY);
-            const scaleX = rendered.width / rendered.sourceWidth;
-            const scaleY = rendered.height / rendered.sourceHeight;
             const costume = {
                 name,
                 dataFormat: storage.DataFormat.SVG,
@@ -6555,6 +7385,8 @@ export default async ({addon, console, msg}) => {
             );
             const rx = Number(options && options.rotationCenterX);
             const ry = Number(options && options.rotationCenterY);
+            const scaleX = rendered.width / rendered.sourceWidth;
+            const scaleY = rendered.height / rendered.sourceHeight;
             const costume = {
                 name,
                 dataFormat: storage.DataFormat.PNG,
@@ -6581,8 +7413,8 @@ export default async ({addon, console, msg}) => {
             };
         };
 
-        inspectAiCostumeImage = async (target, tool) => {
-            if (!hasAiVisionSupport(this.state.aiConfig)) {
+        inspectAiCostumeImage = async (target, tool, executionContext) => {
+            if (!(executionContext && executionContext.allowImages) && !hasAiVisionSupport(this.state.aiConfig)) {
                 return {ok: false, type: 'inspect_costume', error: '图像理解未启用，请在 AI 设置中打开“启用图像理解”。'};
             }
             const resolved = this.resolveAiCostume(target, tool, true);
@@ -6617,8 +7449,8 @@ export default async ({addon, console, msg}) => {
             };
         };
 
-        getAiStageSnapshot = async () => {
-            if (!hasAiVisionSupport(this.state.aiConfig)) {
+        getAiStageSnapshot = async executionContext => {
+            if (!(executionContext && executionContext.allowImages) && !hasAiVisionSupport(this.state.aiConfig)) {
                 return {ok: false, type: 'get_stage_snapshot', error: '图像理解未启用，请在 AI 设置中打开“启用图像理解”。'};
             }
             const renderer = vm && vm.renderer;
@@ -6704,7 +7536,9 @@ export default async ({addon, console, msg}) => {
             } catch (_) { /* ignore */ }
         };
 
-        loadAiExtension = async tool => {
+        loadAiExtension = async (tool, execution) => {
+            const assertActive = () => this.assertMcpCallActive(execution);
+            assertActive();
             const manager = vm && vm.extensionManager;
             if (!manager) return {ok: false, type: 'load_extension', error: '当前 VM 没有 extensionManager'};
             const rawUrl = String(tool && (tool.url || tool.extensionUrl || tool.extensionURL) || '').trim();
@@ -6718,6 +7552,7 @@ export default async ({addon, console, msg}) => {
             if (!record && !isUrl) {
                 try {
                     record = await findAiRemoteExtensionRecord(rawSlug || rawId || rawValue);
+                    assertActive();
                 } catch (_) { /* fall back below */ }
             }
             const directTurboWarpUrl = !record && rawSlug ? makeAiTurboWarpExtensionUrl(rawSlug) : '';
@@ -6737,23 +7572,35 @@ export default async ({addon, console, msg}) => {
                 };
             }
             try {
+                assertActive();
                 if (record && (typeof manager.isBuiltinExtension !== 'function' || manager.isBuiltinExtension(record.id)) &&
                     typeof manager.loadExtensionIdSync === 'function') {
+                    assertActive();
                     manager.loadExtensionIdSync(record.id);
                 } else if (record && record.url && typeof manager.loadExtensionURL === 'function') {
+                    assertActive();
                     await manager.loadExtensionURL(record.url);
+                    assertActive();
                 } else if (extensionId && typeof manager.isBuiltinExtension === 'function' &&
                     manager.isBuiltinExtension(extensionId) && typeof manager.loadExtensionIdSync === 'function') {
+                    assertActive();
                     manager.loadExtensionIdSync(extensionId);
                 } else if (directTurboWarpUrl && typeof manager.loadExtensionURL === 'function') {
+                    assertActive();
                     await manager.loadExtensionURL(directTurboWarpUrl);
+                    assertActive();
                 } else if (!isUrl && typeof vm._loadExtensions === 'function') {
+                    assertActive();
                     await vm._loadExtensions([extensionId]);
+                    assertActive();
                 } else if (typeof manager.loadExtensionURL === 'function') {
+                    assertActive();
                     await manager.loadExtensionURL(rawValue);
+                    assertActive();
                 } else {
                     return {ok: false, type: 'load_extension', error: '当前 VM 不支持加载扩展'};
                 }
+                assertActive();
                 this.refreshAiExtensionUi();
                 const afterLoadedIds = getAiLoadedExtensionIds(vm);
                 const newLoadedIds = afterLoadedIds.filter(id => !beforeLoadedIds.has(id));
@@ -6819,14 +7666,67 @@ export default async ({addon, console, msg}) => {
             return {ok: true, requiredExtensions: requiredIds, loadedExtensions};
         };
 
-        executeAiProjectTool = async tool => {
+        executeAiProjectTool = async (tool, execution) => {
+            const assertActive = () => this.assertMcpCallActive(execution);
+            const addCostumeWithGuard = async (target, md5, costume) => {
+                assertActive();
+                const previousCurrent = typeof target.currentCostume === 'number' ? target.currentCostume : 0;
+                await vm.addCostume(md5, costume, target.id);
+                try {
+                    // addCostume loads its asset asynchronously and commits at the
+                    // end of that promise. Remove that exact object if the MCP
+                    // lease/project changed while it was loading.
+                    assertActive();
+                } catch (err) {
+                    const costumes = target.sprite && Array.isArray(target.sprite.costumes)
+                        ? target.sprite.costumes : [];
+                    const addedIndex = costumes.indexOf(costume);
+                    if (addedIndex >= 0 && target.sprite && typeof target.sprite.deleteCostumeAt === 'function') {
+                        target.sprite.deleteCostumeAt(addedIndex);
+                        if (costumes.length && typeof target.setCostume === 'function') {
+                            target.setCostume(Math.min(previousCurrent, costumes.length - 1));
+                        }
+                        if (getAiTargets(vm).includes(target)) {
+                            if (vm.runtime && typeof vm.runtime.emitProjectChanged === 'function') {
+                                vm.runtime.emitProjectChanged();
+                            }
+                            if (typeof vm.emitTargetsUpdate === 'function') vm.emitTargetsUpdate();
+                        }
+                    }
+                    throw err;
+                }
+            };
+            assertActive();
             const type = tool && tool.type;
             if (type === 'create_sprite') {
                 const usedNames = getAiTargets(vm).filter(target => !target.isStage).map(target => getAiTargetName(target));
                 const name = getAiUnusedName(tool.name || 'Sprite', usedNames);
-                await vm.addSprite(JSON.stringify(emptySprite(name, 'pop', 'costume1')));
-                const created = getAiTargets(vm).find(target => !target.isStage && getAiTargetName(target) === name);
+                const beforeTargetIds = new Set(getAiTargets(vm).map(target => target.id));
+                const importName = execution ? getAiUnusedName(
+                    `__jsc_mcp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    usedNames
+                ) : name;
+                assertActive();
+                await vm.addSprite(JSON.stringify(emptySprite(importName, 'pop', 'costume1')));
+                const created = getAiTargets(vm).find(target => (
+                    !target.isStage &&
+                    !beforeTargetIds.has(target.id) &&
+                    getAiTargetName(target) === importName
+                ));
+                try {
+                    assertActive();
+                } catch (err) {
+                    if (created && getAiTargets(vm).includes(created) && typeof vm.deleteSprite === 'function') {
+                        vm.deleteSprite(created.id);
+                    }
+                    throw err;
+                }
                 if (!created) return {ok: false, type, error: `角色创建后未找到: ${name}`};
+                if (importName !== name) {
+                    assertActive();
+                    if (typeof vm.renameSprite === 'function') vm.renameSprite(created.id, name);
+                    else if (created.sprite) created.sprite.name = name;
+                }
                 this.prepareForExternalWorkspaceReset();
                 return {ok: true, type, target: this.getAiTargetSummary(created, {includeCostumes: false}), summary: `已创建角色：${name}`};
             }
@@ -6844,6 +7744,7 @@ export default async ({addon, console, msg}) => {
                 if (!confirmed) {
                     return {ok: false, type, cancelled: true, error: `用户取消删除角色：${summary.targetName}`};
                 }
+                assertActive();
                 vm.deleteSprite(resolved.target.id);
                 this.prepareForExternalWorkspaceReset();
                 return {ok: true, type, target: summary, summary: `已删除角色：${summary.targetName}`};
@@ -6857,7 +7758,7 @@ export default async ({addon, console, msg}) => {
                 const fallback = resolved.target.isStage ? 'backdrop1' : 'costume1';
                 const name = getAiUnusedName(tool.costumeName || tool.name || fallback, existing);
                 const costume = emptyCostume(name);
-                await vm.addCostume(costume.md5 || AI_DEFAULT_EMPTY_ASSET_MD5, costume, resolved.target.id);
+                await addCostumeWithGuard(resolved.target, costume.md5 || AI_DEFAULT_EMPTY_ASSET_MD5, costume);
                 const fullTargetSummary = this.getAiTargetSummary(resolved.target);
                 const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
                 const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
@@ -6890,7 +7791,8 @@ export default async ({addon, console, msg}) => {
                 const name = getAiUnusedName(tool.costumeName || tool.name || fallback, existing);
                 const prepared = await this.prepareAiSvgCostume(name, tool.svg, tool);
                 if (!prepared.ok) return {ok: false, type, error: prepared.error};
-                await vm.addCostume(prepared.costume.md5, prepared.costume, resolved.target.id);
+                assertActive();
+                await addCostumeWithGuard(resolved.target, prepared.costume.md5, prepared.costume);
                 const fullTargetSummary = this.getAiTargetSummary(resolved.target);
                 const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
                 const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
@@ -6930,10 +7832,12 @@ export default async ({addon, console, msg}) => {
                 const tempName = getAiUnusedName(`__ai_svg_${Date.now()}`, costumes.map(costume => costume && costume.name));
                 const prepared = await this.prepareAiSvgCostume(tempName, tool.svg, tool);
                 if (!prepared.ok) return {ok: false, type, error: prepared.error};
+                assertActive();
                 const originalCurrent = typeof target.currentCostume === 'number' ? target.currentCostume : 0;
-                await vm.addCostume(prepared.costume.md5, prepared.costume, target.id);
+                await addCostumeWithGuard(target, prepared.costume.md5, prepared.costume);
                 const added = costumes[costumes.length - 1];
                 if (!added) return {ok: false, type, error: 'SVG 造型加载后未找到'};
+                assertActive();
                 target.sprite.deleteCostumeAt(found.index);
                 let addedIndex = costumes.indexOf(added);
                 if (addedIndex < 0) addedIndex = costumes.length - 1;
@@ -6964,7 +7868,8 @@ export default async ({addon, console, msg}) => {
                 const name = getAiUnusedName(tool.costumeName || tool.name || fallback, existing);
                 const prepared = await this.prepareAiBitmapCostume(name, tool.imageData, tool);
                 if (!prepared.ok) return {ok: false, type, error: prepared.error};
-                await vm.addCostume(prepared.costume.md5, prepared.costume, resolved.target.id);
+                assertActive();
+                await addCostumeWithGuard(resolved.target, prepared.costume.md5, prepared.costume);
                 const fullTargetSummary = this.getAiTargetSummary(resolved.target);
                 const targetSummary = this.getAiTargetSummary(resolved.target, {includeCostumes: false});
                 const createdCostume = (fullTargetSummary.costumes || []).find(item => item.name === name) || {};
@@ -7007,10 +7912,12 @@ export default async ({addon, console, msg}) => {
                 );
                 const prepared = await this.prepareAiBitmapCostume(tempName, tool.imageData, tool);
                 if (!prepared.ok) return {ok: false, type, error: prepared.error};
+                assertActive();
                 const originalCurrent = typeof target.currentCostume === 'number' ? target.currentCostume : 0;
-                await vm.addCostume(prepared.costume.md5, prepared.costume, target.id);
+                await addCostumeWithGuard(target, prepared.costume.md5, prepared.costume);
                 const added = costumes[costumes.length - 1];
                 if (!added) return {ok: false, type, error: '位图造型加载后未找到'};
+                assertActive();
                 target.sprite.deleteCostumeAt(found.index);
                 let addedIndex = costumes.indexOf(added);
                 if (addedIndex < 0) addedIndex = costumes.length - 1;
@@ -7055,6 +7962,7 @@ export default async ({addon, console, msg}) => {
                 if (!confirmed) {
                     return {ok: false, type, cancelled: true, error: `用户取消删除${label}：${deletedName}`};
                 }
+                assertActive();
                 const deleted = target.deleteCostume(found.index);
                 if (!deleted) return {ok: false, type, error: '删除造型/背景失败'};
                 if (vm.runtime && typeof vm.runtime.emitProjectChanged === 'function') vm.runtime.emitProjectChanged();
@@ -7202,7 +8110,240 @@ export default async ({addon, console, msg}) => {
             };
         };
 
-        executeAiRuntimeControlTool = async tool => {
+        getAiRuntimeState = tool => {
+            const runtime = vm && vm.runtime;
+            const targets = runtime && Array.isArray(runtime.targets) ? runtime.targets : [];
+            const originals = targets.filter(target => target && target.isOriginal);
+            const requested = Array.isArray(tool && tool.targetIds) ? tool.targetIds : [];
+            const selectedTargets = [];
+            const errors = [];
+            const keys = requested.length ? requested : (vm.editingTarget ? [vm.editingTarget.id] : []);
+            const seen = new Set();
+            for (const key of keys) {
+                const resolved = this.resolveAiTarget(key);
+                if (!resolved.target) {
+                    errors.push(resolved.error || `找不到角色: ${key}`);
+                    continue;
+                }
+                if (!seen.has(resolved.target.id)) {
+                    seen.add(resolved.target.id);
+                    selectedTargets.push(resolved.target);
+                }
+            }
+            const includeDataValues = !!(tool && tool.includeDataValues);
+            const maxDataItems = Math.min(
+                AI_RUNTIME_DATA_ITEMS_MAX,
+                Math.max(0, Number.isFinite(Number(tool && tool.maxDataItems)) ?
+                    Math.floor(Number(tool.maxDataItems)) : AI_RUNTIME_DATA_ITEMS_DEFAULT)
+            );
+            const maxListItems = Math.min(
+                AI_RUNTIME_LIST_ITEMS_MAX,
+                Math.max(0, Math.floor(Number.isFinite(Number(tool && tool.maxListItems)) ?
+                    Number(tool.maxListItems) : AI_RUNTIME_LIST_ITEMS_DEFAULT))
+            );
+            const targetStates = selectedTargets.map(target => {
+                const summary = this.getAiTargetSummary(target, {includeCostumes: false});
+                const values = [];
+                let dataAliases = new Map();
+                if (includeDataValues) {
+                    try {
+                        const source = this.aiPseudocodeCache.get(target.id) || this.getTargetPseudocode(target);
+                        dataAliases = getAiDeclaredDataAliases(source);
+                    } catch (_) { /* names remain readable without aliases */ }
+                }
+                const dataIds = Object.keys(target.variables || {}).filter(id => {
+                    const variable = target.variables[id];
+                    return variable && ((variable.type || '') === '' || variable.type === 'list');
+                });
+                if (includeDataValues) {
+                    for (const id of dataIds) {
+                        if (values.length >= maxDataItems) break;
+                        const variable = target.variables[id];
+                        if (!variable) continue;
+                        const scope = target.isStage ? 'global' : 'local';
+                        const type = variable.type === 'list' ? 'list' : 'variable';
+                        const alias = dataAliases.get(`${scope}|${type}|${variable.name}`) || '';
+                        if (variable.type === 'list') {
+                            const list = Array.isArray(variable.value) ? variable.value : [];
+                            values.push({
+                                name: alias || variable.name,
+                                rawName: alias ? variable.name : undefined,
+                                type: 'list',
+                                scope,
+                                length: list.length,
+                                items: list.slice(0, maxListItems),
+                                truncated: list.length > maxListItems
+                            });
+                        } else if ((variable.type || '') === '') {
+                            values.push({
+                                name: alias || variable.name,
+                                rawName: alias ? variable.name : undefined,
+                                type: 'variable',
+                                scope,
+                                value: variable.value
+                            });
+                        }
+                    }
+                }
+                return {
+                    ...summary,
+                    x: target.isStage ? null : Number(target.x),
+                    y: target.isStage ? null : Number(target.y),
+                    direction: target.isStage ? null : Number(target.direction),
+                    size: target.isStage ? null : Number(target.size),
+                    visible: target.isStage ? true : !!target.visible,
+                    rotationStyle: target.isStage ? null : String(target.rotationStyle || ''),
+                    currentCostume: {
+                        index: typeof target.currentCostume === 'number' ? target.currentCostume : null,
+                        name: summary.currentCostumeName || ''
+                    },
+                    dataValues: includeDataValues ? values : undefined,
+                    dataValuesTruncated: includeDataValues && dataIds.length > values.length
+                };
+            });
+            const timing = getAiRuntimeContext(vm);
+            return {
+                ok: !errors.length,
+                type: 'get_runtime_state',
+                ...this.getAiRuntimeStatus(),
+                timing: {
+                    framerate: timing.framerate,
+                    effectiveFramerate: timing.effectiveFramerate,
+                    stepTimeMs: timing.stepTimeMs,
+                    turboMode: timing.turboMode
+                },
+                stage: {
+                    width: runtime && runtime.stageWidth,
+                    height: runtime && runtime.stageHeight
+                },
+                originalTargetCount: originals.length,
+                cloneCount: Math.max(0, targets.length - originals.length),
+                includeDataValues,
+                maxDataItems,
+                maxListItems,
+                targets: targetStates,
+                error: errors.length ? errors.join(' | ') : undefined
+            };
+        };
+
+        getAiProjectOverview = () => {
+            const targets = getAiTargets(vm);
+            const summaries = [];
+            let totalBlocks = 0;
+            let totalCostumes = 0;
+            let totalSounds = 0;
+            const warnings = [];
+            for (const target of targets) {
+                try {
+                const serialized = sb3.serialize(vm.runtime, target.id);
+                const blocks = remapBlockIdsForEditor((serialized && serialized.blocks) || {});
+                const safety = this.getAiCurrentTargetWriteSafety(target, blocks);
+                const preflightRendered = safety.rendered;
+                const pseudocode = typeof preflightRendered === 'string' ? preflightRendered :
+                    pseudoConverter.renderPseudocode(blocks, {target, vm}, {includeCoords: this.includeCoords});
+                this.aiPseudocodeCache.set(target.id, pseudocode);
+                const pseudocodeLines = splitAiLines(pseudocode);
+                const scripts = scriptLineRanges(pseudocode).filter(range => {
+                    const chunk = pseudocodeLines.slice(range.startLine, range.endLine).join('\n')
+                        .replace(/\/\*[\s\S]*?\*\//g, '')
+                        .replace(/^\s*\/\/.*$/gm, '')
+                        .trim();
+                    return !!chunk && !chunk.startsWith('#');
+                }).map(range => ({
+                    startLine: range.startLine + 1,
+                    endLine: range.endLine,
+                    title: String(pseudocodeLines[range.startLine] || '').trim()
+                }));
+                const serializedEntryCount = Object.keys(blocks).length;
+                const blockCount = Object.keys(blocks).filter(id => !Array.isArray(blocks[id])).length;
+                const scriptCount = Object.keys(blocks).filter(id => {
+                    const block = blocks[id];
+                    return block && !Array.isArray(block) && block.topLevel === true;
+                }).length;
+                if (scripts.length !== scriptCount) {
+                    warnings.push(`${this.getAiTargetRef(target)}: 顶层脚本导航范围 ${scripts.length}/${scriptCount}`);
+                }
+                const costumes = target.sprite && Array.isArray(target.sprite.costumes) ? target.sprite.costumes : [];
+                const sounds = target.sprite && Array.isArray(target.sprite.sounds) ? target.sprite.sounds : [];
+                totalBlocks += blockCount;
+                totalCostumes += costumes.length;
+                totalSounds += sounds.length;
+                summaries.push({
+                    ...this.getAiTargetSummary(target, {includeCostumes: false}),
+                    blockCount,
+                    semanticBlockCount: blockCount,
+                    serializedEntryCount,
+                    scriptCount,
+                    pseudocodeLineCount: pseudocodeLines.length,
+                    scripts,
+                    costumeCount: costumes.length,
+                    soundCount: sounds.length,
+                    variableCount: Object.keys(target.variables || {}).filter(id => {
+                        const variable = target.variables[id];
+                        return variable && (variable.type || '') === '';
+                    }).length,
+                    listCount: Object.keys(target.variables || {}).filter(id => {
+                        const variable = target.variables[id];
+                        return variable && variable.type === 'list';
+                    }).length,
+                    writeSafe: safety.writeSafe === true,
+                    unsafeReason: safety.unsafeReason || null
+                });
+                } catch (err) {
+                    const message = err && err.message ? err.message : String(err);
+                    warnings.push(`${this.getAiTargetRef(target)}: ${message}`);
+                    const costumes = target.sprite && Array.isArray(target.sprite.costumes) ? target.sprite.costumes : [];
+                    const sounds = target.sprite && Array.isArray(target.sprite.sounds) ? target.sprite.sounds : [];
+                    totalCostumes += costumes.length;
+                    totalSounds += sounds.length;
+                    summaries.push({
+                        ...this.getAiTargetSummary(target, {includeCostumes: false}),
+                        blockCount: null,
+                        semanticBlockCount: null,
+                        serializedEntryCount: null,
+                        scriptCount: null,
+                        pseudocodeLineCount: null,
+                        scripts: [],
+                        costumeCount: costumes.length,
+                        soundCount: sounds.length,
+                        variableCount: Object.keys(target.variables || {}).filter(id => {
+                            const variable = target.variables[id];
+                            return variable && (variable.type || '') === '';
+                        }).length,
+                        listCount: Object.keys(target.variables || {}).filter(id => {
+                            const variable = target.variables[id];
+                            return variable && variable.type === 'list';
+                        }).length,
+                        writeSafe: false,
+                        unsafeReason: `无法分析: ${message}`
+                    });
+                }
+            }
+            return {
+                ok: true,
+                type: 'get_project_overview',
+                currentTargetRef: vm.editingTarget ? this.getAiTargetRef(vm.editingTarget) : '',
+                stageWidth: vm.runtime && vm.runtime.stageWidth,
+                stageHeight: vm.runtime && vm.runtime.stageHeight,
+                targetCount: summaries.length,
+                spriteCount: summaries.filter(item => !item.isStage).length,
+                totalBlocks,
+                totalCostumes,
+                totalSounds,
+                extensions: getAiLoadedExtensionIds(vm).map(id => {
+                    const item = summarizeAiExtension(vm, AI_EXTENSION_ID_MAP.get(id) || {id, name: id});
+                    return {id: item.id, name: item.name || item.id};
+                }),
+                runtime: this.getAiRuntimeStatus(),
+                targets: summaries,
+                partial: warnings.length > 0,
+                warnings
+            };
+        };
+
+        executeAiRuntimeControlTool = async (tool, execution) => {
+            const assertActive = () => this.assertMcpCallActive(execution);
+            assertActive();
             const type = tool && tool.type;
             if (type === 'click_green_flag') {
                 if (
@@ -7217,20 +8358,27 @@ export default async ({addon, console, msg}) => {
                 }
                 const before = this.getAiRuntimeStatus();
                 const callPath = [];
-                if (before.paused) setPaused(false);
+                if (before.paused) {
+                    assertActive();
+                    setPaused(false);
+                }
                 const invokeDirectGreenFlag = () => {
+                    assertActive();
                     const current = this.getAiRuntimeStatus();
                     const didStartVm = !current.started && typeof vm.start === 'function';
                     if (didStartVm) {
+                        assertActive();
                         vm.start();
                         callPath.push('vm.start');
                     }
                     if (typeof vm.greenFlag === 'function') {
+                        assertActive();
                         vm.greenFlag();
                         callPath.push('vm.greenFlag');
                         return;
                     }
                     if (vm.runtime && typeof vm.runtime.greenFlag === 'function') {
+                        assertActive();
                         vm.runtime.greenFlag();
                         callPath.push('runtime.greenFlag');
                     }
@@ -7251,7 +8399,9 @@ export default async ({addon, console, msg}) => {
                 };
                 let usedDomClick = false;
                 try {
+                    assertActive();
                     capture = mergeCapture(capture, this.captureAiStartHats(() => {
+                        assertActive();
                         const clicked = this.clickAiGreenFlagControl();
                         if (clicked.ok) {
                             usedDomClick = true;
@@ -7281,6 +8431,7 @@ export default async ({addon, console, msg}) => {
                     typeof vm.runtime.startHats === 'function' &&
                     (before.greenFlagHatCount > 0 || this.getAiGreenFlagHatCount() > 0)
                 ) {
+                    assertActive();
                     const threads = vm.runtime.startHats('event_whenflagclicked') || [];
                     fallbackThreadCount = Array.isArray(threads) ? threads.length : 0;
                     callPath.push('runtime.startHats:fallback');
@@ -7304,6 +8455,7 @@ export default async ({addon, console, msg}) => {
             }
             if (type === 'click_pause') {
                 const before = this.getAiRuntimeStatus();
+                assertActive();
                 setPaused(true);
                 const status = this.getAiRuntimeStatus();
                 return {
@@ -7321,7 +8473,11 @@ export default async ({addon, console, msg}) => {
                 if (typeof vm.stopAll !== 'function' && (!vm.runtime || typeof vm.runtime.stopAll !== 'function')) {
                     return {ok: false, type, error: '当前 VM 不支持点击停止'};
                 }
-                if (isPaused()) setPaused(false);
+                if (isPaused()) {
+                    assertActive();
+                    setPaused(false);
+                }
+                assertActive();
                 if (typeof vm.stopAll === 'function') vm.stopAll();
                 else vm.runtime.stopAll();
                 const status = this.getAiRuntimeStatus();
@@ -7338,11 +8494,15 @@ export default async ({addon, console, msg}) => {
             return {ok: false, type, error: '不支持的运行控制工具请求'};
         };
 
-        executeAiTool = async (tool, knownTargetTexts, currentText, messageId) => {
+        executeAiTool = async (tool, knownTargetTexts, currentText, messageId, executionContext) => {
+            const mcpExecution = executionContext && executionContext.mcpExecution;
+            this.assertMcpCallActive(mcpExecution);
             if (!tool || (
                 tool.type !== 'click_green_flag' &&
                 tool.type !== 'click_pause' &&
                 tool.type !== 'click_stop' &&
+                tool.type !== 'get_project_overview' &&
+                tool.type !== 'get_runtime_state' &&
                 tool.type !== 'get_pseudocode' &&
                 tool.type !== 'get_target_info' &&
                 tool.type !== 'get_costume_info' &&
@@ -7368,8 +8528,10 @@ export default async ({addon, console, msg}) => {
                 tool.type === 'click_pause' ||
                 tool.type === 'click_stop'
             ) {
-                return this.executeAiRuntimeControlTool(tool);
+                return this.executeAiRuntimeControlTool(tool, mcpExecution);
             }
+            if (tool.type === 'get_runtime_state') return this.getAiRuntimeState(tool);
+            if (tool.type === 'get_project_overview') return this.getAiProjectOverview();
             if (
                 tool.type === 'create_sprite' ||
                 tool.type === 'delete_sprite' ||
@@ -7380,16 +8542,14 @@ export default async ({addon, console, msg}) => {
                 tool.type === 'create_bitmap_costume' ||
                 tool.type === 'replace_bitmap_costume'
             ) {
-                return this.executeAiProjectTool(tool);
+                return this.executeAiProjectTool(tool, mcpExecution);
             }
             const resolveRequestedTargets = targetIds => {
                 const requested = (Array.isArray(targetIds) ? targetIds : [])
                     .map(item => String(item).trim())
                     .filter(Boolean);
-                const allTargets = getAiTargets(vm);
-                const wantsAll = !requested.length ||
-                    requested.some(item => item === '*' || item.toLowerCase() === 'all');
-                const keys = wantsAll ? allTargets.map(target => target.id) : requested;
+                const currentTarget = vm.editingTarget;
+                const keys = requested.length ? requested : (currentTarget ? [currentTarget.id] : []);
                 const targets = [];
                 const errors = [];
                 const seen = new Set();
@@ -7410,31 +8570,29 @@ export default async ({addon, console, msg}) => {
                     pseudocodeTool.targetIds : [])
                     .map(item => String(item).trim())
                     .filter(Boolean);
-                const normalized = requested.map(item => item.toLowerCase());
-                const wantsAllTargets = normalized.some(item => item === '*' || item === 'all' || item === 'all_targets');
-                const wantsAllSprites = !!(pseudocodeTool && pseudocodeTool.allSprites) ||
-                    !requested.length ||
-                    normalized.some(item =>
-                        item === 'all_sprites' ||
-                        item === 'sprites' ||
-                        item === 'all_characters' ||
-                        item === 'characters' ||
-                        item === '所有角色' ||
-                        item === '全部角色'
-                    );
-                if (wantsAllTargets) {
+                const scope = String(pseudocodeTool && pseudocodeTool.scope || (requested.length ? 'targets' : 'current'))
+                    .trim().toLowerCase();
+                if (scope === 'all_targets') {
                     return {targets: getAiTargets(vm), errors: [], scope: 'all_targets'};
                 }
-                if (wantsAllSprites) {
+                if (scope === 'all_sprites') {
                     const allTargets = getAiTargets(vm);
-                    const sprites = allTargets.filter(target => !target.isStage);
-                    const targets = pseudocodeTool && pseudocodeTool.includeStage ?
-                        allTargets.filter(target => target.isStage).concat(sprites) :
-                        sprites;
-                    return {targets, errors: [], scope: pseudocodeTool && pseudocodeTool.includeStage ?
-                        'all_targets' : 'all_sprites'};
+                    return {
+                        targets: pseudocodeTool && pseudocodeTool.includeStage ?
+                            allTargets : allTargets.filter(target => !target.isStage),
+                        errors: [],
+                        scope: pseudocodeTool && pseudocodeTool.includeStage ? 'all_targets' : 'all_sprites'
+                    };
                 }
-                return {...resolveRequestedTargets(requested), scope: 'selected'};
+                if (scope === 'current') {
+                    if (!vm.editingTarget) return {targets: [], errors: ['没有选中的角色或舞台'], scope};
+                    return {targets: [vm.editingTarget], errors: [], scope};
+                }
+                if (scope === 'targets') {
+                    if (!requested.length) return {targets: [], errors: ['scope="targets" 需要 targetRefs'], scope};
+                    return {...resolveRequestedTargets(requested), scope};
+                }
+                return {targets: [], errors: [`不支持的 scope: ${scope}`], scope};
             };
             if (tool.type === 'list_extensions') {
                 const result = await this.listAiExtensions(tool);
@@ -7442,7 +8600,7 @@ export default async ({addon, console, msg}) => {
                 return result;
             }
             if (tool.type === 'load_extension') {
-                const result = await this.loadAiExtension(tool);
+                const result = await this.loadAiExtension(tool, mcpExecution);
                 if (messageId) this.addAiMessageDetail(messageId, '加载扩展结果', JSON.stringify(result, null, 2));
                 return result;
             }
@@ -7452,13 +8610,13 @@ export default async ({addon, console, msg}) => {
                 return result;
             }
             if (tool.type === 'get_stage_snapshot') {
-                return this.getAiStageSnapshot();
+                return this.getAiStageSnapshot(executionContext);
             }
             if (tool.type === 'inspect_costume') {
                 const targetKey = tool.targetId || (vm.editingTarget && vm.editingTarget.id);
                 const resolved = this.resolveAiTarget(targetKey);
                 if (!resolved.target) return {ok: false, type: 'inspect_costume', error: resolved.error};
-                return this.inspectAiCostumeImage(resolved.target, tool);
+                return this.inspectAiCostumeImage(resolved.target, tool, executionContext);
             }
             if (tool.type === 'get_costume_info') {
                 const requested = tool.targetIds && tool.targetIds.length
@@ -7488,8 +8646,12 @@ export default async ({addon, console, msg}) => {
                 return {ok: true, type: 'get_costume_info', targets};
             }
             if (tool.type === 'get_target_info') {
-                const resolvedTargets = resolveRequestedTargets(tool.targetIds);
-                const targets = resolvedTargets.targets.map(target => this.getAiTargetSummary(target));
+                const resolvedTargets = tool.targetIds && tool.targetIds.length
+                    ? resolveRequestedTargets(tool.targetIds)
+                    : {targets: getAiTargets(vm), errors: []};
+                const targets = resolvedTargets.targets.map(target => this.getAiTargetSummary(target, {
+                    includeCostumes: !!tool.detailed
+                }));
                 if (messageId) {
                     this.addAiMessageDetail(
                         messageId,
@@ -7499,7 +8661,8 @@ export default async ({addon, console, msg}) => {
                             const costumes = (item.costumes || [])
                                 .map(costume => `${costume.index}:${costume.name}`)
                                 .join('、');
-                            return `${label}\n类型：${item.targetType}\n造型/背景：${costumes || '无'}`;
+                            return `${label}\n类型：${item.targetType}\n造型/背景数量：${item.costumeCount}` +
+                                (tool.detailed ? `\n造型/背景：${costumes || '无'}` : '');
                         }).join('\n\n')
                     );
                 }
@@ -7514,62 +8677,200 @@ export default async ({addon, console, msg}) => {
                 return {ok: true, type: 'get_target_info', targets};
             }
             if (tool.type === 'search_text') {
-                const resolvedTargets = resolveRequestedTargets(tool.targetIds);
-                const matches = [];
-                const errors = resolvedTargets.errors.slice();
-                const targetsSearched = [];
-                let totalMatches = 0;
+                const now = Date.now();
+                for (const [id, snapshot] of this.aiSearchSnapshots.entries()) {
+                    if (!snapshot || now - snapshot.createdAt > AI_SEARCH_CACHE_TTL_MS) this.aiSearchSnapshots.delete(id);
+                }
                 const maxResults = Math.min(200, Math.max(1, Number(tool.maxResults) || AI_SEARCH_RESULT_LIMIT));
+                const maxChars = normalizeAiToolMaxChars(tool.maxChars);
+                const contextLines = Math.min(
+                    AI_SEARCH_CONTEXT_LINES_MAX,
+                    Math.max(0, Number.isFinite(Number(tool.contextLines)) ? Math.floor(Number(tool.contextLines)) :
+                        AI_SEARCH_CONTEXT_LINES_DEFAULT)
+                );
                 const searchOptions = {
                     caseSensitive: tool.caseSensitive,
-                    regex: tool.regex,
-                    maxResults
+                    regex: tool.regex
                 };
-                const searchCheck = searchAiPseudocodeLines('', tool.query, searchOptions);
-                if (!searchCheck.ok) return {ok: false, type: 'search_text', error: searchCheck.error, matches};
-                for (const target of resolvedTargets.targets) {
-                    try {
-                        const pseudocode = knownTargetTexts && knownTargetTexts.has(target.id)
-                            ? knownTargetTexts.get(target.id)
-                            : this.getTargetPseudocode(target, currentText);
-                        const result = searchAiPseudocodeLines(pseudocode, tool.query, searchOptions);
-                        if (!result.ok) {
-                            errors.push(`${getAiTargetName(target)}: ${result.error}`);
-                            continue;
-                        }
-                        const summary = this.getAiTargetSummary(target, {includeCostumes: false});
-                        targetsSearched.push(summary);
-                        totalMatches += result.totalMatches;
-                        for (const match of result.matches) {
-                            matches.push({
-                                ...summary,
-                                lineNumber: match.lineNumber,
-                                column: match.column,
-                                lineText: match.lineText
-                            });
-                        }
-                    } catch (err) {
-                        errors.push(`${getAiTargetName(target)}: ${err.message}`);
+                const searchScopeKey = `${tool.scope || 'all_targets'}|${(tool.targetIds || []).join(',')}`;
+                let snapshot = null;
+                let offset = 0;
+                if (tool.cursor) {
+                    const cursorMatch = String(tool.cursor).match(/^([a-z0-9-]+):(\d+)$/i);
+                    if (!cursorMatch) return {ok: false, type: 'search_text', error: 'cursor 无效', matches: []};
+                    snapshot = this.aiSearchSnapshots.get(cursorMatch[1]);
+                    offset = Number(cursorMatch[2]);
+                    if (!snapshot) return {ok: false, type: 'search_text', error: 'cursor 已过期，请重新查找', matches: []};
+                    if (
+                        snapshot.query !== tool.query ||
+                        snapshot.caseSensitive !== !!tool.caseSensitive ||
+                        snapshot.regex !== !!tool.regex ||
+                        snapshot.contextLines !== contextLines ||
+                        snapshot.scopeKey !== searchScopeKey
+                    ) {
+                        return {ok: false, type: 'search_text', error: 'cursor 与查找参数不匹配', matches: []};
                     }
                 }
-                if (errors.length) return {ok: false, type: 'search_text', error: errors.join(' | '), matches};
-                const limitedMatches = matches.slice(0, maxResults);
+                if (!snapshot) {
+                    const searchCheck = await searchAiPseudocodeLines('', tool.query, searchOptions);
+                    if (!searchCheck.ok) return {ok: false, type: 'search_text', error: searchCheck.error, matches: []};
+                    const resolvedTargets = resolvePseudocodeTargets(tool);
+                    const errors = resolvedTargets.errors.slice();
+                    const allMatches = [];
+                    const targetsSearched = [];
+                    let snapshotChars = 0;
+                    let snapshotTruncated = false;
+                    let snapshotLimitReason = '';
+                    const markSnapshotTruncated = reason => {
+                        snapshotTruncated = true;
+                        if (!snapshotLimitReason) snapshotLimitReason = reason;
+                        if (reason && !errors.includes(reason)) errors.push(reason);
+                    };
+                    const regexSearchStartedAt = Date.now();
+                    targetLoop:
+                    for (let targetIndex = 0; targetIndex < resolvedTargets.targets.length; targetIndex++) {
+                        const target = resolvedTargets.targets[targetIndex];
+                        if (tool.regex && Date.now() - regexSearchStartedAt >= AI_SEARCH_REGEX_TIMEOUT_MS) {
+                            errors.push('正则查找达到总超时限制，剩余目标未搜索');
+                            break;
+                        }
+                        try {
+                            const pseudocode = knownTargetTexts && knownTargetTexts.has(target.id)
+                                ? knownTargetTexts.get(target.id)
+                                : this.getAiToolPseudocodeText(target, knownTargetTexts, currentText);
+                            const remainingMatchResults = AI_SEARCH_SNAPSHOT_MATCH_LIMIT - allMatches.length;
+                            if (remainingMatchResults <= 0) {
+                                markSnapshotTruncated(
+                                    `查找结果达到快照上限 ${AI_SEARCH_SNAPSHOT_MATCH_LIMIT} 条，请缩小范围或使用更具体的 query`
+                                );
+                                break;
+                            }
+                            const result = await searchAiPseudocodeLines(pseudocode, tool.query, {
+                                ...searchOptions,
+                                maxResults: remainingMatchResults
+                            });
+                            if (!result.ok) {
+                                errors.push(`${getAiTargetName(target)}: ${result.error}`);
+                                if (tool.regex && /Web Worker 不可用/.test(result.error || '')) break;
+                                continue;
+                            }
+                            const summary = this.getAiTargetSummary(target, {includeCostumes: false});
+                            const lines = splitAiLines(pseudocode);
+                            targetsSearched.push(summary);
+                            for (const match of result.matches) {
+                                const startLine = Math.max(1, match.lineNumber - contextLines);
+                                const endLine = Math.min(lines.length, match.lineNumber + contextLines);
+                                const text = lines.slice(startLine - 1, endLine).join('\n');
+                                const remainingSnapshotChars = AI_SEARCH_SNAPSHOT_CHAR_LIMIT - snapshotChars;
+                                if (remainingSnapshotChars <= 0) {
+                                    markSnapshotTruncated(
+                                        `查找结果上下文达到快照上限 ${AI_SEARCH_SNAPSHOT_CHAR_LIMIT} 字符，请缩小范围或上下文行数`
+                                    );
+                                    break targetLoop;
+                                }
+                                const storedText = text.slice(0, remainingSnapshotChars);
+                                allMatches.push({
+                                    targetRef: summary.targetRef,
+                                    line: match.lineNumber,
+                                    column: match.column,
+                                    contextStartLine: startLine,
+                                    contextEndLine: endLine,
+                                    matchLineOffset: match.lineNumber - startLine,
+                                    text: storedText,
+                                    ...(storedText.length < text.length ? {textTruncated: true} : {})
+                                });
+                                snapshotChars += storedText.length;
+                                if (storedText.length < text.length) {
+                                    markSnapshotTruncated(
+                                        `查找结果上下文达到快照上限 ${AI_SEARCH_SNAPSHOT_CHAR_LIMIT} 字符，请缩小范围或上下文行数`
+                                    );
+                                    break targetLoop;
+                                }
+                            }
+                            if (result.truncated || (
+                                allMatches.length >= AI_SEARCH_SNAPSHOT_MATCH_LIMIT &&
+                                targetIndex < resolvedTargets.targets.length - 1
+                            )) {
+                                markSnapshotTruncated(
+                                    `查找结果达到快照上限 ${AI_SEARCH_SNAPSHOT_MATCH_LIMIT} 条，请缩小范围或使用更具体的 query`
+                                );
+                                break;
+                            }
+                        } catch (err) {
+                            errors.push(`${getAiTargetName(target)}: ${err.message}`);
+                        }
+                    }
+                    if (errors.length && !targetsSearched.length) {
+                        return {ok: false, type: 'search_text', error: errors.join(' | '), matches: []};
+                    }
+                    const snapshotId = `s${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+                    snapshot = {
+                        id: snapshotId,
+                        createdAt: now,
+                        query: tool.query,
+                        caseSensitive: !!tool.caseSensitive,
+                        regex: !!tool.regex,
+                        contextLines,
+                        scopeKey: searchScopeKey,
+                        allMatches,
+                        storedChars: snapshotChars,
+                        truncated: snapshotTruncated,
+                        limitReason: snapshotLimitReason,
+                        targetsSearched,
+                        warnings: errors
+                    };
+                    this.aiSearchSnapshots.set(snapshotId, snapshot);
+                    while (this.aiSearchSnapshots.size > AI_SEARCH_CACHE_MAX_ENTRIES) {
+                        this.aiSearchSnapshots.delete(this.aiSearchSnapshots.keys().next().value);
+                    }
+                }
+                if (!Number.isInteger(offset) || offset < 0 || offset > snapshot.allMatches.length) {
+                    return {ok: false, type: 'search_text', error: 'cursor 偏移无效', matches: []};
+                }
+                const matches = [];
+                let chars = 0;
+                let index = offset;
+                while (index < snapshot.allMatches.length && matches.length < maxResults) {
+                    const source = snapshot.allMatches[index];
+                    const remaining = maxChars - chars;
+                    if (remaining <= 0) break;
+                    const text = String(source.text || '');
+                    if (matches.length && text.length > remaining) break;
+                    matches.push(text.length > remaining ? {
+                        ...source,
+                        text: text.slice(0, remaining),
+                        textTruncated: true
+                    } : source);
+                    chars += Math.min(text.length, remaining);
+                    index++;
+                }
+                const nextCursor = index < snapshot.allMatches.length ? `${snapshot.id}:${index}` : null;
                 const result = {
                     ok: true,
                     type: 'search_text',
                     query: tool.query,
                     caseSensitive: !!tool.caseSensitive,
                     regex: !!tool.regex,
-                    totalMatches,
-                    matches: limitedMatches,
-                    truncated: totalMatches > limitedMatches.length,
-                    targetsSearched
+                    contextLines,
+                    totalMatches: snapshot.allMatches.length,
+                    totalMatchesExact: !snapshot.truncated,
+                    returnedMatches: matches.length,
+                    matches,
+                    cursor: tool.cursor || null,
+                    nextCursor,
+                    truncated: !!nextCursor || !!snapshot.truncated,
+                    snapshotLimitReason: snapshot.limitReason || null,
+                    storedSnapshotChars: snapshot.storedChars || 0,
+                    maxChars,
+                    targets: snapshot.targetsSearched,
+                    partial: !!(snapshot.warnings && snapshot.warnings.length),
+                    warnings: snapshot.warnings || [],
+                    errors: snapshot.warnings || []
                 };
                 this.addAiMessageDetail(messageId, `查找结果 - ${tool.query}`, formatAiSearchResultDetail(result));
                 return result;
             }
-            const fetched = [];
-            const snippets = [];
+            let entries = [];
             const errors = [];
             const lineRanges = Array.isArray(tool.lineRanges) ? tool.lineRanges : [];
             const resolvedPseudocodeTargets = resolvePseudocodeTargets(tool);
@@ -7587,8 +8888,16 @@ export default async ({addon, console, msg}) => {
                     }
                     targetRangeMap.get(target.id).ranges.push(range);
                 };
-                for (const target of resolvedPseudocodeTargets.targets) {
-                    genericRanges.forEach(range => addRangeForTarget(target, range));
+                if (genericRanges.length) {
+                    if (resolvedPseudocodeTargets.targets.length === 1) {
+                        genericRanges.forEach(range => addRangeForTarget(resolvedPseudocodeTargets.targets[0], range));
+                    } else if (genericRanges.length === resolvedPseudocodeTargets.targets.length) {
+                        resolvedPseudocodeTargets.targets.forEach((target, index) => {
+                            addRangeForTarget(target, genericRanges[index]);
+                        });
+                    } else {
+                        errors.push('多个目标的 lineRanges 必须与 targetRefs 一一对应，或每个 range 明确提供 targetRef');
+                    }
                 }
                 for (const range of targetSpecificRanges) {
                     const resolved = this.resolveAiTarget(range.targetId);
@@ -7601,6 +8910,9 @@ export default async ({addon, console, msg}) => {
                 for (const {target, ranges} of targetRangeMap.values()) {
                     try {
                         const pseudocode = this.getAiToolPseudocodeText(target, knownTargetTexts, currentText);
+                        if (knownTargetTexts && !knownTargetTexts.has(target.id)) {
+                            knownTargetTexts.set(target.id, pseudocode);
+                        }
                         const summary = this.getAiTargetSummary(target, {includeCostumes: false});
                         for (const range of ranges) {
                             const snippet = getAiPseudocodeLineSlice(pseudocode, range);
@@ -7613,11 +8925,10 @@ export default async ({addon, console, msg}) => {
                                 startLine: snippet.startLine,
                                 endLine: snippet.endLine,
                                 totalLines: snippet.totalLines,
-                                pseudocode: snippet.pseudocode,
-                                lines: snippet.lines
+                                pseudocode: snippet.pseudocode
                             };
-                            snippets.push(item);
-                            this.addAiPseudocodeSnippetDetail(messageId, item);
+                            entries.push(item);
+                            this.addAiPseudocodeSnippetDetail(messageId, {...item, lines: snippet.lines});
                         }
                     } catch (err) {
                         errors.push(`${getAiTargetName(target)}: ${err.message}`);
@@ -7630,52 +8941,140 @@ export default async ({addon, console, msg}) => {
                         mode: 'snippet',
                         scope: resolvedPseudocodeTargets.scope,
                         error: errors.join(' | '),
-                        fetched,
-                        snippets
+                        snippets: entries
                     };
                 }
-                return {
-                    ok: true,
-                    type: 'get_pseudocode',
-                    mode: 'snippet',
-                    scope: resolvedPseudocodeTargets.scope,
-                    targetCount: targetRangeMap.size,
-                    fetched,
-                    snippets
-                };
-            }
-            for (const target of resolvedPseudocodeTargets.targets) {
-                try {
-                    const cached = knownTargetTexts.has(target.id);
-                    const pseudocode = this.getAiToolPseudocodeText(
-                        target,
-                        knownTargetTexts,
-                        currentText
-                    );
-                    if (!cached) knownTargetTexts.set(target.id, pseudocode);
-                    const summary = this.getAiTargetSummary(target, {includeCostumes: false});
-                    fetched.push({
-                        ...summary,
-                        cached,
-                        totalLines: splitAiLines(pseudocode).length,
-                        pseudocode
-                    });
-                    if (messageId && !cached) {
-                        this.addAiMessageDetail(messageId, `已读取的伪代码 - ${summary.targetName}`, pseudocode);
+            } else {
+                for (const target of resolvedPseudocodeTargets.targets) {
+                    try {
+                        const cached = knownTargetTexts.has(target.id);
+                        const pseudocode = this.getAiToolPseudocodeText(
+                            target,
+                            knownTargetTexts,
+                            currentText
+                        );
+                        if (!cached) knownTargetTexts.set(target.id, pseudocode);
+                        const summary = this.getAiTargetSummary(target, {includeCostumes: false});
+                        entries.push({
+                            ...summary,
+                            totalLines: splitAiLines(pseudocode).length,
+                            pseudocode
+                        });
+                    } catch (err) {
+                        errors.push(`${getAiTargetName(target)}: ${err.message}`);
                     }
-                } catch (err) {
-                    errors.push(`${getAiTargetName(target)}: ${err.message}`);
                 }
             }
+            if (errors.length) {
+                return {
+                    ok: false,
+                    type: 'get_pseudocode',
+                    mode: lineRanges.length ? 'snippet' : 'full',
+                    scope: resolvedPseudocodeTargets.scope,
+                    error: errors.join(' | '),
+                    fetched: []
+                };
+            }
+            const maxChars = normalizeAiToolMaxChars(tool.maxChars);
+            const cursor = tool.cursor ? Number(tool.cursor) : 0;
+            const totalChars = entries.reduce((sum, item) => sum + String(item.pseudocode || '').length, 0);
+            if (!Number.isInteger(cursor) || cursor < 0 || cursor > totalChars) {
+                return {ok: false, type: 'get_pseudocode', error: 'cursor 无效', fetched: []};
+            }
+            const paged = [];
+            let globalStart = 0;
+            let remaining = maxChars;
+            let nextOffset = cursor;
+            for (const entry of entries) {
+                const text = String(entry.pseudocode || '');
+                const globalEnd = globalStart + text.length;
+                if (globalEnd < cursor || (globalEnd === cursor && text.length)) {
+                    globalStart = globalEnd;
+                    continue;
+                }
+                if (remaining <= 0) break;
+                const hasPreviousText = paged.some(item => String(item.pseudocode || '').length > 0);
+                const separatorChars = hasPreviousText && text.length > 0 ? 2 : 0;
+                if (remaining <= separatorChars) break;
+                remaining -= separatorChars;
+                const localStart = Math.max(0, cursor - globalStart);
+                let take = Math.min(remaining, text.length - localStart);
+                if (localStart + take < text.length && take > 1) {
+                    const boundary = text.lastIndexOf('\n', localStart + take - 1);
+                    if (boundary >= localStart) take = Math.max(1, boundary + 1 - localStart);
+                }
+                if (take > 0 || (!text.length && cursor === globalStart)) {
+                    const baseStartLine = Number(entry.startLine) || 1;
+                    const startLine = baseStartLine + (text.slice(0, localStart).match(/\n/g) || []).length;
+                    const consumedForEnd = text.slice(0, localStart + Math.max(0, take - 1));
+                    const endLine = baseStartLine + (consumedForEnd.match(/\n/g) || []).length;
+                    paged.push({
+                        ...entry,
+                        pseudocode: text.slice(localStart, localStart + take),
+                        startLine,
+                        endLine,
+                        startChar: localStart,
+                        endChar: localStart + take,
+                        totalChars: text.length,
+                        complete: localStart === 0 && take === text.length
+                    });
+                    remaining -= take;
+                    nextOffset = globalStart + localStart + take;
+                }
+                globalStart = globalEnd;
+            }
+            const nextCursor = nextOffset < totalChars ? String(nextOffset) : null;
+            let responseOffset = 0;
+            const bodyParts = [];
+            const segments = paged.map(item => {
+                const separatorBeforeChars = responseOffset > 0 && item.pseudocode.length > 0 ? 2 : 0;
+                if (separatorBeforeChars) {
+                    bodyParts.push('\n\n');
+                    responseOffset += separatorBeforeChars;
+                }
+                const text = item.pseudocode;
+                const responseStartChar = responseOffset;
+                bodyParts.push(text);
+                responseOffset += text.length;
+                return {
+                    targetRef: item.targetRef,
+                    rawName: item.rawName,
+                    displayName: item.displayName,
+                    targetType: item.targetType,
+                    startLine: item.startLine,
+                    endLine: item.endLine,
+                    totalLines: item.totalLines,
+                    startChar: item.startChar,
+                    endChar: item.endChar,
+                    totalChars: item.totalChars,
+                    responseStartChar,
+                    responseEndChar: responseOffset,
+                    separatorBeforeChars,
+                    complete: item.complete
+                };
+            });
+            const pseudocodeBody = bodyParts.join('');
+            if (pseudocodeBody.length > maxChars) {
+                return {ok: false, type: 'get_pseudocode', error: '分页结果超过 maxChars 内部限制'};
+            }
             const result = {
-                ok: !errors.length,
+                ok: true,
                 type: 'get_pseudocode',
-                mode: 'full',
+                mode: lineRanges.length ? 'snippet' : 'full',
                 scope: resolvedPseudocodeTargets.scope,
-                targetCount: fetched.length,
-                fetched
+                targetCount: new Set(paged.map(item => item.targetRef)).size,
+                totalTargetCount: new Set(entries.map(item => item.targetRef)).size,
+                totalChars,
+                returnedChars: pseudocodeBody.length,
+                cursor: tool.cursor || null,
+                nextCursor,
+                maxChars,
+                pseudocode: pseudocodeBody,
+                segments
             };
-            if (errors.length) result.error = errors.join(' | ');
+            if (executionContext && Array.isArray(executionContext.aiPseudocodeReadWindows)) {
+                cacheAiPseudocodeReadWindows(executionContext.aiPseudocodeReadWindows, result);
+            }
             return result;
         };
 
@@ -7809,18 +9208,117 @@ export default async ({addon, console, msg}) => {
                 if (!checked.ok) {
                     errors.push({
                         targetRef: app.targetRef,
-                        targetId: app.targetId,
                         targetName: app.targetName,
                         errors: checked.errors,
                         pseudocode: app.pseudocode
                     });
                     continue;
                 }
+                let currentBlocks;
+                try {
+                    const currentSerialized = sb3.serialize(vm.runtime, app.target.id);
+                    currentBlocks = remapBlockIdsForEditor((currentSerialized && currentSerialized.blocks) || {});
+                } catch (err) {
+                    errors.push({
+                        targetRef: app.targetRef,
+                        targetName: app.targetName,
+                        errors: [{line: 1, col: 1, message: `当前脚本安全预检失败: ${err.message}`}],
+                        pseudocode: app.pseudocode
+                    });
+                    continue;
+                }
+                const currentSafety = this.getAiCurrentTargetWriteSafety(app.target, currentBlocks);
+                app.originalBlocks = currentBlocks;
+                app.originalPseudocode = typeof currentSafety.rendered === 'string'
+                    ? currentSafety.rendered
+                    : '';
+                if (currentSafety.writeSafe !== true) {
+                    errors.push({
+                        targetRef: app.targetRef,
+                        targetName: app.targetName,
+                        errors: [{line: 1, col: 1, message: currentSafety.unsafeReason || '当前脚本不可安全回写'}],
+                        pseudocode: app.pseudocode
+                    });
+                    continue;
+                }
                 app.parsed = checked.result;
                 app.meta = this.createPseudoMeta(checked.result);
+                const safety = getAiConverterWriteSafety(
+                    checked.result.blocks,
+                    app.target,
+                    vm,
+                    {
+                        includeCoords: this.includeCoords,
+                        dataRecords: checked.result.declaredDataRecords || [],
+                        pendingVars: checked.result.pendingVars,
+                        pendingLists: checked.result.pendingLists,
+                        pendingBroadcasts: checked.result.pendingBroadcasts,
+                        declaredLocalVars: checked.result.declaredLocalVars,
+                        declaredLocalLists: checked.result.declaredLocalLists
+                    }
+                );
+                app.writeSafe = safety.writeSafe === true;
+                app.unsafeReason = safety.unsafeReason || '';
+                if (safety.writeSafe !== true) {
+                    errors.push({
+                        targetRef: app.targetRef,
+                        targetName: app.targetName,
+                        errors: [{
+                            line: 1,
+                            col: 1,
+                            message: app.unsafeReason || '伪代码往返安全预检未明确通过；当前目标仅支持只读分析'
+                        }],
+                        pseudocode: app.pseudocode
+                    });
+                    continue;
+                }
+                try {
+                    sb3.deserializeBlocks(JSON.parse(JSON.stringify(checked.result.blocks)));
+                } catch (err) {
+                    errors.push({
+                        targetRef: app.targetRef,
+                        targetName: app.targetName,
+                        errors: [{line: 1, col: 1, message: `反序列化预检失败: ${err.message}`}],
+                        pseudocode: app.pseudocode
+                    });
+                    continue;
+                }
+                const manager = vm && vm.extensionManager;
+                const unavailableExtensions = getAiRequiredExtensionsFromBlocks(checked.result.blocks).filter(extensionId => {
+                    if (isAiExtensionLoaded(vm, extensionId)) return false;
+                    return !(manager && typeof manager.isBuiltinExtension === 'function' &&
+                        manager.isBuiltinExtension(extensionId) && typeof manager.loadExtensionIdSync === 'function');
+                });
+                if (unavailableExtensions.length) {
+                    errors.push({
+                        targetRef: app.targetRef,
+                        targetName: app.targetName,
+                        errors: [{
+                            line: 1,
+                            col: 1,
+                            message: `缺少扩展：${unavailableExtensions.map(id => `${id} 需要先调用 load_extension 加载`).join('；')}`
+                        }],
+                        pseudocode: app.pseudocode
+                    });
+                }
             }
             if (errors.length) {
                 return {ok: false, error: this.formatAiApplicationErrors(errors), applications: normalized.applications, errors};
+            }
+            for (const app of normalized.applications) {
+                const extensionCheck = this.ensureAiExtensionsForBlocks(app.parsed.blocks);
+                if (!extensionCheck.ok) {
+                    return {
+                        ok: false,
+                        error: `${app.targetName}: ${extensionCheck.error}`,
+                        applications: normalized.applications,
+                        errors: [{
+                            targetRef: app.targetRef,
+                            targetName: app.targetName,
+                            errors: [{line: 1, col: 1, message: extensionCheck.error}]
+                        }]
+                    };
+                }
             }
             return normalized;
         };
@@ -7845,12 +9343,128 @@ export default async ({addon, console, msg}) => {
         };
 
         applyAiApplications = applications => {
+            const unproven = (applications || []).find(app => !app || app.writeSafe !== true);
+            if (unproven) {
+                const targetName = unproven && unproven.targetName ? unproven.targetName : '未知目标';
+                const reason = unproven && unproven.unsafeReason
+                    ? unproven.unsafeReason
+                    : '伪代码往返安全预检未明确通过；当前目标仅支持只读分析';
+                return {ok: false, error: `${targetName}: ${reason}`};
+            }
             const currentTargetId = vm.editingTarget && vm.editingTarget.id;
             let currentApplication = null;
             const loadedExtensions = [];
+            const stage = vm.runtime && typeof vm.runtime.getTargetForStage === 'function'
+                ? vm.runtime.getTargetForStage()
+                : null;
+            const cloneRollbackValue = value => {
+                if (value === undefined || value === null || typeof value !== 'object') return value;
+                return JSON.parse(JSON.stringify(value));
+            };
+            const snapshotVariables = target => {
+                const snapshots = new Map();
+                for (const [id, variable] of Object.entries(target.variables || {})) {
+                    if (!variable || typeof variable !== 'object') {
+                        snapshots.set(id, {variable, state: variable});
+                        continue;
+                    }
+                    const state = {};
+                    for (const key of Object.keys(variable)) state[key] = cloneRollbackValue(variable[key]);
+                    snapshots.set(id, {variable, state});
+                }
+                return snapshots;
+            };
+            const restoreVariableScopes = scopes => {
+                for (const scope of scopes.values()) {
+                    const restored = {};
+                    for (const [id, snapshot] of scope.variables) {
+                        let variable = snapshot.variable;
+                        if (variable && typeof variable === 'object') {
+                            for (const key of Object.keys(variable)) {
+                                if (!Object.prototype.hasOwnProperty.call(snapshot.state, key)) delete variable[key];
+                            }
+                            for (const [key, value] of Object.entries(snapshot.state)) {
+                                variable[key] = cloneRollbackValue(value);
+                            }
+                        } else {
+                            variable = snapshot.state;
+                        }
+                        restored[id] = variable;
+                    }
+                    scope.target.variables = restored;
+                }
+            };
+            const variableScopes = new Map();
             for (const app of applications) {
-                const result = this.applyBlocksToWorkspace(app.parsed.blocks, app.meta, app.target, {forcePseudo: true});
-                if (!result.ok) return {ok: false, error: `${app.targetName}: ${result.error}`};
+                if (app.target && !variableScopes.has(app.target.id)) {
+                    variableScopes.set(app.target.id, {target: app.target, variables: snapshotVariables(app.target)});
+                }
+            }
+            if (stage && !variableScopes.has(stage.id)) {
+                variableScopes.set(stage.id, {target: stage, variables: snapshotVariables(stage)});
+            }
+            let rollbackPlans;
+            try {
+                rollbackPlans = applications.map(app => {
+                    return {
+                        app,
+                        blocks: app.originalBlocks || remapBlockIdsForEditor(
+                            (sb3.serialize(vm.runtime, app.target.id) || {}).blocks || {}
+                        ),
+                        comments: JSON.parse(JSON.stringify(app.target.comments || {})),
+                        pseudocode: app.originalPseudocode ||
+                            renderTargetPseudocode(app.target, vm, {includeCoords: this.includeCoords})
+                    };
+                });
+            } catch (err) {
+                return {ok: false, error: `回滚预检失败: ${err && err.message ? err.message : String(err)}`};
+            }
+            const appliedPlans = [];
+            for (const app of applications) {
+                let result;
+                try {
+                    result = this.applyBlocksToWorkspace(app.parsed.blocks, app.meta, app.target, {forcePseudo: true});
+                } catch (err) {
+                    result = {ok: false, error: err && err.message ? err.message : String(err)};
+                }
+                if (!result.ok) {
+                    restoreVariableScopes(variableScopes);
+                    const rollbackErrors = [];
+                    const currentPlan = rollbackPlans.find(plan => plan.app === app);
+                    const plansToRollback = appliedPlans.concat(currentPlan ? [currentPlan] : []).reverse();
+                    for (const plan of plansToRollback) {
+                        try {
+                            const rolledBack = this.applyBlocksToWorkspace(
+                                plan.blocks,
+                                null,
+                                plan.app.target,
+                                {skipAutoAlign: true}
+                            );
+                            plan.app.target.comments = JSON.parse(JSON.stringify(plan.comments));
+                            if (!rolledBack.ok) rollbackErrors.push(`${plan.app.targetName}: ${rolledBack.error}`);
+                        } catch (err) {
+                            plan.app.target.comments = JSON.parse(JSON.stringify(plan.comments));
+                            rollbackErrors.push(`${plan.app.targetName}: ${err && err.message ? err.message : String(err)}`);
+                        }
+                    }
+                    restoreVariableScopes(variableScopes);
+                    for (const plan of plansToRollback) {
+                        try {
+                            const restored = renderTargetPseudocode(plan.app.target, vm, {includeCoords: this.includeCoords});
+                            if (restored !== plan.pseudocode) rollbackErrors.push(`${plan.app.targetName}: 回滚校验不一致（含注释）`);
+                        } catch (err) {
+                            rollbackErrors.push(`${plan.app.targetName}: 回滚校验失败: ${err.message}`);
+                        }
+                    }
+                    if (vm.runtime && typeof vm.runtime.emitProjectChanged === 'function') vm.runtime.emitProjectChanged();
+                    return {
+                        ok: false,
+                        error: `${app.targetName}: ${result.error}` +
+                            (rollbackErrors.length ? `；回滚失败: ${rollbackErrors.join(' | ')}` : ''),
+                        rolledBack: !rollbackErrors.length
+                    };
+                }
+                appliedPlans.push(rollbackPlans.find(plan => plan.app === app));
                 for (const extension of result.loadedExtensions || []) {
                     if (!loadedExtensions.some(item => item && item.id === extension.id)) loadedExtensions.push(extension);
                 }
@@ -7924,6 +9538,7 @@ export default async ({addon, console, msg}) => {
             try {
                 const currentText = editor.getText() || '';
                 const knownTargetTexts = new Map([[target.id, currentText]]);
+                const aiPseudocodeReadWindows = [];
                 let feedback = null;
                 let repairAttempts = 0;
                 let hiddenParseAttempts = 0;
@@ -7960,7 +9575,7 @@ export default async ({addon, console, msg}) => {
                         this.buildAiMessages(instruction, knownTargetTexts, feedback, {
                             completedProjectOperations: projectOperationHistory.slice(),
                             completedEditOperations: editOperationHistory.slice()
-                        }),
+                        }, aiPseudocodeReadWindows),
                         this.aiAbortController.signal,
                         delta => {
                             if (!visibleStarted) {
@@ -8024,6 +9639,8 @@ export default async ({addon, console, msg}) => {
                 const getAiToolStatusText = (tool, index, total) => {
                     const prefix = total > 1 ? `AI 正在执行工具 ${index + 1}/${total}：` : '';
                     if (tool && tool.type === 'search_text') return `${prefix}查找：${tool.query || ''}`;
+                    if (tool && tool.type === 'get_project_overview') return `${prefix}查看项目概览`;
+                    if (tool && tool.type === 'get_runtime_state') return `${prefix}查看运行状态`;
                     if (tool && tool.type === 'get_target_info') return `${prefix}查看目标信息`;
                     if (tool && tool.type === 'get_costume_info') return `${prefix}查看造型/背景信息`;
                     if (tool && tool.type === 'inspect_costume') return `${prefix}查看造型/背景图片`;
@@ -8035,15 +9652,10 @@ export default async ({addon, console, msg}) => {
                     if (tool && tool.type === 'click_pause') return `${prefix}点击暂停`;
                     if (tool && tool.type === 'click_stop') return `${prefix}点击停止`;
                     if (tool && tool.type === 'get_pseudocode') {
-                        const requested = Array.isArray(tool.targetIds) ? tool.targetIds : [];
-                        const normalized = requested.map(item => String(item).trim().toLowerCase());
-                        if (normalized.some(item => item === '*' || item === 'all' || item === 'all_targets')) {
+                        if (tool.scope === 'all_targets') {
                             return `${prefix}查看全部目标伪代码`;
                         }
-                        if (tool.allSprites || !requested.length || normalized.some(item =>
-                            item === 'all_sprites' || item === 'sprites' ||
-                            item === 'all_characters' || item === 'characters'
-                        )) {
+                        if (tool.scope === 'all_sprites') {
                             return `${prefix}查看所有角色伪代码`;
                         }
                         return `${prefix}查看伪代码`;
@@ -8060,6 +9672,8 @@ export default async ({addon, console, msg}) => {
                 };
                 const executeOneAiToolAction = async (tool, index, total, messageId) => {
                     const isSearchTool = tool && tool.type === 'search_text';
+                    const isOverviewTool = tool && tool.type === 'get_project_overview';
+                    const isRuntimeStateTool = tool && tool.type === 'get_runtime_state';
                     const isProjectTool = isAiProjectTool(tool);
                     const isTargetInfoTool = tool && tool.type === 'get_target_info';
                     const isCostumeInfoTool = tool && tool.type === 'get_costume_info';
@@ -8076,7 +9690,13 @@ export default async ({addon, console, msg}) => {
                     );
                     const statusId = this.addAiStatusMessage(getAiToolStatusText(tool, index, total));
                     this.addAiToolCallDetail(statusId, tool, index, total);
-                    const toolResult = await this.executeAiTool(tool, knownTargetTexts, currentText, statusId);
+                    const toolResult = await this.executeAiTool(
+                        tool,
+                        knownTargetTexts,
+                        currentText,
+                        statusId,
+                        {aiPseudocodeReadWindows}
+                    );
                     throwIfAborted();
                     this.addAiToolResultDetail(statusId, tool, toolResult, index, total);
                     if (toolResult.ok) {
@@ -8099,7 +9719,7 @@ export default async ({addon, console, msg}) => {
                                     regex: toolResult.regex,
                                     totalMatches: toolResult.totalMatches,
                                     truncated: toolResult.truncated,
-                                    targetsSearched: toolResult.targetsSearched,
+                                    targets: toolResult.targets || [],
                                     matches: toolResult.matches
                                 }
                             };
@@ -8254,10 +9874,27 @@ export default async ({addon, console, msg}) => {
                                 }
                             };
                         }
-                        const snippets = Array.isArray(toolResult.snippets) ? toolResult.snippets : [];
+                        if (isOverviewTool || isRuntimeStateTool) {
+                            const summary = isOverviewTool
+                                ? `AI 已查看项目概览：${toolResult.targetCount || 0} 个目标`
+                                : `AI 已查看运行状态：${(toolResult.targets || []).length} 个目标`;
+                            this.addAiProcessStep(messageId, summary);
+                            this.updateAiChatMessage(statusId, {text: summary});
+                            return {
+                                ok: true,
+                                feedbackItem: {
+                                    kind: 'tool_result',
+                                    toolType: toolResult.type,
+                                    ok: true,
+                                    summary,
+                                    result: toolResult
+                                }
+                            };
+                        }
+                        const segments = Array.isArray(toolResult.segments) ? toolResult.segments : [];
                         if (toolResult.mode === 'snippet') {
-                            const labels = snippets.map(item =>
-                                `${item.targetRef ? `${item.targetRef} ` : ''}${item.targetName} 第 ${item.startLine}-${item.endLine} 行`
+                            const labels = segments.map(item =>
+                                `${item.targetRef || 'current'} 第 ${item.startLine}-${item.endLine} 行`
                             );
                             this.addAiProcessStep(messageId, `已读取伪代码片段：${labels.join('、') || '无新增'}`);
                             this.updateAiChatMessage(statusId, {
@@ -8272,12 +9909,15 @@ export default async ({addon, console, msg}) => {
                                     toolType: 'get_pseudocode',
                                     mode: 'snippet',
                                     ok: true,
-                                    snippets
+                                    scope: toolResult.scope,
+                                    segments,
+                                    returnedChars: toolResult.returnedChars,
+                                    nextCursor: toolResult.nextCursor
                                 }
                             };
                         }
-                        const names = toolResult.fetched
-                            .map(item => `${item.targetRef || ''} ${item.targetName || ''}`.trim())
+                        const names = segments
+                            .map(item => item.targetRef || item.displayName || '')
                             .filter(Boolean);
                         this.addAiProcessStep(messageId, `已读取角色伪代码：${names.join('、') || '无新增'}`);
                         this.updateAiChatMessage(statusId, {
@@ -8294,7 +9934,9 @@ export default async ({addon, console, msg}) => {
                                 ok: true,
                                 scope: toolResult.scope,
                                 targetCount: toolResult.targetCount,
-                                fetched: toolResult.fetched
+                                segments,
+                                returnedChars: toolResult.returnedChars,
+                                nextCursor: toolResult.nextCursor
                             }
                         };
                     }
@@ -8317,12 +9959,13 @@ export default async ({addon, console, msg}) => {
                         feedbackItem: {
                             kind: 'tool_result',
                             toolType: isSearchTool ? 'search_text' :
-                                (isProjectTool ? tool.type :
+                                (isOverviewTool || isRuntimeStateTool ? tool.type :
+                                    (isProjectTool ? tool.type :
                                     (isTargetInfoTool ? 'get_target_info' :
                                         (isCostumeInfoTool ? 'get_costume_info' :
                                             (isVisionTool ? tool.type :
                                                 (isRuntimeControlTool ? tool.type :
-                                                    (isExtensionTool ? tool.type : 'get_pseudocode')))))),
+                                                    (isExtensionTool ? tool.type : 'get_pseudocode'))))))),
                             ok: false,
                             error: toolResult.error,
                             targets: toolResult.targets || [],
@@ -8376,9 +10019,19 @@ export default async ({addon, console, msg}) => {
                             repair: true,
                             feedbackItem: {
                                 kind: 'repair',
-                                previousPayload: editPayload,
                                 error: prepared.error,
-                                parseErrors: prepared.errors || null,
+                                parseErrors: (prepared.errors || []).map(item => ({
+                                    targetRef: item.targetRef,
+                                    targetName: item.targetName,
+                                    errors: item.errors
+                                })),
+                                draftSummary: (prepared.applications || []).map(app => ({
+                                    targetRef: app.targetRef,
+                                    targetName: app.targetName,
+                                    mode: app.mode,
+                                    patchCount: (app.patches || []).length,
+                                    charCount: String(app.pseudocode || '').length
+                                })),
                                 repairAttempt: repairAttempts
                             }
                         };
@@ -8410,8 +10063,14 @@ export default async ({addon, console, msg}) => {
                             repair: true,
                             feedbackItem: {
                                 kind: 'repair',
-                                previousPayload: editPayload,
                                 error: applyResult.error,
+                                draftSummary: prepared.applications.map(app => ({
+                                    targetRef: app.targetRef,
+                                    targetName: app.targetName,
+                                    mode: app.mode,
+                                    patchCount: (app.patches || []).length,
+                                    charCount: String(app.pseudocode || '').length
+                                })),
                                 repairAttempt: repairAttempts
                             }
                         };
@@ -8430,7 +10089,6 @@ export default async ({addon, console, msg}) => {
                         summary,
                         applications: prepared.applications.map(app => ({
                             targetRef: app.targetRef,
-                            targetId: app.targetId,
                             targetName: app.targetName,
                             mode: app.mode,
                             summary: app.summary || '',
@@ -8633,16 +10291,10 @@ export default async ({addon, console, msg}) => {
                 return {ok: false, errors: [{line: 1, col: 1, message: 'No target selected'}]};
             }
             const r = pseudoConverter.parsePseudocode(text, {target, vm});
-            if (r.errors && r.errors.length) {
-                return {ok: false, errors: r.errors};
-            }
-            if ((!r.blocks || !Object.keys(r.blocks).length) && (!r.comments || !Object.keys(r.comments).length)) {
-                return {ok: false, errors: [{line: 1, col: 1, message: 'No blocks parsed from pseudocode'}]};
-            }
-            return {ok: true, result: r};
+            return validatePseudocodeParseResult(r);
         };
 
-        buildAiMessages = (instruction, knownTargetTexts, extra, progress) => {
+        buildAiMessages = (instruction, knownTargetTexts, extra, progress, aiPseudocodeReadWindows) => {
             const target = vm.editingTarget;
             const currentText = target && knownTargetTexts && knownTargetTexts.has(target.id)
                 ? knownTargetTexts.get(target.id)
@@ -8650,21 +10302,26 @@ export default async ({addon, console, msg}) => {
             const visionSupported = hasAiVisionSupport(this.state.aiConfig);
             const toolNoConfirm = !!(this.state.aiConfig && this.state.aiConfig.toolNoConfirm);
             const imageAttachments = visionSupported ? collectAiImageAttachments(extra || null) : [];
-            const cleanExtra = stripAiImageAttachments(extra || null);
+            const cleanExtra = summarizeAiFeedbackForPrompt(stripAiImageAttachments(extra || null));
             const context = getAiProjectContext(
                 target,
                 vm,
                 currentText,
                 item => this.getAiTargetSummary(item, {includeCostumes: false})
             );
+            const contextCharBudget = normalizeAiContextCharBudget(
+                this.state.aiConfig && this.state.aiConfig.contextCharBudget
+            );
+            const availablePseudocode = this.getKnownPseudocodeEntries(knownTargetTexts || new Map());
+            const conversation = this.state.aiMessages
+                .filter(m => m && m.kind !== 'status' && String(m.text || '').trim())
+                .slice(-6)
+                .map(m => ({role: m.role, text: String(m.text || '').slice(0, 1600)}));
             const userPayload = {
                 instruction,
                 context,
-                availablePseudocode: this.getKnownPseudocodeEntries(knownTargetTexts || new Map()),
-                conversation: this.state.aiMessages
-                    .filter(m => m && m.kind !== 'status' && String(m.text || '').trim())
-                    .slice(-10)
-                    .map(m => ({role: m.role, text: m.text})),
+                availablePseudocode: [],
+                conversation,
                 projectOperationProgress: progress
                     ? {completed: progress.completedProjectOperations || []}
                     : null,
@@ -8672,9 +10329,70 @@ export default async ({addon, console, msg}) => {
                     ? {completed: progress.completedEditOperations || []}
                     : null,
                 feedback: cleanExtra || null,
-                currentPseudocode: currentText
+                contextCharBudget
             };
-            const userContentText = JSON.stringify(userPayload, null, 2);
+            let overhead = JSON.stringify(userPayload).length;
+            if (overhead > contextCharBudget && userPayload.context) {
+                userPayload.context = {
+                    ...userPayload.context,
+                    keywords: '[omitted; use existing pseudocode names or get_extension_blocks]',
+                    extensions: userPayload.context.extensions ? {
+                        core: userPayload.context.extensions.core,
+                        loaded: userPayload.context.extensions.loaded
+                    } : null
+                };
+                userPayload.conversation = userPayload.conversation.slice(-2);
+                overhead = JSON.stringify(userPayload).length;
+            }
+            let remainingCodeChars = Math.max(0, contextCharBudget - overhead - 512);
+            const currentTargetRef = target ? this.getAiTargetRef(target) : '';
+            const orderedPseudocode = prioritizeAiPseudocodeContextEntries(
+                availablePseudocode,
+                aiPseudocodeReadWindows,
+                currentTargetRef
+            );
+            for (const entry of orderedPseudocode) {
+                const source = String(entry.pseudocode || '');
+                const take = Math.min(source.length, remainingCodeChars);
+                const sourceStartChar = entry.contextSource === 'recent_get_pseudocode' ?
+                    (Number(entry.startChar) || 0) : 0;
+                const sourceIsPartial = entry.contextSource === 'recent_get_pseudocode' && entry.complete === false;
+                userPayload.availablePseudocode.push({
+                    ...entry,
+                    pseudocode: source.slice(0, take),
+                    pseudocodeChars: Number(entry.totalChars) || source.length,
+                    windowChars: source.length,
+                    pseudocodeTruncated: take < source.length || sourceIsPartial,
+                    nextChar: take < source.length ? sourceStartChar + take :
+                        (sourceIsPartial ? Number(entry.endChar) || sourceStartChar + source.length : null)
+                });
+                remainingCodeChars -= take;
+                if (remainingCodeChars <= 0) break;
+            }
+            let userContentText = JSON.stringify(userPayload, null, 2);
+            while (userContentText.length > contextCharBudget) {
+                const excess = userContentText.length - contextCharBudget;
+                const entry = userPayload.availablePseudocode
+                    .slice().reverse().find(item => item && item.pseudocode && item.pseudocode.length);
+                if (entry) {
+                    const nextLength = Math.max(0, entry.pseudocode.length - excess - 128);
+                    entry.pseudocode = entry.pseudocode.slice(0, nextLength);
+                    entry.pseudocodeTruncated = true;
+                    entry.nextChar = (entry.contextSource === 'recent_get_pseudocode' ?
+                        (Number(entry.startChar) || 0) : 0) + nextLength;
+                } else if (userPayload.availablePseudocode.length > 1) {
+                    userPayload.availablePseudocode.pop();
+                } else if (userPayload.conversation.length) {
+                    userPayload.conversation.shift();
+                } else if (userPayload.context && Array.isArray(userPayload.context.targets) &&
+                        userPayload.context.targets.length > 1) {
+                    userPayload.context.targets.pop();
+                    userPayload.context.targetsTruncated = true;
+                } else {
+                    break;
+                }
+                userContentText = JSON.stringify(userPayload, null, 2);
+            }
             const userContent = imageAttachments.length ? [
                 {type: 'text', text: userContentText},
                 ...imageAttachments.map(attachment => ({
@@ -8701,7 +10419,7 @@ export default async ({addon, console, msg}) => {
                         `批量规则：多个互不依赖的动作应放在同一个 batch.calls 中，最多 ${AI_MAX_TOOL_CALLS_PER_BATCH} 个。后一个动作依赖前一个动作返回结果时，必须分轮执行。`,
                         '例如“创建三个角色”应使用一个 batch，包含三个 create_sprite。例如“读取 a 中名称最长的造型，再用这个名称创建角色”必须先 get_target_info，等 tool_result 返回后再 create_sprite。例如“创建两个角色，一个写加法，一个写乘法”：先 batch 创建两个角色，拿到新 targetRef 后再 edit_pseudocode。',
                         '工具执行后，插件会返回 tool_result 或 edit_result。你必须根据 result 判断下一步，不要猜测执行结果。',
-                        '可用动作：click_green_flag、click_pause、click_stop、get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、create_bitmap_costume、replace_bitmap_costume、edit_pseudocode。',
+                        '可用动作：click_green_flag、click_pause、click_stop、get_project_overview、get_runtime_state、get_target_info、get_pseudocode、search_text、list_extensions、load_extension、get_extension_blocks、get_costume_info、create_sprite、delete_sprite、create_costume、delete_costume、create_svg_costume、replace_svg_costume、create_bitmap_costume、replace_bitmap_costume、edit_pseudocode。',
                         '运行控制动作只在用户明确要求运行、暂停、停止或需要试运行项目时使用。click_green_flag 点击绿旗并启动项目；click_pause 暂停当前项目（若已暂停则保持暂停）；click_stop 点击停止并清除暂停状态。',
                         ...(visionSupported ? [
                             '用户已为此 AI 配置启用图像理解。额外可用动作：inspect_costume、get_stage_snapshot。',
@@ -8719,13 +10437,13 @@ export default async ({addon, console, msg}) => {
                         'context.extensions.core 是 Scratch 打开就自带的核心分类；context.extensions.loaded 是当前已加载扩展；context.extensions.localAvailable 是本地已存在、可加载的扩展薄列表，只包含 id/name/loaded/hardware，不包含未加载扩展的 opcode 表。伪代码里使用扩展 opcode 时，插件会在应用前自动加载可识别的本地扩展，例如 pen/music/microbit。远程扩展不会靠 opcode 自动猜测 URL；使用远程扩展前必须先调用 list_extensions 搜索或 load_extension 传入 url/slug。找不到或不能自动加载的扩展会让伪代码应用失败。',
                         '加载扩展只表示项目可以使用该扩展，不表示你已经知道它的 opcode 和参数。需要编写某个已加载扩展的积木时，先调用 get_extension_blocks 获取 opcode 表、参数槽和 @op 示例；未列入 context.keywords 的扩展积木必须使用 @op("完整opcode", inputs={...}, fields={...})。',
                         '如果 load_extension 的 tool_result 带有 nextSuggestedAction，请优先按这个 extensionId 调用 get_extension_blocks；URL 加载的远程扩展尤其需要这样获取真实 id。',
-                        'availablePseudocode 中已有的伪代码可以直接使用，且带有 totalLines/numberedLines 行号；没有的目标需要用 get_pseudocode 读取。get_pseudocode 不传 targetRefs 时会一次返回所有角色；includeStage 为 true 时同时返回舞台。currentPseudocode 是当前选中目标的原始伪代码，行号以 availablePseudocode 为准。',
+                        'availablePseudocode 中每段伪代码正文只出现一次。contextSource 为 recent_get_pseudocode 的条目是刚读取的精确窗口，优先使用它的 targetRef、startLine/endLine、startChar/endChar、cursor/nextCursor；它会替代同目标的全文开头。pseudocodeTruncated 为 true 时，用 get_pseudocode 的 cursor/nextCursor 继续读取；没有的目标也用 get_pseudocode。get_pseudocode 不传参数只读取当前目标；读取全部角色必须显式 scope:"all_sprites"，读取舞台和全部角色必须显式 scope:"all_targets"。',
                         `查看扩展列表或搜索远程扩展：${AI_ACTION_OPEN}{"type":"list_extensions","query":"clones","includeRemote":true}${AI_ACTION_CLOSE}`,
                         `加载扩展：${AI_ACTION_OPEN}{"type":"load_extension","extensionId":"pen"}${AI_ACTION_CLOSE}`,
                         `查看已加载扩展 opcode 表：${AI_ACTION_OPEN}{"type":"get_extension_blocks","extensionId":"pen"}${AI_ACTION_CLOSE}`,
                         `加载 TurboWarp 远程扩展：${AI_ACTION_OPEN}{"type":"load_extension","slug":"clones"}${AI_ACTION_CLOSE} 或 ${AI_ACTION_OPEN}{"type":"load_extension","url":"https://extensions.turbowarp.org/xxx.js"}${AI_ACTION_CLOSE}`,
                         `读取伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"]}${AI_ACTION_CLOSE}`,
-                        `一次读取所有角色伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode"}${AI_ACTION_CLOSE}`,
+                        `一次读取所有角色伪代码：${AI_ACTION_OPEN}{"type":"get_pseudocode","scope":"all_sprites"}${AI_ACTION_CLOSE}`,
                         `读取指定行：${AI_ACTION_OPEN}{"type":"get_pseudocode","targetRefs":["a"],"startLine":3,"endLine":8}${AI_ACTION_CLOSE}`,
                         `查找文本：${AI_ACTION_OPEN}{"type":"search_text","query":"当前关卡","targetRefs":["a"],"caseSensitive":false,"regex":false}${AI_ACTION_CLOSE}`,
                         `点击绿旗：${AI_ACTION_OPEN}{"type":"click_green_flag"}${AI_ACTION_CLOSE}`,
@@ -8747,11 +10465,12 @@ export default async ({addon, console, msg}) => {
                         `修改伪代码 patch：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"patch","patches":[{"op":"replace","startLine":1,"endLine":1,"oldText":"原来的连续行","newText":"新的连续行"}]}]}${AI_ACTION_CLOSE}`,
                         `修改伪代码 replace：${AI_ACTION_OPEN}{"type":"edit_pseudocode","edits":[{"targetRef":"a","mode":"replace","pseudocode":"完整伪代码"}]}${AI_ACTION_CLOSE}`,
                         '有明确行号且只改少量连续行时优先使用 mode:"patch"。新脚本、空伪代码、新增大段脚本、大范围重写、或修复解析错误时可以使用 mode:"replace" 和 pseudocode。不要为了使用 patch 而拆得很碎。',
+                        '任何小范围修改都优先使用 patch，并完整保留未涉及的 #vars/#localvars/#lists/#locallists 声明（包括 `"真实名" as readable_alias` 冲突别名）。不要把 readable_alias 改成 Scratch ID。',
                         'patch 规则：行号从 1 开始；replace/delete 必须提供完全匹配的 oldText；insertAfter 在指定行后插入 newText；所有 patch 都基于修改前的原文；不要修改无关脚本、变量、列表、广播、注释或自定义块。',
                         'edit_pseudocode 的 summary 和 patch summary 默认省略。只有复杂修改确实需要说明时才写短 summary。最终总结应在 edit_result 成功后用普通回答完成。',
                         '不要输出 Scratch JSON。不要在可见回复里展示伪代码；伪代码只能放在 edit_pseudocode 动作中。隐藏伪代码必须能被项目 parser 解析。',
                         '保留无关脚本、头部声明、变量、列表、广播、自定义块和注释，除非用户要求修改。',
-                        '如果 currentPseudocode 为空，根据用户要求创建完整第一版。优先使用上下文中的已有名称，只使用 context.keywords 中支持的积木名/opcode。',
+                        '如果当前目标在 availablePseudocode 中的 pseudocode 为空，根据用户要求创建完整第一版。优先使用上下文中的已有名称，只使用 context.keywords 中支持的积木名/opcode。',
                         '选关界面、按钮、菜单等视觉 UI，优先使用 Scratch/Paper.js 兼容的简单 SVG 造型表达按钮外观和真实文字。不要用 say/think 气泡当按钮文字。多个编号按钮可以创建多个 SVG 造型，克隆根据局部变量切换造型。',
                         '生成选关按钮、敌人、菜单项等带编号克隆时，必须使用“全局创建标记 + 克隆局部身份变量 + create_clone 后 wait(0)”模式：循环里递增全局标记并创建克隆，wait(0) 让克隆启动脚本先复制标记；on_clone_start 第一句把标记存入 #localvars；点击、位置和造型都使用这个 #localvars。',
                         '如果 feedback 中包含 repair/parser 错误，说明上一次草稿没有通过解析。先简短说明正在修复，然后调用 edit_pseudocode 给出修正版。修复时可以使用全文 replace。不要重复同一个错误动作。',
@@ -9041,36 +10760,14 @@ export default async ({addon, console, msg}) => {
             // meta 由 parsePseudocode 的返回值传入；JSON 模式下 meta 为空对象，所有集合都当空。
             // 伪代码模式下始终开启自动对齐：apply 时自动建新变量/列表/广播，并删掉本角色里没用到的 local 变量/列表
             // （stage target 和广播永不自动删；stage 上的 global 永不自动删——可能被其它 sprite 引用）
-            const autoAlign = !!(options && options.forcePseudo) || this.state.mode === 'pseudo';
-            const pendingVars = (meta && meta.pendingVars) || new Map();
-            const pendingLists = (meta && meta.pendingLists) || new Map();
+            const autoAlign = !(options && options.skipAutoAlign) &&
+                (!!(options && options.forcePseudo) || this.state.mode === 'pseudo');
             const pendingBroadcasts = (meta && meta.pendingBroadcasts) || new Map();
-            const declaredVars = (meta && meta.declaredVars) || new Set();
-            const declaredLists = (meta && meta.declaredLists) || new Set();
             const declaredBroadcasts = (meta && meta.declaredBroadcasts) || new Set();
-            const declaredLocalVars = (meta && meta.declaredLocalVars) || new Set();
-            const declaredLocalLists = (meta && meta.declaredLocalLists) || new Set();
             const referenceIdRemaps = {variable: new Map(), list: new Map(), broadcast: new Map()};
 
             if (autoAlign) {
                 const stage = vm.runtime.getTargetForStage && vm.runtime.getTargetForStage();
-                // 选择变量/列表 应该创建在哪个 target 上：
-                //   - 当前 target 是 stage → 只能全局（就是 stage 自己）
-                //   - 声明在 #localvars/#locallists → 当前 sprite（局部）
-                //   - 否则 → stage（全局），匹配 Scratch "Make a Variable" 默认行为
-                const chooseScope = (name, isLocalDeclared) => {
-                    if (target.isStage) return stage;
-                    if (isLocalDeclared) return target;
-                    return stage || target;
-                };
-                const lookupInOwnScope = (scope, name, type) => {
-                    if (!scope || !scope.variables) return null;
-                    for (const id of Object.keys(scope.variables)) {
-                        const v = scope.variables[id];
-                        if (v && v.name === name && (v.type || '') === type) return v;
-                    }
-                    return null;
-                };
                 const rememberReferenceId = (kind, requestedId, resolved) => {
                     if (!resolved || requestedId == null || resolved.id == null) return;
                     referenceIdRemaps[kind].set(String(requestedId), {
@@ -9084,25 +10781,16 @@ export default async ({addon, console, msg}) => {
                 let declCounter = 0;
                 const freshDeclId = kind => `${kind}-decl-${declSeed}-${declCounter++}`;
 
-                // 变量：声明里有、还没实际存在的补进 pending
-                for (const name of declaredVars) {
-                    if (!lookupInOwnScope(chooseScope(name, false), name, '') && !pendingVars.has(name)) {
-                        pendingVars.set(name, freshDeclId('newvar'));
-                    }
-                }
-                for (const name of declaredLocalVars) {
-                    if (!lookupInOwnScope(chooseScope(name, true), name, '') && !pendingVars.has(name)) {
-                        pendingVars.set(name, freshDeclId('newvar'));
-                    }
-                }
-                for (const name of declaredLists) {
-                    if (!lookupInOwnScope(chooseScope(name, false), name, 'list') && !pendingLists.has(name)) {
-                        pendingLists.set(name, freshDeclId('newlist'));
-                    }
-                }
-                for (const name of declaredLocalLists) {
-                    if (!lookupInOwnScope(chooseScope(name, true), name, 'list') && !pendingLists.has(name)) {
-                        pendingLists.set(name, freshDeclId('newlist'));
+                const dataAlignment = alignPseudocodeDataDeclarations({
+                    target,
+                    stage,
+                    meta: meta || {},
+                    freshId: freshDeclId
+                });
+                if (!dataAlignment.ok) return {ok: false, error: dataAlignment.error};
+                for (const kind of ['variable', 'list']) {
+                    for (const [requestedId, resolved] of dataAlignment.referenceIdRemaps[kind]) {
+                        rememberReferenceId(kind, requestedId, resolved);
                     }
                 }
                 for (const name of declaredBroadcasts) {
@@ -9111,25 +10799,6 @@ export default async ({addon, console, msg}) => {
                     }
                 }
 
-                // 实际创建
-                for (const [name, id] of pendingVars) {
-                    const scope = chooseScope(name, declaredLocalVars.has(name));
-                    let variable = lookupInOwnScope(scope, name, '');
-                    if (!variable && scope) {
-                        scope.createVariable(id, name, '', false);
-                        variable = lookupInOwnScope(scope, name, '');
-                    }
-                    rememberReferenceId('variable', id, variable);
-                }
-                for (const [name, id] of pendingLists) {
-                    const scope = chooseScope(name, declaredLocalLists.has(name));
-                    let list = lookupInOwnScope(scope, name, 'list');
-                    if (!list && scope) {
-                        scope.createVariable(id, name, 'list', false);
-                        list = lookupInOwnScope(scope, name, 'list');
-                    }
-                    rememberReferenceId('list', id, list);
-                }
                 if (stage) {
                     for (const [name, id] of pendingBroadcasts) {
                         let broadcast = stage.lookupBroadcastByInputValue(name);
@@ -9237,35 +10906,7 @@ export default async ({addon, console, msg}) => {
             // 只对非 stage target 生效；stage 上的条目都是 global，可能被其它 sprite 引用，不碰。
             // 广播也永远不删（global）。
             if (autoAlign && !target.isStage) {
-                const referenced = new Set();
-                for (const b of blockArray) {
-                    if (b.fields) {
-                        const v = b.fields.VARIABLE; if (v && v[1]) referenced.add(v[1]);
-                        const l = b.fields.LIST;     if (l && l[1]) referenced.add(l[1]);
-                    }
-                    if (b.inputs) {
-                        for (const k of Object.keys(b.inputs)) {
-                            const input = b.inputs[k];
-                            if (!Array.isArray(input)) continue;
-                            for (let i = 1; i < input.length; i++) {
-                                const v = input[i];
-                                if (Array.isArray(v) && (v[0] === 12 || v[0] === 13) && v[2]) referenced.add(v[2]);
-                            }
-                        }
-                    }
-                }
-                // 头部 declared 也算保留
-                const reserveByName = (name, type) => {
-                    const v = target.lookupVariableByNameAndType(name, type);
-                    if (v) referenced.add(v.id);
-                };
-                for (const n of declaredVars) reserveByName(n, '');
-                for (const n of declaredLists) reserveByName(n, 'list');
-                for (const n of declaredLocalVars) reserveByName(n, '');
-                for (const n of declaredLocalLists) reserveByName(n, 'list');
-                for (const id of Object.keys(target.variables)) {
-                    if (!referenced.has(id)) target.deleteVariable(id);
-                }
+                prunePseudocodeLocalData({target, blocks: cloned, meta: meta || {}});
             }
 
             // emitWorkspaceUpdate 是同步的：listener（blocks.jsx.onWorkspaceUpdate）里
@@ -9340,7 +10981,7 @@ export default async ({addon, console, msg}) => {
             const editor = this.jsonEditorComponent.current;
             if (!editor) return;
             const text = (editor.getText() || '').trim();
-            if (!text) { this.clearError(); return; }
+            if (!shouldAutoApplyEditorText(text, this.state.mode)) { this.clearError(); return; }
             if (this.projectLoading || !this.editorTargetId) return;
             const target = vm.editingTarget;
             if (!target) { this.setError('没有选中的角色或舞台'); return; }
@@ -9367,10 +11008,6 @@ export default async ({addon, console, msg}) => {
                     return;
                 }
                 raw = r.blocks;
-                if (!Object.keys(raw).length && (!r.comments || !Object.keys(r.comments).length)) {
-                    this.setError('伪代码里没有积木或注释');
-                    return;
-                }
                 meta = this.createPseudoMeta(r);
             }
             // 解析结果和上次 apply 完全一致 → 纯空白/换行变化，没必要再动 workspace
@@ -9388,7 +11025,23 @@ export default async ({addon, console, msg}) => {
             this.dirty = false;
             // 伪代码模式下把头部同步到 "声明 ∪ 引用"，并按当前 target 的作用域把变量/列表分到全局/局部。
             // 广播会根据 broadcast/on_broadcast 引用自动创建，不再回写 #broadcasts 头部。
-            if (this.state.mode === 'pseudo' && meta) {
+            const declaredDataRecords = meta && Array.isArray(meta.declaredDataRecords)
+                ? meta.declaredDataRecords
+                : [];
+            const headerIdentityCounts = new Map();
+            for (const record of declaredDataRecords) {
+                if (!record) continue;
+                const spelling = pseudoConverter.sanitizeIdent(String(record.name == null ? '' : record.name));
+                const key = `${record.wantType === 'list' ? 'list' : 'variable'}\u0000${spelling}`;
+                headerIdentityCounts.set(key, (headerIdentityCounts.get(key) || 0) + 1);
+            }
+            const preserveStructuredHeader = declaredDataRecords.some(record => record && record.alias) ||
+                [...headerIdentityCounts.values()].some(count => count > 1);
+            // Name-only header rebuilding cannot represent two scoped entities
+            // with the same raw name and would also orphan aliases used in the
+            // body. Alias-bearing or spelling-conflicted source already has a
+            // complete authoritative header, so preserve it verbatim.
+            if (this.state.mode === 'pseudo' && meta && !preserveStructuredHeader) {
                 const refs = collectReferencedNames(raw);
                 const unionSet = (a, b) => { const s = new Set(a); for (const x of b) s.add(x); return s; };
                 // 所有要在头部出现的名字 = 声明 ∪ 引用
@@ -9716,9 +11369,12 @@ export default async ({addon, console, msg}) => {
             const toolNoConfirm = !!config.toolNoConfirm;
             const requestRetryEnabled = config.requestRetryEnabled !== false;
             const requestRetryCount = normalizeAiRequestRetryCount(config.requestRetryCount);
+            const contextCharBudget = normalizeAiContextCharBudget(config.contextCharBudget);
             const mcpBridgeEnabled = !!this.state.mcpBridgeEnabled;
             const mcpBridgeStatus = this.state.mcpBridgeStatus || this.mcpBridgeLastStatus || 'disabled';
             const mcpBridgeUrl = this.state.mcpBridgeUrl || AI_MCP_BRIDGE_DEFAULT_URL;
+            const mcpEndpointUrl = getMcpHttpEndpointUrl(mcpBridgeUrl);
+            const mcpActivityLog = Array.isArray(this.state.mcpActivityLog) ? this.state.mcpActivityLog : [];
             const hasDesktopMcpApi = !!(window.fortycodeDesktopMcp && typeof window.fortycodeDesktopMcp.start === 'function');
             const endpointInputValue = this.aiEndpointRef.current
                 ? this.aiEndpointRef.current.value
@@ -10608,18 +12264,39 @@ export default async ({addon, console, msg}) => {
                                     </label>
                                     {mcpBridgeEnabled ? (
                                         <React.Fragment>
-                                            <input
-                                                ref={this.mcpBridgeUrlRef}
-                                                value={mcpBridgeUrl}
-                                                placeholder={AI_MCP_BRIDGE_DEFAULT_URL}
-                                                onChange={this.handleMcpBridgeUrlChange}
-                                                onBlur={this.handleMcpBridgeUrlBlur}
-                                                style={{
-                                                    ...fieldStyle,
-                                                    height: 30,
-                                                    fontSize: 12
-                                                }}
-                                            />
+                                            <div style={{display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 6}}>
+                                                <input
+                                                    value={mcpEndpointUrl}
+                                                    readOnly
+                                                    aria-label="MCP HTTP 地址"
+                                                    style={{
+                                                        ...fieldStyle,
+                                                        height: 30,
+                                                        fontSize: 12,
+                                                        fontFamily: 'monospace'
+                                                    }}
+                                                />
+                                                <button type="button" onClick={this.copyMcpEndpoint} style={{...buttonStyle, height: 30}}>
+                                                    复制
+                                                </button>
+                                            </div>
+                                            <details style={{fontSize: 12, color: '#64748b'}}>
+                                                <summary style={{cursor: 'pointer'}}>高级：页面桥接基础地址</summary>
+                                                <input
+                                                    ref={this.mcpBridgeUrlRef}
+                                                    value={mcpBridgeUrl}
+                                                    placeholder={AI_MCP_BRIDGE_DEFAULT_URL}
+                                                    onChange={this.handleMcpBridgeUrlChange}
+                                                    onBlur={this.handleMcpBridgeUrlBlur}
+                                                    style={{
+                                                        ...fieldStyle,
+                                                        width: '100%',
+                                                        height: 30,
+                                                        marginTop: 6,
+                                                        fontSize: 12
+                                                    }}
+                                                />
+                                            </details>
                                             <div style={{
                                                 color: mcpBridgeStatus === 'connected' ? '#047857' : '#64748b',
                                                 fontSize: 12,
@@ -10627,8 +12304,46 @@ export default async ({addon, console, msg}) => {
                                             }}>
                                                 MCP 状态：{formatMcpBridgeStatus(mcpBridgeStatus)}
                                             </div>
+                                            {mcpActivityLog.length ? (
+                                                <div style={{display: 'grid', gap: 3, color: '#475569', fontSize: 11, lineHeight: 1.35}}>
+                                                    {mcpActivityLog.slice(0, 5).map(item => (
+                                                        <div key={item.id} style={{wordBreak: 'break-word'}}>
+                                                            <span style={{fontFamily: 'monospace'}}>{item.name}</span>
+                                                            {item.target ? ` · ${item.target}` : ''}
+                                                            {item.durationMs ? ` · ${item.durationMs}ms` : ''}
+                                                            {' · '}
+                                                            {item.error || item.resultSummary || item.detail || item.status}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            ) : null}
                                         </React.Fragment>
                                     ) : null}
+                                </div>
+                                <div style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'minmax(0, 1fr) 120px',
+                                    gap: 8,
+                                    alignItems: 'center',
+                                    padding: '10px 11px',
+                                    border: '1px solid #dbe3ee',
+                                    borderRadius: 8,
+                                    background: '#ffffff'
+                                }}>
+                                    <span style={{color: '#475569', fontSize: 12, lineHeight: 1.4}}>
+                                        单次 AI 项目上下文字符预算
+                                    </span>
+                                    <input
+                                        ref={this.aiContextCharBudgetRef}
+                                        type="number"
+                                        min={AI_CONTEXT_CHAR_BUDGET_MIN}
+                                        max={AI_CONTEXT_CHAR_BUDGET_MAX}
+                                        step="1000"
+                                        value={contextCharBudget}
+                                        onChange={this.handleAiContextCharBudgetChange}
+                                        aria-label="AI 项目上下文字符预算"
+                                        style={{...fieldStyle, height: 30}}
+                                    />
                                 </div>
                                 <div style={{
                                     display: 'grid',
@@ -11067,9 +12782,15 @@ export default async ({addon, console, msg}) => {
         }
     };
     const onWorkspaceChanged = () => {
+        if (reactModalInstance && typeof reactModalInstance.invalidateAiReadCaches === 'function') {
+            reactModalInstance.invalidateAiReadCaches();
+        }
         scheduleRegenerateFromWorkspace();
     };
     const onTargetsUpdate = data => {
+        if (reactModalInstance && typeof reactModalInstance.invalidateAiReadCaches === 'function') {
+            reactModalInstance.invalidateAiReadCaches();
+        }
         const nextTargetId = data && Object.prototype.hasOwnProperty.call(data, 'editingTarget')
             ? data.editingTarget
             : getEditingTargetId();

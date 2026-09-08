@@ -1,0 +1,523 @@
+{
+  "protocolVersions": [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05"
+  ],
+  "tools": [
+    {
+      "name": "jsc_bridge_status",
+      "description": "Return local bridge status without calling a 40code page.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "jsc_list_pages",
+      "description": "List active 40code pages and the page selected by this MCP session.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "jsc_select_page",
+      "description": "Select the 40code page used by subsequent tools in this MCP session.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "clientId": {"type": "string", "minLength": 1, "maxLength": 256, "description": "An active clientId returned by jsc_list_pages."}
+        },
+        "required": ["clientId"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "jsc_get_pseudocode_syntax",
+      "description": "Return the pseudocode syntax guide for edit_pseudocode.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "jsc_get_status",
+      "description": "Return status, current target, and target references from the selected 40code page.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "get_project_overview",
+      "description": "Return a compact project overview for orientation before targeted reads or edits.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "get_runtime_state",
+      "description": "Return the selected page's current project runtime state.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "targetRefs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 256, "uniqueItems": true},
+          "includeDataValues": {"type": "boolean", "default": false},
+          "maxDataItems": {"type": "integer", "minimum": 0, "maximum": 100, "default": 20},
+          "maxListItems": {"type": "integer", "minimum": 0, "maximum": 200, "default": 20}
+        },
+        "oneOf": [
+          {"not": {"anyOf": [{"required": ["targetRef"]}, {"required": ["targetRefs"]}]}},
+          {"required": ["targetRef"]},
+          {"required": ["targetRefs"]}
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_target_info",
+      "description": "List target, sprite, and stage metadata. Omit targetRefs to list all targets.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRefs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "maxItems": 256,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_pseudocode",
+      "description": "Read pseudocode for the current target, selected targets, or all targets with cursor pagination. An empty object reads the current target.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {"type": "string", "enum": ["current", "targets", "all_sprites", "all_targets"], "default": "current"},
+          "targetRefs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "minItems": 1,
+            "maxItems": 256,
+            "uniqueItems": true
+          },
+          "includeStage": {"type": "boolean", "default": false},
+          "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "maxChars": {"type": "integer", "minimum": 1, "maximum": 200000, "default": 48000},
+          "startLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+          "endLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+          "lineRanges": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "properties": {
+                "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+                "startLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                "endLine": {"type": "integer", "minimum": 1, "maximum": 1000000}
+              },
+              "required": ["startLine", "endLine"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "dependencies": {"startLine": ["endLine"], "endLine": ["startLine"]},
+        "allOf": [
+          {
+            "not": {
+              "allOf": [
+                {"required": ["lineRanges"]},
+                {"anyOf": [{"required": ["startLine"]}, {"required": ["endLine"]}]}
+              ]
+            }
+          }
+        ],
+        "oneOf": [
+          {
+            "properties": {"scope": {"enum": ["current"]}},
+            "not": {"required": ["targetRefs"]}
+          },
+          {
+            "properties": {"scope": {"enum": ["all_sprites", "all_targets"]}},
+            "required": ["scope"],
+            "not": {"required": ["targetRefs"]}
+          },
+          {
+            "properties": {"scope": {"enum": ["targets"]}},
+            "required": ["targetRefs"]
+          }
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "search_text",
+      "description": "Search pseudocode text across targets and optionally include surrounding lines.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "minLength": 1, "maxLength": 256},
+          "scope": {"type": "string", "enum": ["current", "targets", "all_sprites", "all_targets"], "default": "all_targets"},
+          "targetRefs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "minItems": 1,
+            "maxItems": 256,
+            "uniqueItems": true
+          },
+          "caseSensitive": {"type": "boolean", "default": false},
+          "regex": {"type": "boolean", "default": false},
+          "maxResults": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+          "contextLines": {"type": "integer", "minimum": 0, "maximum": 10, "default": 1},
+          "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "maxChars": {"type": "integer", "minimum": 1, "maximum": 200000, "default": 48000}
+        },
+        "required": ["query"],
+        "oneOf": [
+          {"properties": {"scope": {"enum": ["all_targets"]}}, "not": {"required": ["targetRefs"]}},
+          {"properties": {"scope": {"enum": ["current", "all_sprites"]}}, "required": ["scope"], "not": {"required": ["targetRefs"]}},
+          {"properties": {"scope": {"enum": ["targets"]}}, "required": ["targetRefs"]}
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_extensions",
+      "description": "List loaded, local, and optionally remote extensions.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "maxLength": 500},
+          "source": {"type": "string", "enum": ["all", "loaded", "local", "remote"]},
+          "includeRemote": {"type": "boolean", "default": false},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "load_extension",
+      "description": "Load exactly one extension by extensionId, TurboWarp slug, or HTTPS URL.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "extensionId": {"type": "string", "minLength": 1, "maxLength": 256},
+          "slug": {"type": "string", "minLength": 1, "maxLength": 256},
+          "url": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^https://"}
+        },
+        "oneOf": [
+          {"required": ["extensionId"]},
+          {"required": ["slug"]},
+          {"required": ["url"]}
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_extension_blocks",
+      "description": "Return block and opcode metadata for a loaded extension.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "extensionId": {"type": "string", "minLength": 1, "maxLength": 256},
+          "query": {"type": "string", "maxLength": 500},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
+        },
+        "required": ["extensionId"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_costume_info",
+      "description": "Return costume or backdrop metadata and optionally SVG source.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "targetRefs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 256, "uniqueItems": true},
+          "costumeName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeIndex": {"type": "integer", "minimum": 0, "maximum": 100000},
+          "includeSvg": {"type": "boolean", "default": false}
+        },
+        "allOf": [
+          {
+            "oneOf": [
+              {"not": {"anyOf": [{"required": ["targetRef"]}, {"required": ["targetRefs"]}]}},
+              {"required": ["targetRef"]},
+              {"required": ["targetRefs"]}
+            ]
+          },
+          {
+            "oneOf": [
+              {"not": {"anyOf": [{"required": ["costumeName"]}, {"required": ["costumeIndex"]}]}},
+              {"required": ["costumeName"]},
+              {"required": ["costumeIndex"]}
+            ]
+          }
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "inspect_costume",
+      "description": "Return a costume or backdrop as standard MCP image content.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeIndex": {"type": "integer", "minimum": 0, "maximum": 100000}
+        },
+        "oneOf": [
+          {"not": {"anyOf": [{"required": ["costumeName"]}, {"required": ["costumeIndex"]}]}},
+          {"required": ["costumeName"]},
+          {"required": ["costumeIndex"]}
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_stage_snapshot",
+      "description": "Return a stage screenshot as standard MCP image content.",
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "click_green_flag",
+      "description": "Start or restart the project.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "click_pause",
+      "description": "Pause the project.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "click_stop",
+      "description": "Stop all project scripts.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "create_sprite",
+      "description": "Create a sprite.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 256}},
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "delete_sprite",
+      "description": "Delete a sprite in the trusted external MCP execution context.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "name": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "oneOf": [{"required": ["targetRef"]}, {"required": ["name"]}],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_costume",
+      "description": "Create a blank costume or backdrop.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "name": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "delete_costume",
+      "description": "Delete a costume or backdrop in the trusted external MCP execution context.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeIndex": {"type": "integer", "minimum": 0, "maximum": 100000}
+        },
+        "oneOf": [{"required": ["costumeName"]}, {"required": ["costumeIndex"]}],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_svg_costume",
+      "description": "Create an SVG costume or backdrop.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "name": {"type": "string", "minLength": 1, "maxLength": 256},
+          "svg": {"type": "string", "minLength": 1, "maxLength": 4000000},
+          "rotationCenterX": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+          "rotationCenterY": {"type": "number", "minimum": -1000000, "maximum": 1000000}
+        },
+        "required": ["svg"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "replace_svg_costume",
+      "description": "Replace one costume or backdrop with SVG.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeIndex": {"type": "integer", "minimum": 0, "maximum": 100000},
+          "newName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "svg": {"type": "string", "minLength": 1, "maxLength": 4000000},
+          "rotationCenterX": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+          "rotationCenterY": {"type": "number", "minimum": -1000000, "maximum": 1000000}
+        },
+        "required": ["svg"],
+        "oneOf": [{"required": ["costumeName"]}, {"required": ["costumeIndex"]}],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_bitmap_costume",
+      "description": "Create a bitmap costume or backdrop from base64 image data.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "name": {"type": "string", "minLength": 1, "maxLength": 256},
+          "imageData": {"type": "string", "minLength": 1, "maxLength": 8000000},
+          "mimeType": {"type": "string", "enum": ["image/png", "image/jpeg", "image/webp", "image/bmp", "image/gif"]},
+          "rotationCenterX": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+          "rotationCenterY": {"type": "number", "minimum": -1000000, "maximum": 1000000}
+        },
+        "required": ["imageData"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "replace_bitmap_costume",
+      "description": "Replace one costume or backdrop with base64 bitmap image data.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "costumeIndex": {"type": "integer", "minimum": 0, "maximum": 100000},
+          "newName": {"type": "string", "minLength": 1, "maxLength": 256},
+          "imageData": {"type": "string", "minLength": 1, "maxLength": 8000000},
+          "mimeType": {"type": "string", "enum": ["image/png", "image/jpeg", "image/webp", "image/bmp", "image/gif"]},
+          "rotationCenterX": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+          "rotationCenterY": {"type": "number", "minimum": -1000000, "maximum": 1000000}
+        },
+        "required": ["imageData"],
+        "oneOf": [{"required": ["costumeName"]}, {"required": ["costumeIndex"]}],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "edit_pseudocode",
+      "description": "Replace or patch pseudocode. Read jsc://pseudocode/syntax first.",
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+          "mode": {"type": "string", "enum": ["replace", "patch"]},
+          "pseudocode": {"type": "string", "maxLength": 4000000},
+          "patches": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": {
+              "type": "object",
+              "properties": {
+                "op": {"type": "string", "enum": ["replace", "delete", "insertAfter"]},
+                "startLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                "endLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                "afterLine": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                "oldText": {"type": "string", "maxLength": 4000000},
+                "newText": {"type": "string", "maxLength": 4000000}
+              },
+              "oneOf": [
+                {"properties": {"op": {"const": "replace"}}, "required": ["op", "startLine", "endLine", "oldText", "newText"], "not": {"required": ["afterLine"]}},
+                {"properties": {"op": {"const": "delete"}}, "required": ["op", "startLine", "endLine", "oldText"], "not": {"anyOf": [{"required": ["afterLine"]}, {"required": ["newText"]}]}},
+                {"properties": {"op": {"const": "insertAfter"}}, "required": ["op", "afterLine", "newText"], "not": {"anyOf": [{"required": ["startLine"]}, {"required": ["endLine"]}, {"required": ["oldText"]}]}}
+              ],
+              "additionalProperties": false
+            }
+          },
+          "edits": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "targetRef": {"type": "string", "minLength": 1, "maxLength": 256},
+                "mode": {"type": "string", "enum": ["replace", "patch"]},
+                "pseudocode": {"type": "string", "maxLength": 4000000},
+                "patches": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 1000,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "op": {"type": "string", "enum": ["replace", "delete", "insertAfter"]},
+                      "startLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                      "endLine": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                      "afterLine": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                      "oldText": {"type": "string", "maxLength": 4000000},
+                      "newText": {"type": "string", "maxLength": 4000000}
+                    },
+                    "oneOf": [
+                      {"properties": {"op": {"const": "replace"}}, "required": ["op", "startLine", "endLine", "oldText", "newText"], "not": {"required": ["afterLine"]}},
+                      {"properties": {"op": {"const": "delete"}}, "required": ["op", "startLine", "endLine", "oldText"], "not": {"anyOf": [{"required": ["afterLine"]}, {"required": ["newText"]}]}},
+                      {"properties": {"op": {"const": "insertAfter"}}, "required": ["op", "afterLine", "newText"], "not": {"anyOf": [{"required": ["startLine"]}, {"required": ["endLine"]}, {"required": ["oldText"]}]}}
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["targetRef", "mode"],
+              "oneOf": [
+                {"properties": {"mode": {"const": "replace"}}, "required": ["pseudocode"], "not": {"required": ["patches"]}},
+                {"properties": {"mode": {"const": "patch"}}, "required": ["patches"], "not": {"required": ["pseudocode"]}}
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "oneOf": [
+          {"properties": {"mode": {"const": "replace"}}, "required": ["targetRef", "mode", "pseudocode"], "not": {"anyOf": [{"required": ["patches"]}, {"required": ["edits"]}]}},
+          {"properties": {"mode": {"const": "patch"}}, "required": ["targetRef", "mode", "patches"], "not": {"anyOf": [{"required": ["pseudocode"]}, {"required": ["edits"]}]}},
+          {"required": ["edits"], "not": {"anyOf": [{"required": ["targetRef"]}, {"required": ["mode"]}, {"required": ["pseudocode"]}, {"required": ["patches"]}]}}
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
